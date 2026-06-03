@@ -1,5 +1,50 @@
+# Developer build artifacts (CMake)
 riscv32-unknown-elf/
 riscv64-unknown-elf/
 riscv64-linux-gnu/
 .build/
 .vscode/
+*.log
+*.trs
+
+# Generated autotools build system (mixed automake build)
+Makefile
+Makefile.in
+/autom4te.cache/
+/aclocal.m4
+/build-aux
+/m4/libtool.m4
+/m4/ltoptions.m4
+/m4/ltsugar.m4
+/m4/ltversion.m4
+/m4/lt~obsolete.m4
+/config.h
+/config.h.in
+/config.log
+/config.status
+/configure
+/libtool
+/stamp-h1
+
+# Per-directory automake/dependency tracking output
+.deps/
+.dirstamp
+
+# libtool compile/link artifacts
+.libs/
+*.lo
+*.la
+*.o
+
+# VMOD interface + man page generated from the .vcc by vmodtool/rst2man
+/src/vcc_if.c
+/src/vcc_if.h
+/src/vmod_riscv.rst
+/src/vmod_riscv.man.rst
+/src/vmod_riscv.3
+
+# Bundled engine out-of-tree build output
+/libriscv-engine/build/
+
+# make dist output
+/libvmod-riscv-*.tar.gz

@@ -1,0 +1,28 @@
+Source: libvmod-riscv
+Section: web
+Priority: extra
+Maintainer: Varnish Software <support@varnish-software.com>
+Build-Depends:
+ debhelper (>= 9),
+ build-essential,
+ pkg-config,
+ python3-docutils,
+ automake,
+ autoconf,
+ libtool,
+ dh-autoreconf,
+ varnish-plus-dev,
+ libssl-dev,
+ cmake,
+ g++
+Standards-Version: 3.9.6
+
+Package: libvmod-riscv
+Architecture: any
+Depends:
+  varnish,
+  ${varnishd:VRT},
+  ${shlibs:Depends},
+  ${misc:Depends}
+Description: RISC-V sandbox vmod for varnish
+ Low-latency programmable RISC-V sandbox VMOD embedding the libriscv emulator.

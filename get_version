@@ -1,0 +1,6 @@
+#!/bin/sh
+
+DIR=$(dirname $0)
+RISCV_VERSION=$($DIR/configure --version | awk 'NR == 1 {print $NF}')
+VCP_VERSION=$(cat $DIR/vcp.version)
+echo $RISCV_VERSION~$VCP_VERSION
