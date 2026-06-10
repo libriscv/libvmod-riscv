@@ -69,7 +69,7 @@ jobs:
           make -j4
 
       - name: Update test symlinks
-        run: ln -sfn ../../program/riscv64-linux-gnu/js src/tests/js
+        run: ln -sfn ../program/riscv64-linux-gnu/js tests/js
 
       - name: Bootstrap (autogen + configure)
         env:
