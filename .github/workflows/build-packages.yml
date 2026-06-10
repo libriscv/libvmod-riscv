@@ -39,6 +39,11 @@ jobs:
           - { label: almalinux-9,     family: rpm, dist: el9,          image: "almalinux:9" }
           - { label: almalinux-10,    family: rpm, dist: el10,         image: "almalinux:10" }
           - { label: amazonlinux-2023, family: rpm, dist: amzn2023,    image: "amazonlinux:2023" }
+        exclude:
+          # varnish-plus / varnish-plus-devel is not published for el8 on
+          # aarch64 (only amd64), so the arm64 alma-8 build cannot resolve its
+          # build dependencies. amd64 alma-8 still builds.
+          - { arch: { name: arm64, runner: ubuntu-24.04-arm }, target: { label: almalinux-8, family: rpm, dist: el8, image: "almalinux:8" } }
     steps:
       # actions/checkout (and submodule fetch) needs git + certs present in the
       # bare distro images before it can run.
@@ -71,3 +76,36 @@ jobs:
           name: libvmod-riscv-${{ matrix.target.label }}-${{ matrix.arch.name }}
           path: packages/*
           if-no-files-found: error
+
+  # Collect every distro/arch artifact into a single draft GitHub release so the
+  # full set of .deb/.rpm packages can be reviewed and published in one place.
+  release:
+    name: Draft release
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: libvmod-riscv-*
+          merge-multiple: true
+
+      - name: List collected packages
+        run: ls -l artifacts
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: packages-build-${{ github.run_number }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "libvmod-riscv packages (build ${{ github.run_number }})" \
+            --target "$GITHUB_SHA" \
+            --notes "Draft release with native libvmod-riscv packages for all supported Varnish Enterprise distros/architectures, built from ${GITHUB_SHA}." \
+            artifacts/*
