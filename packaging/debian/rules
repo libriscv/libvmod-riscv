@@ -17,8 +17,11 @@ VARNISHD_VRT = $(shell \
 	tail -1 | \
 	tr -c -d '[0-9.]')
 
+# Force the autoconf buildsystem: the source tree also ships a top-level
+# CMakeLists.txt (the developer build), which debhelper would otherwise
+# auto-detect and drive instead of ./configure.
 %:
-	dh $@ --parallel
+	dh $@ --parallel --buildsystem=autoconf
 
 override_dh_auto_configure:
 	dh_auto_configure -- $(LOCAL_CONFIGURE_FLAGS)

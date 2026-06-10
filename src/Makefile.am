@@ -124,6 +124,7 @@ EXTRA_DIST = \
 	builder/builder.sh.h \
 	machine/crc32_embedded.hpp \
 	machine/include_api.hpp \
+	machine/syscalls.h \
 	$(VMOD_TESTS)
 
 CLEANFILES = \

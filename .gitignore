@@ -7,6 +7,11 @@ riscv64-linux-gnu/
 *.log
 *.trs
 
+# Package build outputs (packaging/ci/build-package.sh)
+/packages/
+# debian/ is staged from packaging/debian by the package build harness
+/debian/
+
 # Generated autotools build system (mixed automake build)
 Makefile
 Makefile.in

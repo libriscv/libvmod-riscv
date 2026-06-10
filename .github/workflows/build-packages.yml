@@ -1,0 +1,73 @@
+name: Packages (Varnish Enterprise)
+
+# Builds native libvmod-riscv packages for every distro/architecture where
+# Varnish Enterprise (varnish-plus) is published, in the same naming format as
+# the enterprise sledge packages, e.g.
+#   libvmod-riscv_1.0~6.0.18r2-1~noble_amd64.deb
+#   libvmod-riscv-1.0~6.0.18r2-1.el9.x86_64.rpm
+# Packages are uploaded as CI artifacts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: ${{ matrix.target.label }} (${{ matrix.arch.name }})
+    runs-on: ${{ matrix.arch.runner }}
+    container: ${{ matrix.target.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: amd64, runner: ubuntu-24.04 }
+          - { name: arm64, runner: ubuntu-24.04-arm }
+        target:
+          # The distro set mirrors upstream varnish/varnish check.yml, narrowed
+          # to where varnish-plus / varnish-plus-dev(el) actually ships.
+          - { label: ubuntu-jammy,    family: deb, codename: jammy,    image: "ubuntu:22.04" }
+          - { label: ubuntu-noble,    family: deb, codename: noble,    image: "ubuntu:24.04" }
+          - { label: debian-bookworm, family: deb, codename: bookworm, image: "debian:bookworm" }
+          - { label: debian-trixie,   family: deb, codename: trixie,   image: "debian:trixie" }
+          - { label: almalinux-8,     family: rpm, dist: el8,          image: "almalinux:8" }
+          - { label: almalinux-9,     family: rpm, dist: el9,          image: "almalinux:9" }
+          - { label: almalinux-10,    family: rpm, dist: el10,         image: "almalinux:10" }
+          - { label: amazonlinux-2023, family: rpm, dist: amzn2023,    image: "amazonlinux:2023" }
+    steps:
+      # actions/checkout (and submodule fetch) needs git + certs present in the
+      # bare distro images before it can run.
+      - name: Install checkout prerequisites
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends git ca-certificates
+          else
+            (command -v dnf >/dev/null 2>&1 && dnf install -y git ca-certificates) \
+              || yum install -y git ca-certificates
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build package
+        env:
+          PKG_FAMILY: ${{ matrix.target.family }}
+          PKG_CODENAME: ${{ matrix.target.codename }}
+          PKG_DIST: ${{ matrix.target.dist }}
+          OUTDIR: ${{ github.workspace }}/packages
+        run: packaging/ci/build-package.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvmod-riscv-${{ matrix.target.label }}-${{ matrix.arch.name }}
+          path: packages/*
+          if-no-files-found: error
