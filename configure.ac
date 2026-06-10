@@ -47,8 +47,12 @@ VMOD_TESTS="$(cd $srcdir/src/ && echo tests/*.vtc)"
 AC_SUBST(VMOD_TESTS)
 
 PKG_CHECK_VAR([LIBVARNISHAPI_LIBDIR], [varnishapi], [libdir])
+dnl Open-source Varnish keeps its private libs in $libdir/varnish; Varnish
+dnl Enterprise (Varnish Plus) uses $libdir/varnish-plus. Include both so the
+dnl `make check' harness finds them regardless of which one is installed -- a
+dnl non-existent entry on LD_LIBRARY_PATH is harmless.
 AC_SUBST([VARNISH_LIBRARY_PATH],
-	[$LIBVARNISHAPI_LIBDIR:$LIBVARNISHAPI_LIBDIR/varnish])
+	[$LIBVARNISHAPI_LIBDIR:$LIBVARNISHAPI_LIBDIR/varnish:$LIBVARNISHAPI_LIBDIR/varnish-plus])
 
 AM_CONDITIONAL([BUILD_RISCV_FOR_VCP],
 	[test -d ${LIBVARNISHAPI_LIBDIR}/varnish-plus])
