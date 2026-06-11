@@ -17,6 +17,8 @@
 #   PKG_FAMILY   deb | rpm                         (required)
 #   PKG_CODENAME deb distro codename, e.g. noble   (required for deb)
 #   PKG_DIST     rpm dist tag, e.g. el9 / amzn2023 (required for rpm; informational)
+#   VCP_VERSION  Varnish Enterprise upstream version to pin, e.g. 6.0.18r2.
+#                Use "latest" or leave unset to install whatever is newest.
 #   OUTDIR       where built packages are copied   (default: ./packages)
 #
 set -euo pipefail
@@ -26,6 +28,7 @@ cd "$REPO_ROOT"
 
 PKG_FAMILY=${PKG_FAMILY:?PKG_FAMILY must be set to 'deb' or 'rpm'}
 OUTDIR=${OUTDIR:-"$REPO_ROOT/packages"}
+VCP_VERSION=${VCP_VERSION:-latest}
 ENTERPRISE_REPO="varnishplus/60-enterprise"
 
 log() { echo "==> $*"; }
@@ -49,11 +52,27 @@ build_deb() {
 		apt-transport-https ca-certificates curl gnupg
 	curl -fsSL "https://packagecloud.io/install/repositories/${ENTERPRISE_REPO}/script.deb.sh" | bash
 	apt-get update
+
+	# Resolve the varnish-plus package spec. "latest" leaves it unversioned;
+	# a pinned upstream version (e.g. 6.0.18r2) is mapped to the full distro
+	# version (e.g. 6.0.18r2-1~noble) by querying the repo, so we don't have to
+	# guess the packaging release or codename suffix.
+	local vcp_pkg=varnish-plus vcp_dev=varnish-plus-dev
+	if [ "$VCP_VERSION" != latest ]; then
+		local full
+		full=$(apt-cache madison varnish-plus \
+			| awk -F'|' '{v=$2; gsub(/ /,"",v); print v}' \
+			| grep -E "^${VCP_VERSION}-" | sort -Vr | head -1)
+		[ -n "$full" ] || { echo "ERROR: varnish-plus ${VCP_VERSION} not available for ${PKG_CODENAME}" >&2; exit 1; }
+		vcp_pkg="varnish-plus=$full"; vcp_dev="varnish-plus-dev=$full"
+		log "Pinning Varnish Enterprise to $full"
+	fi
+
 	apt-get install -y --no-install-recommends \
 		build-essential debhelper dh-autoreconf devscripts fakeroot \
 		autoconf automake libtool pkg-config cmake make \
 		libssl-dev python3 python3-docutils \
-		varnish-plus varnish-plus-dev
+		"$vcp_pkg" "$vcp_dev"
 
 	# Ensure a C++20-capable compiler. Ubuntu jammy defaults to g++-11; pull in
 	# g++-12 and make it the default. Newer distros already ship a fit compiler.
@@ -135,12 +154,22 @@ build_rpm() {
 			;;
 	esac
 
+	# Resolve the varnish-plus package spec. "latest" leaves it unversioned; a
+	# pinned upstream version (e.g. 6.0.18r2) becomes a NEVRA glob that matches
+	# any packaging release / dist tag (e.g. varnish-plus-6.0.18r2-1.el9).
+	local vcp_pkg=varnish-plus vcp_dev=varnish-plus-devel
+	if [ "$VCP_VERSION" != latest ]; then
+		vcp_pkg="varnish-plus-${VCP_VERSION}-*"
+		vcp_dev="varnish-plus-devel-${VCP_VERSION}-*"
+		log "Pinning Varnish Enterprise to ${VCP_VERSION}"
+	fi
+
 	# tar/gzip are needed by `make dist' and rpmbuild and are not preinstalled on
 	# the Amazon Linux 2023 base image.
 	$PM install -y \
 		rpm-build make cmake python3 pkgconfig openssl-devel tar gzip \
 		autoconf automake libtool \
-		varnish-plus varnish-plus-devel
+		"$vcp_pkg" "$vcp_dev"
 
 	# C++20 compiler: el8/el9 default gcc is too old, use gcc-toolset-13.
 	# el9/el10 (gcc 11/14) and amzn2023 (gcc 11) already do C++20 with the base
