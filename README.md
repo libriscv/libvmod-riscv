@@ -99,6 +99,42 @@ pub fn main() {
 }
 ```
 
+## JavaScript example program
+
+Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required — the JavaScript source is passed as a string directly in your VCL via `add_main_argument`.
+
+Point the tenant `filename` at the `js` binary built with the VMOD:
+
+```vcl
+sub vcl_init {
+    riscv.embed_tenants("""{
+        "customer1.com": {
+            "filename": "/path/to/js"
+        }
+    }""");
+    riscv.add_main_argument("customer1.com", """
+function on_recv(req) {
+    req.set("X-Tenant: customer1");
+    if (req.url == "/health") return ["synth", 200];
+    return ["pass"];
+}
+""");
+    riscv.finalize_tenants();
+}
+
+sub vcl_recv {
+    if (!riscv.fork(req.http.Host)) {
+        return (synth(403));
+    }
+    riscv.run();
+    if (riscv.want_result() == "synth") {
+        return (synth(riscv.want_status()));
+    }
+}
+```
+
+The available hooks mirror the VCL stages: `on_recv`, `on_hash`, `on_synth`, `on_deliver`, `on_backend_fetch`, `on_backend_response`. Each hook receives request/response objects with `get`, `set`, and `unset` methods for header manipulation. Return an array like `["synth", 200]` or a string like `"pass"` to drive the VCL decision.
+
 ## Benchmarks
 
 Performance comparison showing the minimal overhead of RISC-V VMs:
