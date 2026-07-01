@@ -5,14 +5,27 @@ name: Packages (Varnish Enterprise)
 # the enterprise sledge packages, e.g.
 #   libvmod-riscv_1.0~6.0.18r2-1~noble_amd64.deb
 #   libvmod-riscv-1.0~6.0.18r2-1.el9.x86_64.rpm
-# Packages are uploaded as CI artifacts.
-
+#
 # Manual-only: this builds against Varnish Enterprise (varnish-plus) and is not
 # meant to run on every push/PR. Trigger it from the Actions tab ("Run
 # workflow") and pick the Varnish Enterprise version to build against.
+#
+# Two modes, selected with the "staging" checkbox:
+#   * prod (default) -- build deps come from the public production
+#     packagecloud repo; the full set of packages is collected into a draft
+#     GitHub release for review.
+#   * staging        -- build deps come from the private staging packagecloud
+#     repo (needs the "staging" environment's ENTERPRISE_REPO / PACKAGECLOUD
+#     secrets); the built packages are pushed back up to the staging repo.
+#     Use this to validate a new, not-yet-released Varnish Enterprise version:
+#     set that version in "Custom version override".
 on:
   workflow_dispatch:
     inputs:
+      staging:
+        description: "Staging: build against (and upload to) the staging Varnish Enterprise repo"
+        type: boolean
+        default: false
       vcp_version:
         description: "Varnish Enterprise version"
         type: choice
@@ -23,12 +36,12 @@ on:
           - 6.0.17r4
           - 6.0.16r13
       vcp_version_custom:
-        description: "Custom version override (e.g. 6.0.15r1). Takes precedence over the dropdown when set."
+        description: "Custom version override (e.g. 6.0.19r1). Takes precedence over the dropdown when set. Staging usually needs this, since it targets an unreleased version."
         type: string
         default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.staging }}
   cancel-in-progress: true
 
 env:
@@ -40,6 +53,11 @@ jobs:
     name: ${{ matrix.target.label }} (${{ matrix.arch.name }})
     runs-on: ${{ matrix.arch.runner }}
     container: ${{ matrix.target.image }}
+    # For staging, attach the "staging" environment so ENTERPRISE_REPO /
+    # PACKAGECLOUD_TOKEN resolve to the private staging repo's credentials. In
+    # prod mode no environment is attached and those secrets resolve to empty,
+    # so build-package.sh falls back to the public production repo.
+    environment: ${{ inputs.staging && 'staging' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +104,9 @@ jobs:
           PKG_CODENAME: ${{ matrix.target.codename }}
           PKG_DIST: ${{ matrix.target.dist }}
           VCP_VERSION: ${{ env.VCP_VERSION }}
+          # Empty in prod (no environment attached) -> public production repo.
+          ENTERPRISE_REPO: ${{ secrets.ENTERPRISE_REPO }}
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
           OUTDIR: ${{ github.workspace }}/packages
         run: packaging/ci/build-package.sh
 
@@ -96,10 +117,12 @@ jobs:
           path: packages/*
           if-no-files-found: error
 
-  # Collect every distro/arch artifact into a single draft GitHub release so the
-  # full set of .deb/.rpm packages can be reviewed and published in one place.
+  # PROD ONLY: collect every distro/arch artifact into a single draft GitHub
+  # release so the full set of .deb/.rpm packages can be reviewed and published
+  # in one place.
   release:
     name: Draft release
+    if: ${{ !inputs.staging }}
     needs: package
     runs-on: ubuntu-24.04
     permissions:
@@ -127,3 +150,30 @@ jobs:
             --target "$GITHUB_SHA" \
             --notes "Draft release with native libvmod-riscv packages for all supported Varnish Enterprise distros/architectures, built against Varnish Enterprise \`${{ env.VCP_VERSION }}\` from ${GITHUB_SHA}." \
             artifacts/*
+
+  # STAGING ONLY: push the freshly built packages back up to the staging
+  # Varnish Enterprise packagecloud repo, so the new (unreleased) version can be
+  # installed from staging for validation.
+  upload:
+    name: Upload to staging
+    if: ${{ inputs.staging }}
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: libvmod-riscv-*
+
+      - name: Push packages to staging packagecloud
+        env:
+          # ENTERPRISE_REPO doubles as the push target (the staging repo we
+          # installed from). PACKAGECLOUD_TOKEN must have push access.
+          STAGING_REPO: ${{ secrets.ENTERPRISE_REPO }}
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+        run: packaging/ci/upload-staging.sh
