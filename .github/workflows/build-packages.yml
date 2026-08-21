@@ -20,13 +20,15 @@ name: Packages (Varnish Enterprise)
 #      Varnish Enterprise version -- set that version in "Custom version
 #      override".
 #
-#   2. What to do with the packages we just built ("Upload packages to
-#      staging" checkbox). Unchecked (default) collects the full set of
-#      packages into a draft GitHub release for review; checked pushes them
-#      up to the staging packagecloud repo instead.
+#   2. Whether to ALSO push the packages we just built up to the staging
+#      packagecloud repo ("Upload packages to staging" checkbox). Regardless
+#      of that checkbox, every run bundles the full set of packages into a
+#      single zip and attaches it to a draft GitHub release, so there is
+#      always a backup to review, download or publish from -- including when
+#      the staging upload fails.
 #
-# These are now decoupled: e.g. you can build from production and still push
-# the result to staging, or build from staging and only produce a draft.
+# These are decoupled: e.g. you can build from production and still push the
+# result to staging, or build from staging and only produce a draft.
 on:
   workflow_dispatch:
     inputs:
@@ -55,7 +57,7 @@ on:
         type: string
         default: ""
       upload_to_staging:
-        description: "Upload packages to staging (instead of creating a draft release)"
+        description: "Also upload packages to the staging packagecloud repo (a draft release is created either way)"
         type: boolean
         default: false
 
@@ -139,12 +141,13 @@ jobs:
           path: packages/*
           if-no-files-found: error
 
-  # DEFAULT: collect every distro/arch artifact into a single draft GitHub
-  # release so the full set of .deb/.rpm packages can be reviewed and published
-  # in one place. Runs unless "Upload packages to staging" is checked.
+  # ALWAYS: collect every distro/arch artifact into one zip and attach it to a
+  # draft GitHub release, so the full set of .deb/.rpm packages can be reviewed
+  # and published in one place. This runs on every build -- also when the
+  # staging upload is requested (and even when that upload fails), so there is
+  # always a complete backup of the built packages.
   release:
     name: Draft release
-    if: ${{ !inputs.upload_to_staging }}
     needs: package
     runs-on: ubuntu-24.04
     permissions:
@@ -167,27 +170,48 @@ jobs:
           pattern: libvmod-riscv-*
           merge-multiple: true
 
-      - name: List collected packages
-        run: ls -l artifacts
+      # One zip with every .deb/.rpm, rather than one release asset per
+      # package. merge-multiple above already flattened the per-job artifacts
+      # into a single directory, and package filenames carry distro + arch, so
+      # they cannot collide.
+      - name: Bundle all packages into a single zip
+        id: bundle
+        run: |
+          ls -l artifacts
+          # VCP_VERSION can be free text ("Custom version override"), so keep
+          # only characters that are safe in a release asset filename.
+          version="$(printf '%s' "$VCP_VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+          zipname="libvmod-riscv-packages-${version}-build${{ github.run_number }}.zip"
+          (cd artifacts && zip -j -q "../$zipname" *)
+          unzip -l "$zipname"
+          echo "zip=$zipname" >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: packages-build-${{ github.run_number }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
+          ZIP: ${{ steps.bundle.outputs.zip }}
         run: |
+          cat > release-notes.md <<EOF
+          Draft release with native libvmod-riscv packages for all supported
+          Varnish Enterprise distros/architectures, built against Varnish
+          Enterprise \`${VCP_VERSION}\` from ${TARGET_SHA}.
+
+          Every package is bundled into a single archive: \`${ZIP}\`.
+          EOF
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
             --title "libvmod-riscv packages (build ${{ github.run_number }}, VE ${{ env.VCP_VERSION }})" \
             --target "$TARGET_SHA" \
-            --notes "Draft release with native libvmod-riscv packages for all supported Varnish Enterprise distros/architectures, built against Varnish Enterprise \`${{ env.VCP_VERSION }}\` from ${TARGET_SHA}." \
-            artifacts/*
+            --notes-file release-notes.md \
+            "$ZIP"
 
-  # OPT-IN: push the freshly built packages up to the staging Varnish Enterprise
-  # packagecloud repo, so the new (unreleased) version can be installed from
-  # staging for validation. Runs only when "Upload packages to staging" is
-  # checked.
+  # OPT-IN, in addition to the draft release above: push the freshly built
+  # packages up to the staging Varnish Enterprise packagecloud repo, so the new
+  # (unreleased) version can be installed from staging for validation. Runs
+  # only when "Upload packages to staging" is checked.
   upload:
     name: Upload to staging
     if: ${{ inputs.upload_to_staging }}
