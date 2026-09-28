@@ -9,6 +9,9 @@ static constexpr bool MADVISE_ENABLED = true;
 extern "C" int madvise(void*, size_t, int);
 static constexpr bool MADVISE_ENABLED = false;
 #endif
+#ifndef MADV_DONTNEED
+static constexpr int MADV_DONTNEED = 0x4;
+#endif
 
 namespace riscv
 {
@@ -78,6 +81,12 @@ namespace riscv
 		if (is_default)
 			return;
 
+		// These pages are not created by the page fault handler, so they
+		// have to be bounded here, otherwise a guest can exhaust host memory
+		// by giving mmap() or mprotect() an enormous length.
+		if (UNLIKELY(m_pages.size() >= this->m_pages_max))
+			throw MachineException(OUT_OF_MEMORY, "Out of memory (page attributes)", this->m_pages_max);
+
 		// Writable: Create a non-owning copy-on-write zero-page
 		// Read-only: Create a non-owning zero-page
 		// Unmapped: Create hidden non-owning zero-page, which can become copy-on-write
@@ -119,26 +128,85 @@ namespace riscv
 #ifdef RISCV_VIRTUAL_PAGING
 		address_t pageno = page_number(dst);
 		address_t end = pageno + page_number((len + (Page::size() - 1)) & ~(Page::size() - 1));
-		while (pageno < end)
+		// A guest can free an enormous range, so when the range is larger
+		// than the page table it's cheaper to iterate the page table instead
+		if (size_t(end - pageno) > m_pages.size())
 		{
-			this->free_pageno(pageno);
-			pageno ++;
+			for (auto it = m_pages.begin(); it != m_pages.end(); )
+			{
+				if (it->first >= pageno && it->first < end)
+					it = m_pages.erase(it);
+				else
+					++it;
+			}
+		}
+		else
+		{
+			while (pageno < end)
+			{
+				this->free_pageno(pageno);
+				pageno ++;
+			}
 		}
 		// TODO: This can be improved by invalidating matches only
 		this->invalidate_reset_cache();
 #endif
 	}
 
+#ifdef RISCV_VIRTUAL_PAGING
+	template <int W>
+	void Memory<W>::discard_page(Memory<W>& memory, Page& page,
+		address_t pageno, address_t addr, size_t size, bool ignore_protections)
+	{
+		if (page.is_cow_page()) {
+			// This is the zero-page
+			return;
+		}
+		if (page.attr.is_cow) {
+			memory.m_page_write_handler(memory, pageno, page);
+		}
+		const size_t offset = addr & (Page::size()-1);
+		if (page.attr.write || ignore_protections) {
+			bool discarded = false;
+			if constexpr (MADVISE_ENABLED) {
+				// madvise "fast-path" (XXX: doesn't scale on busy server)
+				// Only whole, host-page-aligned pages qualify: madvise rejects
+				// anything else, and page data comes from the heap, which
+				// carries no such alignment guarantee.
+				if (offset == 0 && size == Page::size()
+					&& (uintptr_t(page.data()) & (Page::size()-1)) == 0) {
+					discarded = madvise(page.data(), Page::size(), MADV_DONTNEED) == 0;
+				}
+			}
+			if (!discarded) {
+				// Zero the existing writable page
+				std::memset(page.data() + offset, 0, size);
+			}
+		} else if (!ignore_protections) {
+			protection_fault(addr);
+		}
+	}
+#endif // RISCV_VIRTUAL_PAGING
+
 	template <int W>
 	void Memory<W>::memdiscard(address_t dst, size_t len, bool ignore_protections)
 	{
-#ifndef MADV_DONTNEED
-		static constexpr int MADV_DONTNEED = 0x4;
-#endif
 		if constexpr (!virtual_paging_enabled) {
 			(void)ignore_protections;
 			if (UNLIKELY(dst + len > memory_arena_size() || dst + len < dst))
 				protection_fault(dst);
+			// Never discard read-only memory: it can be a shared mapping, and
+			// discarding a file mapping restores the original bytes anyway.
+			// Rounded up, as the page at the boundary still holds rodata.
+			const address_t roend =
+				(initial_rodata_end() + Page::size()-1) & ~address_t(Page::size()-1);
+			if (dst < roend) {
+				const size_t skip = std::min(len, size_t(roend - dst));
+				dst += skip;
+				len -= skip;
+				if (len == 0)
+					return;
+			}
 			if constexpr (MADVISE_ENABLED) {
 				auto* baseptr = &((uint8_t *)m_arena.data)[dst];
 				madvise(baseptr, len, MADV_DONTNEED);
@@ -149,6 +217,44 @@ namespace riscv
 		}
 
 #ifdef RISCV_VIRTUAL_PAGING
+		if (len == 0)
+			return;
+
+		// A guest can discard an enormous range, so when the range spans more
+		// pages than the page table holds, it is cheaper to bulk-discard the
+		// part inside the arena and then visit only the pages that exist
+		const address_t firstpage = page_number(dst);
+		const address_t endpage   = page_number(dst + len - 1) + 1;
+		if (size_t(endpage - firstpage) > m_pages.size())
+		{
+			if constexpr (flat_readwrite_arena) {
+				const address_t aend =
+					std::min(address_t(dst + len), address_t(memory_arena_size()));
+				if (dst < aend) {
+					auto* baseptr = &((uint8_t *)m_arena.data)[dst];
+					const size_t bytes = aend - dst;
+					if constexpr (MADVISE_ENABLED) {
+						if (madvise(baseptr, bytes, MADV_DONTNEED) != 0)
+							std::memset(baseptr, 0, bytes);
+					} else {
+						std::memset(baseptr, 0, bytes);
+					}
+				}
+			}
+			for (auto& entry : m_pages)
+			{
+				const address_t pageno = entry.first;
+				if (pageno < firstpage || pageno >= endpage)
+					continue;
+				const address_t pbegin = std::max(dst, address_t(pageno * Page::size()));
+				const address_t pend = std::min(address_t(dst + len),
+					address_t((pageno + 1) * Page::size()));
+				discard_page(*this, entry.second, pageno, pbegin,
+					size_t(pend - pbegin), ignore_protections);
+			}
+			return;
+		}
+
 		while (len > 0)
 		{
 			const size_t offset = dst & (Page::size()-1); // offset within page
@@ -160,31 +266,7 @@ namespace riscv
 			auto it = m_pages.find(pageno);
 			// If we don't find a page, we can treat it as a CoW zero page
 			if (it != m_pages.end()) {
-				Page& page = it->second;
-				if (page.is_cow_page()) {
-					// This is the zero-page
-				} else {
-					if (page.attr.is_cow) {
-						m_page_write_handler(*this, pageno, page);
-					}
-					if (page.attr.write || ignore_protections) {
-
-						if constexpr (MADVISE_ENABLED) {
-							// madvise "fast-path" (XXX: doesn't scale on busy server)
-							if (offset == 0 && size == Page::size()) {
-								madvise(page.data(), Page::size(), MADV_DONTNEED);
-							} else {
-								std::memset(page.data() + offset, 0, size);
-							}
-						} else {
-							// Zero the existing writable page
-							std::memset(page.data() + offset, 0, size);
-						}
-
-					} else if (!ignore_protections) {
-						this->protection_fault(dst);
-					}
-				}
+				discard_page(*this, it->second, pageno, dst, size, ignore_protections);
 			} else {
 				// Create arena-page
 				if (flat_readwrite_arena && pageno < this->m_arena.pages)
@@ -198,7 +280,8 @@ namespace riscv
 							const size_t new_size = new_dst - dst;
 
 							auto* baseptr = &((uint8_t *)m_arena.data)[dst];
-							madvise(baseptr, new_size, MADV_DONTNEED);
+							if (madvise(baseptr, new_size, MADV_DONTNEED) != 0)
+								std::memset(baseptr, 0, new_size);
 
 							dst += new_size;
 							len -= new_size;
@@ -279,6 +362,15 @@ namespace riscv
 			// STOP: 0x7ff00073
 			0x73, 0x00, 0xf0, 0x7f,
 			// JMP -4 (jump back to STOP): 0xffdff06f
+			0x6f, 0xf0, 0xdf, 0xff,
+			// Signal trampoline, at Memory::SIGRETURN_OFFSET.
+			// Linux points the return address of a signal handler at a
+			// trampoline like this one, instead of at the interrupted code.
+			// LI a7, 139 (rt_sigreturn): 0x08b00893
+			0x93, 0x08, 0xb0, 0x08,
+			// ECALL: 0x00000073
+			0x73, 0x00, 0x00, 0x00,
+			// JMP -4 (a sigreturn never returns here): 0xffdff06f
 			0x6f, 0xf0, 0xdf, 0xff,
 			0x0
 		}

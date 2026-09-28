@@ -30,6 +30,24 @@ inline void CPU<W>::reset_stack_pointer() noexcept
 }
 
 template<int W>
+inline bool CPU<W>::guest_rewrote_code(const DecodedExecuteSegment<W>& exec, address_t pc)
+{
+	if (UNLIKELY(!exec.is_within(pc)))
+		return false;
+#if __cpp_exceptions
+	try {
+		return *(const uint16_t *)exec.exec_data(pc)
+			!= machine().memory.template read<uint16_t>(pc);
+	} catch (...) {
+		return false;
+	}
+#else
+	return *(const uint16_t *)exec.exec_data(pc)
+		!= machine().memory.template read<uint16_t>(pc);
+#endif
+}
+
+template<int W>
 inline void CPU<W>::jump(const address_t dst)
 {
 	// it's possible to jump to a misaligned address

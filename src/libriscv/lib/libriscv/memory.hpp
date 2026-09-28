@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include "decoded_exec_segment.hpp"
 #include "mmap_cache.hpp"
+#include "shared_rodata.hpp"
 #include "util/buffer.hpp" // <string>
 #include "util/function.hpp"
 #if RISCV_SPAN_AVAILABLE
@@ -30,6 +31,11 @@ namespace riscv
 		static constexpr address_t DYLINK_BASE  = 0x40000; // Dynamic link base address
 		static constexpr address_t RWREAD_BEGIN = 0x1000; // Default rw-arena rodata start
 		static constexpr address_t OVERALLOCATE = PageSize; // Arena overalloc on both ends (must be page-aligned for madvise)
+		// Guests routinely map more address space than they have memory for, and
+		// attribute-only pages hold no page data. A page table entry still costs
+		// ~64-88 bytes on the host, so the page table is bounded by this multiple
+		// of the memory limit in pages, keeping the host cost proportional.
+		static constexpr size_t PAGE_TABLE_OVERCOMMIT = 64;
 
 		template <typename T>
 		T read(address_t src);
@@ -123,8 +129,17 @@ namespace riscv
 		// Returns the address used for exiting (returning from) a vmcall()
 		address_t exit_address() const noexcept;
 		void      set_exit_address(address_t new_exit);
+		// The offset of the signal trampoline inside the host code page
+		static constexpr address_t SIGRETURN_OFFSET = 8;
+		// The address of a trampoline that invokes rt_sigreturn, used as the
+		// return address of signal handlers. Zero when there is no host code
+		// page, eg. when the program provided its own exit function.
+		address_t sigreturn_address() const noexcept { return this->m_sigreturn_address; }
 		// The initial heap address (*not* the current heap maximum)
 		address_t heap_address() const noexcept { return this->m_heap_address; }
+		// The current program break, as moved by the brk() system call.
+		address_t brk_address() const noexcept { return this->m_brk_address; }
+		void set_brk_address(address_t addr) noexcept { this->m_brk_address = addr; }
 		// Simple memory mapping implementation
 		auto& mmap_cache() noexcept { return m_mmap_cache; }
 		address_t mmap_start() const noexcept { return this->m_heap_address + BRK_MAX; }
@@ -160,6 +175,9 @@ namespace riscv
 		Callsite lookup(address_t) const;
 		void print_backtrace(std::function<void(std::string_view)>, bool ra = true) const;
 
+		// Validates .symtab/.strtab once and invokes fn(sym, name) for each
+		// symbol, @name is nullptr when it points outside the string table.
+		void for_each_symbol(std::function<void(const typename riscv::Elf<W>::Sym&, const char*)> fn) const;
 		// Get list of all symbols in the binary
 		std::vector<const char*> all_symbols() const;
 		// Get list of all unmangled symbols in the binary that starts with a given prefix
@@ -182,6 +200,12 @@ namespace riscv
 #ifdef RISCV_VIRTUAL_PAGING
 		size_t pages_active() const noexcept { return m_pages.size(); }
 		size_t owned_pages_active() const noexcept;
+		// Amortized scan of owned pages below a given limit. Returns true if the number of owned pages is definitely below the limit
+		bool owned_pages_below(size_t limit) noexcept;
+		// Upper bound on entries in the page table, derived from memory_max.
+		// Owned pages are bounded by the page fault handler, while attribute-
+		// only pages (eg. from mmap and mprotect) are bounded by this limit.
+		size_t pages_max() const noexcept { return m_pages_max; }
 		// Page handling
 		const auto& pages() const noexcept { return m_pages; }
 		auto& pages() noexcept { return m_pages; }
@@ -237,6 +261,7 @@ namespace riscv
 #else
 		size_t pages_active() const noexcept { return 0; }
 		size_t owned_pages_active() const noexcept { return 0; }
+		bool owned_pages_below(size_t) noexcept { return true; }
 		void  invalidate_cache(address_t, Page*) const noexcept {}
 		void  invalidate_reset_cache() const noexcept {}
 #endif
@@ -249,6 +274,8 @@ namespace riscv
 		// Evict all execute segments, also disabling the main execute segment
 		void evict_execute_segments();
 		void evict_execute_segment(DecodedExecuteSegment<W>&);
+		void mark_execute_segments_stale() noexcept;
+		void flush_execute_segments(address_t begin, address_t end) noexcept;
 #ifdef RISCV_BINARY_TRANSLATION
 		std::vector<address_t> gather_jump_hints() const;
 #endif
@@ -266,6 +293,16 @@ namespace riscv
 		address_t memory_arena_read_boundary() const noexcept { return this->m_arena.read_boundary; }
 		address_t memory_arena_write_boundary() const noexcept { return this->m_arena.write_boundary; }
 		address_t initial_rodata_end() const noexcept { return this->m_arena.initial_rodata_end; }
+		// End of the region shared with other machines, or zero when private
+		address_t shared_rodata_end() const noexcept {
+			return this->m_rodata_image != nullptr ? address_t(this->m_rodata_image->end()) : 0;
+		}
+		// Native code generators bake the displacement of these into the emitted
+		// bounds checks and read the values at run time, so that generated code
+		// stays valid for any machine the execute segment is shared with.
+		const address_t& memory_arena_read_boundary_ref() const noexcept { return this->m_arena.read_boundary; }
+		const address_t& memory_arena_write_boundary_ref() const noexcept { return this->m_arena.write_boundary; }
+		const address_t& initial_rodata_end_ref() const noexcept { return this->m_arena.initial_rodata_end; }
 
 		// Serializes the current memory state to an existing vector
 		// Returns the final size of the serialized state
@@ -282,6 +319,10 @@ namespace riscv
 		void initial_paging();
 #endif
 		[[noreturn]] static void protection_fault(address_t);
+#ifdef RISCV_VIRTUAL_PAGING
+		static void discard_page(Memory<W>&, Page&, address_t pageno,
+			address_t addr, size_t size, bool ignore_protections);
+#endif
 		// Helpers
 		template <typename T>
 		static void foreach_helper(T& mem, address_t addr, size_t len,
@@ -292,7 +333,7 @@ namespace riscv
 		// ELF stuff
 		using Elf = typename riscv::Elf<W>;
 		template <typename T> T* elf_offset(size_t ofs) const {
-			if (ofs + sizeof(T) >= ofs && ofs + sizeof(T) < m_binary.size())
+			if (ofs + sizeof(T) >= ofs && ofs + sizeof(T) <= m_binary.size())
 				return (T*) &m_binary[ofs];
 #if __cpp_exceptions
 			throw MachineException(INVALID_PROGRAM, "Invalid ELF offset", ofs);
@@ -304,24 +345,41 @@ namespace riscv
 		const auto* elf_header() const {
 			return elf_offset<const typename Elf::Header> (0);
 		}
+		// Safely resolve a symbol name from a (section_by_name-validated)
+		// string table. Returns nullptr when st_name points outside the
+		// table or the string is not NUL-terminated within it.
+		const char* elf_symbol_name(const typename Elf::SectionHeader* strtab, uint32_t st_name) const;
 		const typename Elf::SectionHeader* section_by_name(const std::string& name) const;
+		// Like section_by_name, but for callers that index m_binary using the
+		// returned section's sh_offset/sh_size. Returns nullptr (best-effort,
+		// never throws) for a SHT_NOBITS section or one whose file range falls
+		// outside the binary.
+		const typename Elf::SectionHeader* section_by_name_validated(const std::string& name) const;
 		void dynamic_linking(const typename Elf::Header&);
 		void relocate_section(const char* section_name, const char* symtab);
 		const typename Elf::Sym* resolve_symbol(std::string_view name) const;
 		const typename Elf::Sym* elf_sym_index(const typename Elf::SectionHeader* shdr, uint32_t symidx) const;
 		// ELF loader
 		void binary_loader(const MachineOptions<W>&);
+		// Find the extents of the programs read-only data, and attach a shared
+		// image if another machine already created one
+		void prepare_shared_rodata(const MachineOptions<W>&, const typename Elf::Header*);
+		// Offer the finished read-only region to later machines
+		void publish_shared_rodata();
 		void binary_load_ph(const MachineOptions<W>&, const typename Elf::ProgramHeader*, address_t vaddr);
 		void serialize_execute_segment(const MachineOptions<W>&, const typename Elf::ProgramHeader*, address_t vaddr);
 		void generate_decoder_cache(const MachineOptions<W>&, std::shared_ptr<DecodedExecuteSegment<W>>&, bool is_initial);
+		address_t decode_execute_range(DecodedExecuteSegment<W>&, address_t from, address_t to);
 		// Machine copy-on-write fork
 		void machine_loader(const Machine<W>&, const MachineOptions<W>&);
 
 		address_t m_start_address = 0;
 		address_t m_stack_address = 0;
 		address_t m_exit_address  = 0;
+		address_t m_sigreturn_address = 0;
 		address_t m_mmap_address  = 0;
 		address_t m_heap_address  = 0;
+		address_t m_brk_address   = 0;
 
 		Machine<W>& m_machine;
 
@@ -330,6 +388,10 @@ namespace riscv
 		mutable CachedPage<W, PageData> m_wr_cache;
 
 		std::unordered_map<address_t, Page> m_pages;
+		size_t m_pages_max = size_t(-1);
+		size_t m_owned_pages_limit = 0;
+		size_t m_owned_pages_amortized_scans = 0;
+		static constexpr size_t OWNED_PAGES_SCAN_LIMIT = 1024;
 #endif
 
 		const bool m_original_machine;
@@ -349,6 +411,11 @@ namespace riscv
 #ifdef RISCV_EXT_ATOMICS
 		AtomicMemory<W> m_atomics;
 #endif
+
+		// Read-only image mapped over the low part of the arena, shared with
+		// every other machine loaded from the same binary
+		RodataKey m_rodata_key {};
+		std::shared_ptr<SharedRodataImage> m_rodata_image = nullptr;
 
 		// Execute segments
 		std::shared_ptr<DecodedExecuteSegment<W>> m_main_exec_segment;

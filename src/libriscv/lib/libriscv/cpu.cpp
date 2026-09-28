@@ -40,12 +40,15 @@ namespace riscv
 	};
 
 	template <int W>
-	CPU<W>::CPU(Machine<W>& machine, const Machine<W>& other)
+	CPU<W>::CPU(Machine<W>& machine, const Machine<W>& other, const MachineOptions<W>& options)
 		: m_machine { machine }, m_exec(other.cpu.m_exec)
 	{
-		// Copy all registers except vectors
-		// Users can still copy vector registers by assigning to registers().rvv().
-		this->registers().copy_from(Registers<W>::Options::NoVectors, other.cpu.registers());
+		// Copy all registers, with vector state conditional on options.preserve_vector_registers
+		this->registers().copy_from(
+			options.preserve_vector_registers
+				? Registers<W>::Options::Everything
+				: Registers<W>::Options::NoVectors,
+			other.cpu.registers());
 	}
 	template <int W>
 	void CPU<W>::reset()
@@ -96,6 +99,8 @@ namespace riscv
 		// Find previously decoded execute segment
 		this->m_exec = machine().memory.exec_segment_for(pc).get();
 		if (LIKELY(!this->m_exec->empty() && !this->m_exec->is_stale())) {
+			// Reached a usable segment, reset the no-progress guard
+			this->m_stale_restart_pc = ~address_t(0);
 			return {this->m_exec, pc};
 		}
 
@@ -146,6 +151,11 @@ restart_next_execute_segment:
 
 		// Evict stale execute segments
 		if (this->m_exec->is_stale()) {
+			// If we already rebuilt for this exact PC and it's stale again,
+			// trap instead of spinning forever
+			if (UNLIKELY(pc == this->m_stale_restart_pc))
+				trigger_exception(EXECUTION_LOOP_DETECTED, pc);
+			this->m_stale_restart_pc = pc;
 			machine().memory.evict_execute_segment(*this->m_exec);
 		}
 
@@ -154,6 +164,9 @@ restart_next_execute_segment:
 		auto& next = this->m_override_exec(*this);
 		if (!next.empty()) {
 			this->m_exec = &next;
+			// The rebuild produced a usable segment, so re-arm the guard
+			if (!next.is_stale())
+				this->m_stale_restart_pc = ~address_t(0);
 			return {this->m_exec, this->registers().pc};
 		}
 
@@ -205,10 +218,17 @@ restart_next_execute_segment:
 			}
 
 			// Decode and store it for later
-			return {&this->init_execute_area(area.get(), base_pageno * Page::size(), n_pages * Page::size(), is_likely_jit), pc};
+			auto& seg = this->init_execute_area(area.get(), base_pageno * Page::size(), n_pages * Page::size(), is_likely_jit);
+			// The rebuild produced a usable segment, so re-arm the guard
+			if (!seg.is_stale())
+				this->m_stale_restart_pc = ~address_t(0);
+			return {&seg, pc};
 		} else {
 			// We can use the sequential execute segment directly
-			return {&this->init_execute_area(base_page_data, base_pageno * Page::size(), n_pages * Page::size(), is_likely_jit), pc};
+			auto& seg = this->init_execute_area(base_page_data, base_pageno * Page::size(), n_pages * Page::size(), is_likely_jit);
+			if (!seg.is_stale())
+				this->m_stale_restart_pc = ~address_t(0);
+			return {&seg, pc};
 		}
 #endif // RISCV_VIRTUAL_PAGING
 	} // CPU::next_execute_segment
@@ -301,7 +321,7 @@ restart_precise_sim:
 			auto pc = this->pc();
 
 			// TODO: This can me made much faster
-			if (UNLIKELY(!exec->is_within(pc))) {
+			if (UNLIKELY(!exec->is_within(pc) || exec->is_stale())) {
 				// This will produce a sequential execute segment for the unknown area
 				// If it is not executable, it will throw an execute space protection fault
 				auto new_values = this->next_execute_segment(pc);
@@ -321,6 +341,44 @@ restart_precise_sim:
 		} // while not stopped
 
 	} // CPU::simulate_precise
+
+	template<int W> RISCV_NOINLINE
+	address_type<W> CPU<W>::simulate_undecoded(address_t pc)
+	{
+		auto& exec = *this->m_exec;
+		const auto* exec_seg_data = exec.exec_data();
+		const auto* exec_decoder  = exec.decoder_cache();
+
+		while (true)
+		{
+			if (this->guest_rewrote_code(exec, pc)) {
+				exec.set_stale(true);
+				break;
+			}
+
+			this->registers().pc = pc;
+			const auto instruction = decode_safely<W>(exec_seg_data, pc);
+			this->execute(instruction);
+			machine().increment_counter(1);
+
+			if constexpr (compressed_enabled)
+				this->registers().pc += instruction.length();
+			else
+				this->registers().pc += 4;
+			pc = this->registers().pc;
+
+			if (this->m_exec != &exec)
+				break;
+			if (!exec.is_within(pc) || exec.is_stale())
+				break;
+			if (exec_decoder[pc >> DecoderData<W>::SHIFT].get_bytecode() != RV32I_BC_INVALID)
+				break;
+			if (machine().stopped())
+				break;
+		}
+
+		return pc;
+	} // CPU::simulate_undecoded
 
 	template<int W>
 	void CPU<W>::step_one(bool use_instruction_counter)

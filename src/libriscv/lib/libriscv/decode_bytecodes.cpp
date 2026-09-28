@@ -27,7 +27,9 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 		{
 			case CI_CODE(0b000, 0b00):
 				// if all bits are zero, it's an illegal instruction
-				if (ci.whole != 0x0) {
+				// C.ADDI4SPN is valid only when nzuimm != 0; the code
+				// points with nzuimm = 0 are reserved (insn:c-addi4spn_rsv).
+				if (ci.whole != 0x0 && ci.CIW.offset() != 0) {
 					return RV32C_BC_ADDI; // C.ADDI4SPN
 				}
 				return RV32I_BC_INVALID;
@@ -81,15 +83,34 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				return RV32C_BC_FUNCTION; // C.NOP
 			case CI_CODE(0b011, 0b01):
 				if (ci.CI.rd == 2) {
-					return RV32C_BC_ADDI; // C.ADDI16SP
+					// C.ADDI16SP is valid only when nzimm != 0
+					// (insn:c-addi16sp_rsv).
+					if (ci.CI16.signed_imm() != 0) {
+						return RV32C_BC_ADDI; // C.ADDI16SP
+					}
 				}
 				else if (ci.CI.rd != 0) {
-					return RV32C_BC_FUNCTION; // C.LUI
+					// C.LUI is valid only when rd != x2 and imm != 0
+					// (insn:c-lui_rsv).
+					if (ci.CI.upper_imm() != 0) {
+						return RV32C_BC_FUNCTION; // C.LUI
+					}
+					if ((ci.CI.rd & 1) != 0 && ci.CI.rd < 16) {
+						return RV32C_BC_FUNCTION; // C.MOP.n
+					}
+				}
+				else if (ci.CI.rd == 0 && ci.CI.upper_imm() != 0) {
+					return RV32C_BC_FUNCTION; // C.LUI hint
 				}
 				return RV32C_BC_FUNCTION; // ILLEGAL
 			case CI_CODE(0b001, 0b01):
 				if constexpr (W >= 8) {
-					return RV32C_BC_JAL_ADDIW; // C.ADDIW
+					// C.ADDIW is valid only when rd != x0
+					// (insn:c-addiw_rsv); rd = x0 is reserved.
+					if (ci.CI.rd != 0) {
+						return RV32C_BC_JAL_ADDIW; // C.ADDIW
+					}
+					return RV32I_BC_INVALID;
 				} else {
 					return RV32C_BC_JAL_ADDIW; // C.JAL
 				}
@@ -297,13 +318,13 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				else
 					return RV32I_BC_ADDI;
 			case 0x1: // SLLI, ...
-				if (instr.Itype.high_bits() == 0x0)
+				if (instr.Itype.high_bits() == 0x0 && (W != 4 || (instr.Itype.imm & 0x20) == 0))
 					return RV32I_BC_SLLI;
 				else if (instr.Itype.imm == 0b011000000100) // SEXT.B
 					return RV32I_BC_SEXT_B;
 				else if (instr.Itype.imm == 0b011000000101) // SEXT.H
 					return RV32I_BC_SEXT_H;
-				else if (instr.Itype.high_bits() == 0x280) // BSETI
+				else if (instr.Itype.high_bits() == 0x280 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) // BSETI
 					return RV32I_BC_BSETI;
 				else
 					return RV32I_BC_FUNCTION;
@@ -314,11 +335,11 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 			case 0x4: // XORI
 				return RV32I_BC_XORI;
 			case 0x5:
-				if (instr.Itype.high_bits() == 0x0)
+				if (instr.Itype.high_bits() == 0x0 && (W != 4 || (instr.Itype.imm & 0x20) == 0))
 					return RV32I_BC_SRLI;
-				else if (instr.Itype.is_srai())
+				else if (instr.Itype.is_srai() && (W != 4 || (instr.Itype.imm & 0x20) == 0))
 					return RV32I_BC_SRAI;
-				else if (instr.Itype.high_bits() == 0x480) // BEXTI
+				else if (instr.Itype.high_bits() == 0x480 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) // BEXTI
 					return RV32I_BC_BEXTI;
 				else
 					return RV32I_BC_FUNCTION;
@@ -362,8 +383,8 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				return RV32I_BC_OP_REM;
 			case 0x17:
 				return RV32I_BC_OP_REMU;
-			case 0x44: // ZEXT.H
-				return RV32I_BC_OP_ZEXT_H;
+			case 0x44: // ZEXT.H / PACK
+				return (W == 4 && instr.Rtype.rs2 == 0) ? RV32I_BC_OP_ZEXT_H : RV32I_BC_FUNCTION;
 			case 0x102:
 				return RV32I_BC_OP_SH1ADD;
 			case 0x104:
@@ -403,8 +424,8 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				return RV64I_BC_OP_MULW;
 			case 0x40: // ADD.UW
 				return RV64I_BC_OP_ADD_UW;
-			case 0x44: // ZEXT.H
-				return RV32I_BC_OP_ZEXT_H;
+			case 0x44: // ZEXT.H / PACKW
+				return (instr.Rtype.rs2 == 0) ? RV32I_BC_OP_ZEXT_H : RV32I_BC_FUNCTION;
 			default:
 				return RV32I_BC_FUNCTION;
 			}
@@ -419,12 +440,12 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 			case 0x0:
 				return RV64I_BC_ADDIW;
 			case 0x1: // SLLIW
-				if (instr.Itype.high_bits() == 0x000) {
+				if (instr.Itype.high_bits() == 0x000 && (instr.Itype.imm & 0x20) == 0) {
 					return RV64I_BC_SLLIW;
 				}
 				return RV32I_BC_FUNCTION;
 			case 0x5: // SRLIW / SRAIW
-				if (instr.Itype.high_bits() == 0x000) {
+				if (instr.Itype.high_bits() == 0x000 && (instr.Itype.imm & 0x20) == 0) {
 					return RV64I_BC_SRLIW;
 				}
 				return RV32I_BC_FUNCTION;
@@ -452,12 +473,8 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				return RV32F_BC_FLW;
 			case 0x3: // FLD
 				return RV32F_BC_FLD;
-#ifdef RISCV_EXT_VECTOR
-			case 0x6: // VLE32
-				return RV32V_BC_VLE32;
-#endif
 			default:
-				return RV32I_BC_INVALID;
+				return RV32I_BC_FUNCTION;
 			}
 		}
 		case RV32F_STORE: {
@@ -467,12 +484,8 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 				return RV32F_BC_FSW;
 			case 0x3: // FSD
 				return RV32F_BC_FSD;
-#ifdef RISCV_EXT_VECTOR
-			case 0x6: // VSE32
-				return RV32V_BC_VSE32;
-#endif
 			default:
-				return RV32I_BC_INVALID;
+				return RV32I_BC_FUNCTION;
 			}
 		}
 		case RV32F_FMADD:
@@ -498,27 +511,10 @@ size_t CPU<W>::computed_index_for(rv32i_instruction instr) noexcept
 					return RV32I_BC_FUNCTION;
 				}
 #ifdef RISCV_EXT_VECTOR
-		case RV32V_OP: {
-			const rv32v_instruction vi{instr};
-			switch (instr.vwidth())
-			{
-			case 0x1: // OPF.VV
-				switch (vi.OPVV.funct6)
-				{
-				case 0b000000: // VFADD.VV
-					return RV32V_BC_VFADD_VV;
-				}
-				break;
-			case 0x5: // OPF.VF
-				switch (vi.OPVV.funct6)
-				{
-				case 0b100100: // VFMUL.VF
-					return RV32V_BC_VFMUL_VF;
-				}
-				break;
-			}
+		case RV32V_OP:
+			// All vector instructions go through the general instruction
+			// handlers (full vl/vtype/mask semantics).
 			return RV32I_BC_FUNCTION;
-		}
 #endif
 #ifdef RISCV_EXT_ATOMICS
 		case RV32A_ATOMIC:

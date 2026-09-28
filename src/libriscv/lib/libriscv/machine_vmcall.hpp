@@ -16,8 +16,12 @@ inline void Machine<W>::setup_call(Args&&... args)
 		else if constexpr (is_string<Args>::value)
 			cpu.reg(iarg++) = stack_push(args, strlen(args)+1);
 #ifdef __cpp_exceptions
-		else if constexpr (std::is_same_v<GuestStdString<W>, remove_cvref<Args>>) {
-			args.move(cpu.reg(REG_SP) - sizeof(Args)); // SSO-adjustment
+		else if constexpr (is_guest_datatype<W, remove_cvref<Args>>::value) {
+			// A guest container can point back into itself (the std::string
+			// small-string optimization, the std::unordered_map buckets), so
+			// it is told where on the stack it will end up (see stack_push)
+			relocate_guest_object<W>(*this, args,
+				(cpu.reg(REG_SP) - sizeof(Args)) & ~address_t(W-1));
 			cpu.reg(iarg++) = stack_push(&args, sizeof(Args));
 		}
 		else if constexpr (is_scoped_guest_object<W, remove_cvref<Args>>::value) {

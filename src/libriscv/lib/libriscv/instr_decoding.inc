@@ -106,12 +106,14 @@
 							}
 							DECODER(DECODED_INSTR(OP_IMM_ADDI));
 						case 0x1: // SLLI
-							if (instruction.Itype.high_bits() == 0x0) {
+							if (instruction.Itype.high_bits() == 0x0
+								&& (sizeof(address_t) != 4 || (instruction.Itype.imm & 0x20) == 0)) {
 								DECODER(DECODED_INSTR(OP_IMM_SLLI));
 							}
 							DECODER(DECODED_INSTR(OP_IMM));
 						case 0x5: // SRLI / SRAI
-							if (instruction.Itype.high_bits() == 0x0) {
+							if (instruction.Itype.high_bits() == 0x0
+								&& (sizeof(address_t) != 4 || (instruction.Itype.imm & 0x20) == 0)) {
 								DECODER(DECODED_INSTR(OP_IMM_SRLI));
 							} else {
 								DECODER(DECODED_INSTR(OP_IMM));
@@ -161,13 +163,17 @@
 						DECODER(DECODED_INSTR(NOP));
 					}
 				case RV64I_OP_IMM32:
-					if (LIKELY(instruction.Itype.rd != 0))
+					// The *W instructions only exist from RV64 up.
+					if constexpr (sizeof(address_t) < 8) {
+						DECODER(DECODED_INSTR(ILLEGAL));
+					}
+					else if (LIKELY(instruction.Itype.rd != 0))
 					{
 						switch (instruction.Itype.funct3) {
 						case 0x0: // ADDIW
 							DECODER(DECODED_INSTR(OP_IMM32_ADDIW));
 						case 0x1: // SLLIW
-							if (instruction.Itype.high_bits() == 0x000) {
+							if (instruction.Itype.high_bits() == 0x000 && (instruction.Itype.imm & 0x20) == 0) {
 								DECODER(DECODED_INSTR(OP_IMM32_SLLIW));
 							} else if (instruction.Itype.high_bits() == 0x080) {
 								DECODER(DECODED_INSTR(OP_IMM32_SLLI_UW));
@@ -175,9 +181,9 @@
 								DECODER(DECODED_INSTR(OP_IMM32));
 							}
 						case 0x5: // SRLIW / SRAIW
-							if (instruction.Itype.high_bits() == 0x000) {
+							if (instruction.Itype.high_bits() == 0x000 && (instruction.Itype.imm & 0x20) == 0) {
 								DECODER(DECODED_INSTR(OP_IMM32_SRLIW));
-							} else if (instruction.Itype.high_bits() == 0x400) {
+							} else if (instruction.Itype.high_bits() == 0x400 && (instruction.Itype.imm & 0x20) == 0) {
 								DECODER(DECODED_INSTR(OP_IMM32_SRAIW));
 							} else {
 								DECODER(DECODED_INSTR(OP_IMM32));
@@ -189,7 +195,11 @@
 						DECODER(DECODED_INSTR(NOP));
 					}
 				case RV64I_OP32:
-					if (LIKELY(instruction.Rtype.rd != 0))
+					// The *W instructions only exist from RV64 up.
+					if constexpr (sizeof(address_t) < 8) {
+						DECODER(DECODED_INSTR(ILLEGAL));
+					}
+					else if (LIKELY(instruction.Rtype.rd != 0))
 					{
 						switch (instruction.Rtype.jumptable_friendly_op()) {
 						case 0x0: // ADDW
@@ -217,18 +227,49 @@
 					}
 #endif
 				case RV32I_FENCE:
-					DECODER(DECODED_INSTR(FENCE));
+					switch (instruction.Itype.funct3) {
+					case 0x0:
+					case 0x1:
+						DECODER(DECODED_INSTR(FENCE));
+					case RV32I_CBO_FUNCT3:
+						if (instruction.Itype.rd == 0)
+							DECODER(DECODED_INSTR(CBO));
+						[[fallthrough]];
+					default:
+						DECODER(DECODED_INSTR(ILLEGAL));
+					}
 
 				// RV32F & RV32D - Floating-point instructions
 				case RV32F_LOAD: {
 					const rv32f_instruction fi { instruction };
 					switch (fi.Itype.funct3) {
+					case 0x1: // FLH (Zfhmin)
+						DECODER(DECODED_FLOAT(FLH));
 					case 0x2: // FLW
 						DECODER(DECODED_FLOAT(FLW));
 					case 0x3: // FLD
 						DECODER(DECODED_FLOAT(FLD));
 #ifdef RISCV_EXT_VECTOR
+					// The unmasked, single-field, unit-stride loads: nf, mew,
+					// mop and lumop all zero with vm set. Every one of those
+					// is static, so recognising the form here leaves the
+					// handler with only what vtype decides. EEW comes along
+					// as a template argument for the same reason.
+					case 0x0: // VLE8
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VLE8_UNIT));
+						DECODER(DECODED_VECTOR(VLE32));
+					case 0x5: // VLE16
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VLE16_UNIT));
+						DECODER(DECODED_VECTOR(VLE32));
 					case 0x6: // VLE32
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VLE32_UNIT));
+						DECODER(DECODED_VECTOR(VLE32));
+					case 0x7: // VLE64
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VLE64_UNIT));
 						DECODER(DECODED_VECTOR(VLE32));
 #endif
 					default:
@@ -238,12 +279,29 @@
 				case RV32F_STORE: {
 					const rv32f_instruction fi { instruction };
 					switch (fi.Itype.funct3) {
+					case 0x1: // FSH (Zfhmin)
+						DECODER(DECODED_FLOAT(FSH));
 					case 0x2: // FSW
 						DECODER(DECODED_FLOAT(FSW));
 					case 0x3: // FSD
 						DECODER(DECODED_FLOAT(FSD));
 #ifdef RISCV_EXT_VECTOR
+					// The store direction of the same, see above.
+					case 0x0: // VSE8
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VSE8_UNIT));
+						DECODER(DECODED_VECTOR(VSE32));
+					case 0x5: // VSE16
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VSE16_UNIT));
+						DECODER(DECODED_VECTOR(VSE32));
 					case 0x6: // VSE32
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VSE32_UNIT));
+						DECODER(DECODED_VECTOR(VSE32));
+					case 0x7: // VSE64
+						if (RVV_IS_UNIT_STRIDE(instruction))
+							DECODER(DECODED_VECTOR(VSE64_UNIT));
 						DECODER(DECODED_VECTOR(VSE32));
 #endif
 					default:
@@ -272,24 +330,46 @@
 						case 0b00100:
 							DECODER(DECODED_FLOAT(FSGNJ_NX));
 						case 0b00101:
+							if (rv32f_instruction { instruction }.R4type.funct3 == 0x2
+								|| rv32f_instruction { instruction }.R4type.funct3 == 0x3)
+								DECODER(DECODED_FLOAT(FMINM_FMAXM));
 							DECODER(DECODED_FLOAT(FMIN_FMAX));
 						case 0b01011:
 							DECODER(DECODED_FLOAT(FSQRT));
 						case 0b10100:
-							if (rv32f_instruction { instruction }.R4type.rd != 0)
+							if (rv32f_instruction { instruction }.R4type.rd != 0) {
+								if (rv32f_instruction { instruction }.R4type.funct3 == 0x4
+									|| rv32f_instruction { instruction }.R4type.funct3 == 0x5)
+									DECODER(DECODED_FLOAT(FLEQ_FLTQ));
 								DECODER(DECODED_FLOAT(FEQ_FLT_FLE));
+							}
 							DECODER(DECODED_INSTR(NOP));
 						case 0b01000:
+							if (rv32f_instruction { instruction }.R4type.rs2 == 0x4
+								|| rv32f_instruction { instruction }.R4type.rs2 == 0x5)
+								DECODER(DECODED_FLOAT(FROUND));
 							DECODER(DECODED_FLOAT(FCVT_SD_DS));
+						case RV32F__FMVP_D_X:
+							if constexpr (sizeof(address_t) == 4) {
+								DECODER(DECODED_FLOAT(FMVP_D_X));
+							}
+							break;
 						case 0b11000:
-							if (rv32f_instruction { instruction }.R4type.rd != 0)
+							if (rv32f_instruction { instruction }.R4type.rd != 0) {
+								if (rv32f_instruction { instruction }.R4type.rs2 == 0x8)
+									DECODER(DECODED_FLOAT(FCVTMOD_W_D));
 								DECODER(DECODED_FLOAT(FCVT_W_SD));
+							}
 							DECODER(DECODED_INSTR(NOP));
 						case 0b11010:
 							DECODER(DECODED_FLOAT(FCVT_SD_W));
 						case 0b11100:
 							if (rv32f_instruction { instruction }.R4type.rd != 0) {
 								if (rv32f_instruction { instruction }.R4type.funct3 == 0) {
+									if constexpr (sizeof(address_t) == 4) {
+										if (rv32f_instruction { instruction }.R4type.rs2 == 0x1)
+											DECODER(DECODED_FLOAT(FMVH_X_D));
+									}
 									DECODER(DECODED_FLOAT(FMV_X_W));
 								} else {
 									DECODER(DECODED_FLOAT(FCLASS));
@@ -297,6 +377,9 @@
 							}
 							DECODER(DECODED_INSTR(NOP));
 						case 0b11110:
+							if (rv32f_instruction { instruction }.R4type.rs2 == 0x1
+								&& rv32f_instruction { instruction }.R4type.funct3 == 0x0)
+								DECODER(DECODED_FLOAT(FLI));
 							DECODER(DECODED_FLOAT(FMV_W_X));
 					}
 					break;
@@ -307,13 +390,18 @@
 					case 0x0: // OPI.VV
 						DECODER(DECODED_VECTOR(VOPI_VV));
 					case 0x1: // OPF.VV
+						if (RVV_IS_OPFVV_ARITH(instruction.whole >> 26))
+							DECODER(DECODED_VECTOR(VOPF_VV_ARITH));
 						DECODER(DECODED_VECTOR(VOPF_VV));
 					case 0x2: // OPM.VV
 						DECODER(DECODED_VECTOR(VOPM_VV));
 					case 0x3: // OPI.VI
+					case 0x4: // OPI.VX
 						DECODER(DECODED_VECTOR(VOPI_VI));
 					case 0x5: // OPF.VF
 						DECODER(DECODED_VECTOR(VOPF_VF));
+					case 0x6: // OPM.VX
+						DECODER(DECODED_VECTOR(VOPM_VV));
 					case 0x7: // Vector Configuration
 						switch (instruction.vsetfunc()) {
 						case 0x0:
@@ -428,7 +516,10 @@
 				// Quadrant 0
 				case CI_CODE(0b000, 0b00):
 					// if all bits are zero, it's an illegal instruction
-					if (ci.whole != 0x0) {
+					// C.ADDI4SPN is valid only when nzuimm != 0; the code
+					// points with nzuimm = 0 are reserved (RISC-V unpriv spec,
+					// insn:c-addi4spn_rsv).
+					if (ci.whole != 0x0 && ci.CIW.offset() != 0) {
 						DECODER(DECODED_COMPR(C0_ADDI4SPN));
 					}
 					DECODER(DECODED_INSTR(ILLEGAL));
@@ -449,7 +540,24 @@
 						}
 					}
 					DECODER(DECODED_INSTR(ILLEGAL));
-				// RESERVED: 0b100, 0b00
+				// Reserved in the base compressed extension; Zcb fills it
+				// with the byte and halfword loads and stores.
+				case CI_CODE(0b100, 0b00):
+					switch (ci.CZB.subf3) {
+					case 0b000: // C.LBU
+						DECODER(DECODED_COMPR(C0_LBU));
+					case 0b001: // bit 6 picks C.LH over C.LHU
+						if (ci.CZB.half_signed())
+							DECODER(DECODED_COMPR(C0_LH));
+						DECODER(DECODED_COMPR(C0_LHU));
+					case 0b010: // C.SB
+						DECODER(DECODED_COMPR(C0_SB));
+					case 0b011: // C.SH, which has no second form
+						if (!ci.CZB.half_signed())
+							DECODER(DECODED_COMPR(C0_SH));
+						DECODER(DECODED_INSTR(ILLEGAL));
+					}
+					DECODER(DECODED_INSTR(ILLEGAL));
 				case CI_CODE(0b101, 0b00):
 				case CI_CODE(0b110, 0b00):
 				case CI_CODE(0b111, 0b00):
@@ -479,7 +587,9 @@
 						if (ci.CI.rd != 0) {
 							DECODER(DECODED_COMPR(C1_ADDIW));
 						}
-						DECODER(DECODED_INSTR(NOP));
+						// insn:c-addiw_rsv: C.ADDIW is valid only when
+						// rd != x0; the code points with rd = x0 are reserved.
+						DECODER(DECODED_INSTR(ILLEGAL));
 					} else {
 						DECODER(DECODED_COMPR(C1_JAL));
 					}
@@ -490,13 +600,30 @@
 					DECODER(DECODED_INSTR(NOP));
 				case CI_CODE(0b011, 0b01):
 					if (ci.CI.rd == 2) {
-						DECODER(DECODED_COMPR(C1_ADDI16SP));
+						if (ci.CI16.signed_imm() != 0) {
+							DECODER(DECODED_COMPR(C1_ADDI16SP));
+						}
 					}
 					else if (ci.CI.rd != 0) {
-						DECODER(DECODED_COMPR(C1_LUI));
+						if (ci.CI.upper_imm() != 0) {
+							DECODER(DECODED_COMPR(C1_LUI));
+						}
+						if ((ci.CI.rd & 1) != 0 && ci.CI.rd < 16) {
+							DECODER(DECODED_INSTR(NOP));
+						}
+					}
+					else if (ci.CI.rd == 0 && ci.CI.upper_imm() != 0) {
+						DECODER(DECODED_INSTR(NOP));
 					}
 					DECODER(DECODED_INSTR(ILLEGAL));
 				case CI_CODE(0b100, 0b01):
+					if constexpr (sizeof(address_t) == 4) {
+						// insn:c-srli_rsv, insn:c-srai_rsv: on RV32 the shift
+						// amount is five bits and the encodings with shamt[5]
+						// set are reserved.
+						if ((ci.CAB.funct2 & 2) == 0 && (ci.whole & (1 << 12)))
+							DECODER(DECODED_INSTR(ILLEGAL));
+					}
 					DECODER(DECODED_COMPR(C1_ALU_OPS));
 				case CI_CODE(0b101, 0b01):
 					DECODER(DECODED_COMPR(C1_JUMP));
@@ -509,6 +636,13 @@
 				case CI_CODE(0b001, 0b10):
 				case CI_CODE(0b010, 0b10):
 				case CI_CODE(0b011, 0b10):
+					if constexpr (sizeof(address_t) == 4) {
+						// insn:c-slli_rsv: as for C.SRLI, shamt[5] is reserved
+						// on RV32. This holds for the rd = x0 HINT encodings
+						// too, so it has to be checked before them.
+						if (ci.CI.funct3 == 0x0 && (ci.whole & (1 << 12)))
+							DECODER(DECODED_INSTR(ILLEGAL));
+					}
 					if (ci.CI.funct3 == 0x0 && ci.CI.rd != 0) {
 						// C.SLLI
 						DECODER(DECODED_COMPR(C2_SLLI));
@@ -558,6 +692,12 @@
 					else if (topbit && ci.CR.rd == 0 && ci.CR.rs2 == 0)
 					{	// EBREAK
 						DECODER(DECODED_COMPR(C2_EBREAK));
+					}
+					else if (ci.CR.rs2 != 0)
+					{	// C.MV and C.ADD with rd = x0 are HINT encodings
+						// (insn:c-mv_hint, insn:c-add_hint). The spec requires
+						// them to execute as a no-op, not to trap.
+						DECODER(DECODED_INSTR(NOP));
 					}
 					DECODER(DECODED_COMPR(UNIMPLEMENTED));
 				}

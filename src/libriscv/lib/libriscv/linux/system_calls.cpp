@@ -6,8 +6,8 @@
 //#define SYSCALL_VERBOSE 1
 #ifdef SYSCALL_VERBOSE
 #define SYSPRINT(fmt, ...) \
-	{ char syspbuf[1024]; machine.print(syspbuf, \
-		snprintf(syspbuf, sizeof(syspbuf), fmt, ##__VA_ARGS__)); }
+	do { if (riscv::verbose_syscalls_enabled) { char syspbuf[1024]; machine.print(syspbuf, \
+		snprintf(syspbuf, sizeof(syspbuf), fmt, ##__VA_ARGS__)); } } while (0)
 static constexpr bool verbose_syscalls = true;
 #else
 #define SYSPRINT(fmt, ...) /* fmt */
@@ -24,6 +24,7 @@ static constexpr bool verbose_syscalls = false;
 #include <sys/random.h>
 #endif
 extern "C" int dup3(int oldfd, int newfd, int flags);
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -81,6 +82,106 @@ static void syscall_stub_zero(Machine<W>& machine) {
 }
 
 template <int W>
+static void syscall_riscv_flush_icache(Machine<W>& machine) {
+	const auto begin = machine.sysarg(0);
+	const auto end   = machine.sysarg(1);
+	SYSPRINT("SYSCALL riscv_flush_icache(0x%lX, 0x%lX, 0x%lX)\n",
+		(long)begin, (long)end, (long)machine.sysarg(2));
+	if (begin < end)
+		machine.memory.flush_execute_segments(begin, end);
+	else
+		machine.memory.mark_execute_segments_stale();
+	machine.set_result(0);
+}
+
+template <int W>
+static void syscall_rt_sigreturn(Machine<W>& machine) {
+	SYSPRINT("SYSCALL rt_sigreturn, sp: 0x%lX\n", (long)machine.cpu.reg(REG_SP));
+	machine.signals().leave(machine);
+}
+
+template <int W>
+static void syscall_getrusage(Machine<W>& machine)
+{
+	const int who = machine.template sysarg<int>(0);
+	const auto g_usage = machine.sysarg(1);
+
+	struct {
+		address_type<W> ru_utime_sec, ru_utime_usec;
+		address_type<W> ru_stime_sec, ru_stime_usec;
+		address_type<W> ru_maxrss;
+		address_type<W> ru_rest[13];
+	} usage {};
+
+	static constexpr int GUEST_RUSAGE_SELF     = 0;
+	static constexpr int GUEST_RUSAGE_CHILDREN = -1;
+	static constexpr int GUEST_RUSAGE_THREAD   = 1;
+	if (who != GUEST_RUSAGE_SELF && who != GUEST_RUSAGE_CHILDREN
+		&& who != GUEST_RUSAGE_THREAD) {
+		machine.set_result(-EINVAL);
+		SYSPRINT("SYSCALL getrusage, who: %d => %d\n",
+			who, (int)machine.return_value());
+		return;
+	}
+
+	if (machine.has_file_descriptors() && machine.fds().proxy_mode) {
+		struct rusage host_usage {};
+		const int res = getrusage(
+			who == GUEST_RUSAGE_CHILDREN ? RUSAGE_CHILDREN : RUSAGE_SELF, &host_usage);
+		if (res < 0) {
+			machine.set_result_or_error(res);
+			return;
+		}
+		usage.ru_utime_sec  = host_usage.ru_utime.tv_sec;
+		usage.ru_utime_usec = host_usage.ru_utime.tv_usec;
+		usage.ru_stime_sec  = host_usage.ru_stime.tv_sec;
+		usage.ru_stime_usec = host_usage.ru_stime.tv_usec;
+		usage.ru_maxrss     = host_usage.ru_maxrss;
+	} else {
+		// Report some deterministic progress, sandbox-safe/sanitized
+		const uint64_t micros = machine.instruction_counter() / 1000;
+		usage.ru_utime_sec  = micros / 1000000;
+		usage.ru_utime_usec = micros % 1000000;
+		usage.ru_maxrss =
+			(machine.memory.pages_active() * riscv::Page::size()) / 1024;
+	}
+
+	if (g_usage != 0x0)
+		machine.copy_to_guest(g_usage, &usage, sizeof(usage));
+	machine.set_result(0);
+	SYSPRINT("SYSCALL getrusage, who: %d usage: 0x%lX => %d\n",
+		who, (long)g_usage, (int)machine.return_value());
+}
+
+template <int W>
+static void syscall_getpid(Machine<W>& machine) {
+	// The process ID is the TID of the main thread, and is never zero
+	machine.set_result(MAIN_THREAD_TID);
+	SYSPRINT("SYSCALL getpid() = %d\n", (int)machine.return_value());
+}
+
+template <int W>
+static void syscall_getppid(Machine<W>& machine) {
+	machine.set_result(1);
+	SYSPRINT("SYSCALL getppid() = %d\n", (int)machine.return_value());
+}
+
+template <int W>
+static void syscall_sched_getaffinity(Machine<W>& machine) {
+	const auto cpusetsize = machine.sysarg(1);
+	const auto g_mask     = machine.sysarg(2);
+	if (cpusetsize < sizeof(uint64_t) || g_mask == 0x0) {
+		machine.set_result(-EINVAL);
+	} else {
+		const uint64_t mask = 0x1;
+		machine.copy_to_guest(g_mask, &mask, sizeof(mask));
+		machine.set_result(sizeof(mask));
+	}
+	SYSPRINT("SYSCALL sched_getaffinity(size=%zu, mask=0x%lX) = %ld\n",
+		(size_t)cpusetsize, (long)g_mask, (long)machine.return_value());
+}
+
+template <int W>
 static void syscall_stub_nosys(Machine<W>& machine) {
 	SYSPRINT("SYSCALL stubbed (nosys): %d\n", (int)machine.cpu.reg(17));
 	machine.set_result(-ENOSYS);
@@ -99,7 +200,12 @@ static void syscall_exit(Machine<W>& machine)
 template <int W>
 static void syscall_ebreak(riscv::Machine<W>& machine)
 {
-	printf("\n>>> EBREAK at %#lX\n", (long) machine.cpu.pc());
+	char buffer[64];
+	const int len = snprintf(buffer, sizeof(buffer),
+		"\n>>> EBREAK at %#lX\n", (long) machine.cpu.pc());
+	// Use the machine printer so that guests cannot bypass it
+	if (len > 0)
+		machine.print(buffer, len);
 	throw MachineException(UNHANDLED_SYSCALL, "EBREAK instruction");
 }
 
@@ -338,7 +444,42 @@ static void syscall_readv(Machine<W>& machine)
 	}
 
 	int real_fd = -1;
-	if (vfd == 1 || vfd == 2) {
+	if (vfd == 0) {
+		// Special stdin handling, matching read(): the stdin_read
+		// callback is the only path to host standard input
+		const size_t iov_size = sizeof(guest_iovec<W>) * count;
+
+		// Retrieve the guest IO vec
+		std::array<guest_iovec<W>, 128> g_vec;
+		machine.copy_from_guest(g_vec.data(), iov_g, iov_size);
+
+		// Convert each iovec buffer to host buffers
+		std::array<riscv::vBuffer, 64> buffers;
+		size_t vec_cnt = 0;
+
+		for (int i = 0; i < count; i++) {
+			// The host buffers come directly from guest memory
+			vec_cnt += machine.memory.gather_writable_buffers_from_range(
+				buffers.size() - vec_cnt, &buffers[vec_cnt], g_vec[i].iov_base, g_vec[i].iov_len);
+		}
+
+		ssize_t res = 0;
+		for (size_t i = 0; i < vec_cnt; i++) {
+			// Arbitrary maximum read length
+			if (buffers[i].len > 1024 * 1024 * 16) {
+				machine.set_result(-ENOMEM);
+				return;
+			}
+			long r = machine.stdin_read(buffers[i].ptr, buffers[i].len);
+			if (r <= 0) break;
+			res += r;
+			if ((size_t)r < buffers[i].len) break;
+		}
+		machine.set_result_or_error(res);
+		SYSPRINT("SYSCALL readv(vfd: 0 iov: 0x%lX cnt: %d) = %ld\n",
+			(long)iov_g, count, (long)machine.return_value());
+		return;
+	} else if (vfd == 1 || vfd == 2) {
 		real_fd = -1;
 	} else if (machine.has_file_descriptors()) {
 		real_fd = machine.fds().translate(vfd);
@@ -376,7 +517,7 @@ static void syscall_writev(Machine<W>& machine)
 	const int  vfd    = machine.template sysarg<int>(0);
 	const auto iov_g  = machine.sysarg(1);
 	const auto count  = machine.template sysarg<int>(2);
-	if constexpr (verbose_syscalls) {
+	if constexpr (verbose_syscalls) if (riscv::verbose_syscalls_enabled) {
 		printf("SYSCALL writev, iov: 0x%lX  cnt: %d\n", (long)iov_g, count);
 	}
 	if (count < 0 || count > 256) {
@@ -424,7 +565,7 @@ static void syscall_writev(Machine<W>& machine)
 		}
 		machine.set_result_or_error(res);
 	}
-	if constexpr (verbose_syscalls) {
+	if constexpr (verbose_syscalls) if (riscv::verbose_syscalls_enabled) {
 		printf("SYSCALL writev, vfd: %d real_fd: %d -> %ld\n",
 			vfd, real_fd, long(machine.return_value()));
 	}
@@ -436,11 +577,13 @@ static void syscall_openat(Machine<W>& machine)
 	const int dir_fd = machine.template sysarg<int>(0);
 	const auto g_path = machine.sysarg(1);
 	const int flags  = machine.template sysarg<int>(2);
+	// The mode is only used with O_CREAT and O_TMPFILE, and ignored otherwise
+	const unsigned mode = machine.template sysarg<unsigned>(3);
 	// We do it this way to prevent accessing memory out of bounds
 	std::string path = machine.memory.memstring(g_path);
 
-	SYSPRINT("SYSCALL openat, dir_fd: %d path: %s flags: %X\n",
-		dir_fd, path.c_str(), flags);
+	SYSPRINT("SYSCALL openat, dir_fd: %d path: %s flags: %X mode: %o\n",
+		dir_fd, path.c_str(), flags, mode);
 
 	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
 
@@ -453,8 +596,8 @@ static void syscall_openat(Machine<W>& machine)
 				return;
 			}
 		}
-		int real_fd = openat(machine.fds().translate(dir_fd), path.c_str(), flags);
-		if (real_fd > 0) {
+		int real_fd = openat(machine.fds().translate(dir_fd), path.c_str(), flags, mode);
+		if (real_fd >= 0) {
 			const int vfd = machine.fds().assign_file(real_fd);
 			machine.set_result(vfd);
 		} else {
@@ -773,6 +916,13 @@ static void syscall_getcwd(Machine<W>& machine)
 	const auto g_buf = machine.sysarg(0);
 	[[maybe_unused]] const auto size = machine.sysarg(1);
 
+	if (UNLIKELY(!machine.has_file_descriptors())) {
+		machine.set_result(-EBADF);
+		SYSPRINT("SYSCALL getcwd, buffer: 0x%lX size: %ld => -EBADF\n",
+			(long)g_buf, (long)size);
+		return;
+	}
+
 	auto& cwd = machine.fds().cwd;
 	if (!cwd.empty()) {
 		machine.copy_to_guest(g_buf, cwd.c_str(), cwd.size()+1);
@@ -952,6 +1102,45 @@ static void syscall_clock_gettime64(Machine<W>& machine)
 	}
 	machine.set_result_or_error(res);
 }
+static constexpr time_t NANOSLEEP_MAX_SECONDS = 1;
+
+template <int W>
+static void nanosleep_clamp_and_penalize(Machine<W>& machine, struct timespec& ts_req)
+{
+	// A guest must not be able to block the host thread for arbitrarily
+	// long, and sleeping does not advance the instruction counter. Clamp
+	// the duration, and penalize the counter proportionally to the
+	// requested time so that repeated sleeps eventually reach the
+	// instruction limit.
+	const uint64_t requested_ns =
+		uint64_t(ts_req.tv_sec) * 1'000'000'000ull + uint64_t(ts_req.tv_nsec);
+	if (ts_req.tv_sec > NANOSLEEP_MAX_SECONDS)
+		ts_req.tv_sec = NANOSLEEP_MAX_SECONDS;
+	// One instruction per microsecond requested
+	machine.penalize(requested_ns / 1000);
+
+	// Cooperative threading: sleeping on the host blocks every guest thread,
+	// not just this one. When another thread is runnable, sleep only briefly
+	// and let the yield below hand the time over to it instead.
+	if (machine.has_threads() && !machine.threads().suspended_threads().empty()) {
+		static constexpr long SHARED_SLEEP_MAX_NS = 1'000'000L; // 1ms
+		if (ts_req.tv_sec > 0 || ts_req.tv_nsec > SHARED_SLEEP_MAX_NS) {
+			ts_req.tv_sec  = 0;
+			ts_req.tv_nsec = SHARED_SLEEP_MAX_NS;
+		}
+	}
+}
+
+/// @brief Hand over to the other guest threads after sleeping.
+/// @details Green threads only run when the running one gives way, so a
+/// thread that goes to sleep has to yield, or it starves all the others.
+template <int W>
+static void nanosleep_yield(Machine<W>& machine, long result)
+{
+	if (machine.has_threads())
+		machine.threads().suspend_and_yield(result);
+}
+
 template <int W>
 static void syscall_nanosleep(Machine<W>& machine)
 {
@@ -962,8 +1151,13 @@ static void syscall_nanosleep(Machine<W>& machine)
 
 	struct timespec ts_req;
 	machine.copy_from_guest(&ts_req, g_req, sizeof(ts_req));
+	if (UNLIKELY(ts_req.tv_sec < 0 || ts_req.tv_nsec < 0)) {
+		machine.set_result(-EINVAL);
+		return;
+	}
 	if (!(machine.has_file_descriptors() && machine.fds().proxy_mode))
 		ts_req.tv_nsec &= ANTI_FINGERPRINTING_MASK_NANOS();
+	nanosleep_clamp_and_penalize(machine, ts_req);
 
 	struct timespec ts_rem;
 	if (g_rem)
@@ -976,6 +1170,7 @@ static void syscall_nanosleep(Machine<W>& machine)
 			machine.copy_to_guest(g_rem, &ts_rem, sizeof(ts_rem));
 	}
 	machine.set_result_or_error(res);
+	nanosleep_yield(machine, machine.template return_value<long>());
 }
 template <int W>
 static void syscall_clock_nanosleep(Machine<W>& machine)
@@ -986,8 +1181,13 @@ static void syscall_clock_nanosleep(Machine<W>& machine)
 	struct timespec ts_req;
 	struct timespec ts_rem;
 	machine.copy_from_guest(&ts_req, g_request, sizeof(ts_req));
+	if (UNLIKELY(ts_req.tv_sec < 0 || ts_req.tv_nsec < 0)) {
+		machine.set_result(-EINVAL);
+		return;
+	}
 	if (!(machine.has_file_descriptors() && machine.fds().proxy_mode))
 		ts_req.tv_nsec &= ANTI_FINGERPRINTING_MASK_NANOS();
+	nanosleep_clamp_and_penalize(machine, ts_req);
 
 	const int res = nanosleep(&ts_req, &ts_rem);
 	if (res >= 0 && g_remain != 0x0) {
@@ -997,6 +1197,7 @@ static void syscall_clock_nanosleep(Machine<W>& machine)
 
 	SYSPRINT("SYSCALL clock_nanosleep, req: 0x%lX rem: 0x%lX = %ld\n",
 		(long)g_request, (long)g_remain, (long)machine.return_value());
+	nanosleep_yield(machine, machine.template return_value<long>());
 }
 
 template <int W>
@@ -1081,11 +1282,13 @@ static void syscall_brk(Machine<W>& machine)
 	auto new_end = machine.sysarg(0);
 	if (new_end > machine.memory.heap_address() + Memory<W>::BRK_MAX) {
 		new_end = machine.memory.heap_address() + Memory<W>::BRK_MAX;
-	} else if (new_end < machine.memory.heap_address()) {
-		new_end = machine.memory.heap_address();
 	}
+	// Static glibc puts the TLS block at the first break.
+	if (new_end >= machine.memory.heap_address())
+		machine.memory.set_brk_address(new_end);
+	new_end = machine.memory.brk_address();
 
-	if constexpr (verbose_syscalls) {
+	if constexpr (verbose_syscalls) if (riscv::verbose_syscalls_enabled) {
 		printf("SYSCALL brk, new_end: 0x%lX  mmap_start: 0x%lX\n",
 			(long)new_end, (long)machine.memory.mmap_start());
 	}
@@ -1133,7 +1336,7 @@ static void syscall_getrandom(Machine<W>& machine)
 	}
 	machine.set_result(result);
 
-	if constexpr (verbose_syscalls) {
+	if constexpr (verbose_syscalls) if (riscv::verbose_syscalls_enabled) {
 		printf("SYSCALL getrandom(addr=0x%lX, len=%ld) = %ld\n",
 			(long)g_addr, (long)g_len, (long)machine.return_value());
 	}
@@ -1307,7 +1510,7 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	// clock_nanosleep
 	install_syscall_handler(115, syscall_clock_nanosleep<W>);
 	// sched_getaffinity
-	install_syscall_handler(123, syscall_stub_nosys<W>);
+	install_syscall_handler(123, syscall_sched_getaffinity<W>);
 	// tkill
 	install_syscall_handler(130,
 	[] (Machine<W>& machine) {
@@ -1333,14 +1536,20 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	install_syscall_handler(134, syscall_sigaction<W>);
 	// rt_sigprocmask
 	install_syscall_handler(135, syscall_stub_zero<W>);
+	// rt_sigreturn
+	install_syscall_handler(139, syscall_rt_sigreturn<W>);
 	// uname
 	install_syscall_handler(160, syscall_uname<W>);
 	// prctl
 	install_syscall_handler(167, syscall_stub_nosys<W>);
 	// gettimeofday
 	install_syscall_handler(169, syscall_gettimeofday<W>);
+	// getrusage
+	install_syscall_handler(165, syscall_getrusage<W>);
 	// getpid
-	install_syscall_handler(172, syscall_stub_zero<W>);
+	install_syscall_handler(172, syscall_getpid<W>);
+	// getppid
+	install_syscall_handler(173, syscall_getppid<W>);
 	// getuid
 	install_syscall_handler(174, syscall_stub_zero<W>);
 	// geteuid
@@ -1358,7 +1567,7 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	// riscv_hwprobe
 	install_syscall_handler(258, syscall_stub_zero<W>);
 	// riscv_flush_icache
-	install_syscall_handler(259, syscall_stub_zero<W>);
+	install_syscall_handler(259, syscall_riscv_flush_icache<W>);
 
 	install_syscall_handler(278, syscall_getrandom<W>);
 
@@ -1380,10 +1589,6 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 		if (sockets)
 			add_socket_syscalls(*this);
 	}
-
-	register_clobbering_syscall(130); // TKILL
-	register_clobbering_syscall(93);  // EXIT
-	register_clobbering_syscall(94);  // EXIT_GROUP
 }
 
 #ifdef RISCV_32I

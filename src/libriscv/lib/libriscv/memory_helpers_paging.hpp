@@ -79,7 +79,10 @@ bool Memory<W>::try_memmove(address_t dst, address_t src, size_t len)
 		return true;
 
 	if constexpr (flat_readwrite_arena) {
-		if (LIKELY(dst + len < memory_arena_size() && dst + len > dst &&
+		// Below the read-only boundary the arena can be a shared read-only
+		// mapping, where a write is fatal
+		if (LIKELY(dst >= initial_rodata_end() &&
+			dst + len < memory_arena_size() && dst + len > dst &&
 			src + len < memory_arena_size() && src + len > src)) {
 			char* p_src = &((char *)m_arena.data)[src];
 			char* p_dest = &((char *)m_arena.data)[dst];
@@ -207,7 +210,9 @@ std::string_view Memory<W>::memview(address_t addr, size_t len, size_t maxlen) c
 		return {};
 
 	if constexpr (flat_readwrite_arena) {
-		if (LIKELY(addr + len - RWREAD_BEGIN < memory_arena_read_boundary() && addr < addr + len)) {
+		const address_t offset = addr - RWREAD_BEGIN;
+		const address_t window = memory_arena_read_boundary();
+		if (LIKELY(offset < window && len <= window - offset)) {
 			auto* begin = &((const char *)m_arena.data)[RISCV_SPECSAFE(addr)];
 			return {begin, len};
 		}
@@ -233,7 +238,9 @@ std::string_view Memory<W>::writable_memview(address_t addr, size_t len, size_t 
 		return {};
 
 	if constexpr (flat_readwrite_arena) {
-		if (LIKELY(addr + len - initial_rodata_end() < memory_arena_write_boundary() && addr < addr + len)) {
+		const address_t offset = addr - initial_rodata_end();
+		const address_t window = memory_arena_write_boundary();
+		if (LIKELY(offset < window && len <= window - offset)) {
 			char* begin = &((char *)m_arena.data)[RISCV_SPECSAFE(addr)];
 			return {begin, len};
 		}
@@ -277,6 +284,10 @@ T* Memory<W>::memarray(address_t addr, size_t count, size_t maxbytes) const
 	if (count != 0 && addr % alignof(T) != 0)
 		protection_fault(addr);
 
+	// The multiplication must not be allowed to overflow
+	if (UNLIKELY(count > maxbytes / sizeof(T)))
+		protection_fault(addr);
+
 	std::string_view view;
 	// When T* is const, we can use plain memview
 	if constexpr (std::is_const_v<T>) {
@@ -297,20 +308,26 @@ T* Memory<W>::try_memarray(address_t addr, size_t count, size_t maxbytes) const
 	if (count == 0)
 		return nullptr;
 
-	const size_t len = count * sizeof(T);
-	if (UNLIKELY(len > maxbytes))
+	// The multiplication must not be allowed to overflow
+	if (UNLIKELY(count > maxbytes / sizeof(T)))
 		protection_fault(addr);
+
+	const size_t len = count * sizeof(T);
 
 	if (addr % alignof(T) != 0)
 		protection_fault(addr);
 
 	if constexpr (flat_readwrite_arena && std::is_const_v<T>) {
-		if (LIKELY(addr + len - RWREAD_BEGIN < memory_arena_read_boundary() && addr < addr + len)) {
+		const address_t offset = addr - RWREAD_BEGIN;
+		const address_t window = memory_arena_read_boundary();
+		if (LIKELY(offset < window && len <= window - offset)) {
 			const char* begin = &((const char *)m_arena.data)[RISCV_SPECSAFE(addr)];
 			return (T*) begin;
 		}
 	} else if constexpr (flat_readwrite_arena) {
-		if (LIKELY(addr + len - initial_rodata_end() < memory_arena_write_boundary() && addr < addr + len)) {
+		const address_t offset = addr - initial_rodata_end();
+		const address_t window = memory_arena_write_boundary();
+		if (LIKELY(offset < window && len <= window - offset)) {
 			char* begin = &((char *)m_arena.data)[RISCV_SPECSAFE(addr)];
 			return (T*) begin;
 		}
@@ -331,6 +348,10 @@ std::span<T> Memory<W>::memspan(address_t addr, size_t count, size_t maxlen) con
 
 	if (count == 0)
 		return {};
+
+	// The multiplication must not be allowed to overflow
+	if (UNLIKELY(count > maxlen / sizeof(T)))
+		protection_fault(addr);
 
 	if constexpr (std::is_const_v<T>) {
 		auto view = memview(addr, count * sizeof(T), maxlen);
@@ -370,7 +391,7 @@ size_t Memory<W>::strlen(address_t addr, size_t maxlen) const
 		const size_t thislen = strnlen(start, max_bytes);
 		len += thislen;
 		if (thislen != max_bytes) break;
-		addr += len;
+		addr += thislen;
 	} while (len < maxlen);
 
 	return (len <= maxlen) ? len : maxlen;
@@ -392,6 +413,15 @@ int Memory<W>::memcmp(address_t p1, address_t p2, size_t len) const
 		protection_fault(p2);
 	return std::memcmp(&((const char*)m_arena.data)[p1], &((const char*)m_arena.data)[p2], len);
 #else
+	if constexpr (flat_readwrite_arena) {
+		if (LIKELY(p1 + len - RWREAD_BEGIN < memory_arena_read_boundary()
+			&& p2 + len - RWREAD_BEGIN < memory_arena_read_boundary()
+			&& p1 < p1 + len && p2 < p2 + len)) {
+			const char* s1 = &((const char *)m_arena.data)[RISCV_SPECSAFE(p1)];
+			const char* s2 = &((const char *)m_arena.data)[RISCV_SPECSAFE(p2)];
+			return std::memcmp(s1, s2, len);
+		}
+	}
 	// NOTE: fast implementation if no pointer crosses page boundary
 	const auto pageno1 = this->page_number(p1);
 	const auto pageno2 = this->page_number(p2);
@@ -437,6 +467,14 @@ int Memory<W>::memcmp(const void* ptr1, address_t p2, size_t len) const
 	return std::memcmp(ptr1, &((const char*)m_arena.data)[p2], len);
 #else
 	const char* s1 = (const char*) ptr1;
+	// The same flat-arena fast path as the two-address overload above
+	if constexpr (flat_readwrite_arena) {
+		if (LIKELY(p2 + len - RWREAD_BEGIN < memory_arena_read_boundary()
+			&& p2 < p2 + len)) {
+			const char* s2 = &((const char *)m_arena.data)[RISCV_SPECSAFE(p2)];
+			return std::memcmp(s1, s2, len);
+		}
+	}
 	// NOTE: fast implementation if no pointer crosses page boundary
 	const auto pageno2 = this->page_number(p2);
 	if (pageno2 == ((p2 + len-1) / Page::size())) {
@@ -519,6 +557,8 @@ template <int W> inline
 size_t Memory<W>::gather_buffers_from_range(
 	size_t cnt, vBuffer buffers[], address_t addr, size_t len) const
 {
+	if (len == 0)
+		return 0;
 #ifndef RISCV_VIRTUAL_PAGING
 	if (UNLIKELY(addr < RWREAD_BEGIN || addr + len > memory_arena_size() || addr + len < addr))
 		machine().cpu.trigger_exception(PROTECTION_FAULT, addr);
@@ -530,7 +570,7 @@ size_t Memory<W>::gather_buffers_from_range(
 #else
 	size_t index = 0;
 	vBuffer* last = nullptr;
-	while (len != 0 && index < cnt)
+	while (len != 0)
 	{
 		const size_t offset = addr & (Page::SIZE-1);
 		const size_t size = std::min(Page::SIZE - offset, len);
@@ -538,8 +578,12 @@ size_t Memory<W>::gather_buffers_from_range(
 
 		auto* ptr = (char*) &page.data()[offset];
 		if (last && ptr == last->ptr + last->len) {
+			// The next page continues the last buffer, which allows a
+			// single buffer to cover several (contiguous) pages
 			last->len += size;
 		} else {
+			if (index == cnt)
+				break;
 			last = &buffers[index];
 			last->ptr = ptr;
 			last->len = size;
@@ -559,6 +603,8 @@ template <int W> inline
 size_t Memory<W>::gather_writable_buffers_from_range(
 	size_t cnt, vBuffer buffers[], address_t addr, size_t len)
 {
+	if (len == 0)
+		return 0;
 #ifndef RISCV_VIRTUAL_PAGING
 	if (UNLIKELY(addr < initial_rodata_end() || addr + len > memory_arena_size() || addr + len < addr))
 		machine().cpu.trigger_exception(PROTECTION_FAULT, addr);
@@ -570,7 +616,7 @@ size_t Memory<W>::gather_writable_buffers_from_range(
 #else
 	size_t index = 0;
 	vBuffer* last = nullptr;
-	while (len != 0 && index < cnt)
+	while (len != 0)
 	{
 		const size_t offset = addr & (Page::SIZE-1);
 		const size_t size = std::min(Page::SIZE - offset, len);
@@ -578,8 +624,12 @@ size_t Memory<W>::gather_writable_buffers_from_range(
 
 		auto* ptr = (char*) &page.data()[offset];
 		if (last && ptr == last->ptr + last->len) {
+			// The next page continues the last buffer, which allows a
+			// single buffer to cover several (contiguous) pages
 			last->len += size;
 		} else {
+			if (index == cnt)
+				break;
 			last = &buffers[index];
 			last->ptr = ptr;
 			last->len = size;

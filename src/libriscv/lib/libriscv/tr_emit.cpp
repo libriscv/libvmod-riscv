@@ -1,9 +1,12 @@
 #include "machine.hpp"
 #include "decoder_cache.hpp"
 #include "instruction_list.hpp"
+#include "dyncall.hpp"
+#include <algorithm>
 #include <array>
 #include <inttypes.h>
 #include <optional>
+#include <set>
 #include "rv32i_instr.hpp"
 #include "rvfd.hpp"
 #include "tr_types.hpp"
@@ -17,19 +20,19 @@
 #define PCRELA(x) ((address_t) (this->pc() + (x)))
 #define PCRELS(x) hex_address(PCRELA(x)) + "LL"
 #define STRADDR(x) (hex_address(x) + "LL")
-// Reveal PC on unknown instructions
-// libtcc always runs on the current machine, so we can use the handler index directly
+// libtcc: resolve handler at translate time; shared builds dispatch at runtime
 #define UNKNOWN_INSTRUCTION() { \
+  this->invalidate_all_bounds_checks(); \
   if (tinfo.is_libtcc) { \
 	if (!instr.is_illegal()) { \
 		this->store_loaded_registers(); \
 		const uintptr_t handler = (uintptr_t)CPU<W>::decode(instr).handler; \
 		code += "if (api.execute_handler(cpu, " + std::to_string(instr.whole) + ", " + std::to_string(handler) + "))\n" \
-			"  return (ReturnValues){0, 0};\n"; \
+			"  RETURN_VALUES(0, 0);\n"; \
 		this->reload_all_registers(); \
 	} else if (m_zero_insn_counter <= 1) { \
 		code += "api.exception(cpu, " + STRADDR(this->pc()) + ", ILLEGAL_OPCODE);\n"; \
-		code += "return (ReturnValues){0, 0};\n"; \
+		code += "RETURN_VALUES(0, 0);\n"; \
 	} \
   } else { \
 	if (!instr.is_illegal()) { \
@@ -46,11 +49,13 @@
 		code += "api.exception(cpu, " + hex_address(this->pc()) + ", ILLEGAL_OPCODE);\n"; \
   } \
 }
+// Handler may clobber any GPR; invalidate all bounds-check windows.
 #define WELL_KNOWN_INSTRUCTION() { \
+  this->invalidate_all_bounds_checks(); \
   if (tinfo.is_libtcc) { \
 	const uintptr_t handler = (uintptr_t)CPU<W>::decode(instr).handler; \
 	code += "if (api.execute_handler(cpu, " + std::to_string(instr.whole) + ", " + std::to_string(handler) + "))\n" \
-		"  return (ReturnValues){0, 0};\n"; \
+		"  RETURN_VALUES(0, 0);\n"; \
   } else { \
 	code += "#ifdef __wasm__\n"; \
 	code += "api.execute(cpu, " + std::to_string(instr.whole) + ");\n"; \
@@ -93,16 +98,24 @@ struct BranchInfo {
 template <int W>
 struct Emitter
 {
-	static constexpr bool OPTIMIZE_SYSCALL_REGISTERS = true;
 	static constexpr unsigned XLEN = W * 8u;
-	static constexpr int CACHED_REGISTERS = 18; // Number of registers to cache
+	// An optimizing compiler allocates locals for free, so every register is a
+	// local: a register left in cpu->r[] costs a memory access on every use.
+	static constexpr int LIBTCC_CACHED_REGISTERS = 32;
+	static constexpr int SYSCC_CACHED_REGISTERS  = 32;
+	// A return is resolved by comparing against the known call sites before
+	// falling back to indirect dispatch; beyond this many sites the compares
+	// are more likely to miss than the branch predictor.
+	static constexpr size_t MAX_PREDICTED_RETURN_SITES = 4;
+	const int CACHED_REGISTERS;
 	using address_t = address_type<W>;
 	using saddr_t = signed_address_type<W>;
 
 	bool uses_register_caching() const noexcept { return tinfo.use_register_caching; }
 
 	Emitter(const TransInfo<W>& ptinfo)
-		: m_pc(ptinfo.basepc), tinfo(ptinfo)
+		: CACHED_REGISTERS(ptinfo.is_libtcc ? LIBTCC_CACHED_REGISTERS : SYSCC_CACHED_REGISTERS),
+		  m_pc(ptinfo.basepc), tinfo(ptinfo)
 	{
 		this->func = funclabel<W>("f", this->pc());
 		this->m_arena_hex_address = hex_address(tinfo.arena_ptr) + "L";
@@ -134,6 +147,8 @@ struct Emitter
 		}
 	}
 	void potentially_reload_register(int reg) {
+		// Reload from memory; may invalidate bounds-check.
+		this->invalidate_bounds_checks(reg);
 		if (uses_register_caching()) {
 			if (reg != 0 && reg < CACHED_REGISTERS) {
 				add_code(loaded_regname(reg) + " = cpu->r[" + std::to_string(reg) + "];");
@@ -158,32 +173,34 @@ struct Emitter
 	}
 
 	void reload_all_registers() {
-		// Use the LOAD_REGS macro to restore the registers
+		this->invalidate_all_bounds_checks();
 		if (uses_register_caching())
 			add_code("LOAD_REGS_" + this->func + "();");
 	}
-	void store_loaded_registers() {
-		// Use the STORE_REGS macro to store the registers
-		if (uses_register_caching())
-			add_code("STORE_REGS_" + this->func + "();");
+	uint32_t dirty_registers() const noexcept {
+		return (index() < m_dirty_at.size()) ? m_dirty_at[index()] : ~0u;
 	}
+	void store_registers(uint32_t mask) {
+		if (uses_register_caching()) {
+			this->m_store_masks.insert(mask);
+			add_code("STORE_REGS_" + this->func + "_" + hex_address(mask) + "();");
+		}
+	}
+	void store_loaded_registers() {
+		this->store_registers(this->dirty_registers());
+	}
+	const auto& get_store_masks() const noexcept { return this->m_store_masks; }
 	void reload_syscall_registers() {
-		// Use the LOAD_SYS_REGS macro to restore registers modified by a syscall
+		this->invalidate_bounds_checks(10);
+		this->invalidate_bounds_checks(11);
 		if (uses_register_caching())
 			add_code("LOAD_SYS_REGS_" + this->func + "();");
-	}
-	void store_syscall_registers() {
-		// Use the STORE_SYS_REGS macro to store registers used by a syscall
-		if (uses_register_caching()) {
-			add_code("STORE_SYS_REGS_" + this->func + "();");
-			this->m_used_store_syscalls = true;
-		}
 	}
 
 	void exit_function(const std::string& new_pc, bool add_bracket = false)
 	{
 		this->store_loaded_registers();
-		const char* return_code = (tinfo.ignore_instruction_limit) ? "return (ReturnValues){0, max_ic};" : "return (ReturnValues){ic, max_ic};";
+		const char* return_code = (tinfo.ignore_instruction_limit) ? "RETURN_VALUES(0, max_ic);" : "RETURN_VALUES(ic, max_ic);";
 		add_code(
 			(new_pc != "cpu->pc") ? "cpu->pc = " + new_pc + ";" : "",
 			return_code, (add_bracket) ? " }" : "");
@@ -218,10 +235,13 @@ struct Emitter
 		}
 		return "(addr_t)0";
 	}
+	// Every GPR write passes through to_reg(); invalidating here kills stale bounds-check windows.
 	std::string to_reg(int reg) {
 		if (reg != 0) {
+			this->invalidate_bounds_checks(reg);
 			if (uses_register_caching() && reg < CACHED_REGISTERS) {
 				load_register(reg);
+				this->gpr_written[reg] = true;
 				return loaded_regname(reg);
 			} else {
 				return "cpu->r[" + std::to_string(reg) + "]";
@@ -235,6 +255,932 @@ struct Emitter
 #ifdef RISCV_EXT_VECTOR
 	std::string from_rvvreg(int reg) {
 		return "cpu->rvv.lane[" + std::to_string(reg) + "]";
+	}
+	// Elements in one full register at this SEW, ie. VLMAX at LMUL=1.
+	static constexpr unsigned rvv_full_vl(unsigned vsew) noexcept {
+		return VectorLane::size() >> vsew;
+	}
+	// Full m1 lane at this SEW: all elements active, no tail.
+	// Matches the fast path in unit_stride_load/store.
+	std::string rvv_full_lane_condition(unsigned vsew) const {
+		// An inlined vsetvli leaves vl in a C local, sparing us a reload.
+		std::string cond = (m_vl_local.empty() ? "cpu->rvv.vl" : m_vl_local)
+			+ " == " + std::to_string(rvv_full_vl(vsew));
+		if (m_vtype.known)
+			return cond;
+		return cond + " && cpu->rvv.vsew == " + std::to_string(vsew)
+			+ " && cpu->rvv.lmul == 0 && !cpu->rvv.vill";
+	}
+	// Per-SEW guard as a C local, shared by all vector instructions in the block.
+	const std::string& rvv_guard(unsigned vsew)
+	{
+		auto& guard = m_rvv_guard.at(vsew);
+		if (guard.empty()) {
+			// With vl known too the guard folds to a constant, and the C
+			// compiler drops either the body or the fallback entirely.
+			if (m_vtype.known && m_vl_known)
+				guard = (m_vl == rvv_full_vl(vsew)) ? "1" : "0";
+			else {
+				guard = "vok" + PCRELS(0) + "_" + std::to_string(vsew);
+				// Declared and assigned separately: an embedded translation
+				// is compiled as C++, where a goto may not jump over an
+				// initialization, and labels land between vector blocks.
+				add_code("int " + guard + "; " + guard + " = "
+					+ rvv_full_lane_condition(vsew) + ";");
+			}
+		}
+		return guard;
+	}
+	// vl is about to change, or may have changed behind our back. SEW, LMUL
+	// and vill are untouched, and so is anything proven from them.
+	void reset_vector_vl() {
+		this->m_vl_known = false;
+		this->m_vl_local.clear();
+		for (auto& guard : this->m_rvv_guard) guard.clear();
+	}
+	void reset_vector_config() {
+		this->m_vtype = {};
+		this->reset_vector_vl();
+	}
+	// Call the interpreter's instruction handler (non-libtcc slow path)
+	void emit_vector_handler_call(const rv32i_instruction& instr) {
+		code += "#ifdef __wasm__\n";
+		code += "api.execute(cpu, " + std::to_string(instr.whole) + ");\n";
+		code += "#else\n";
+		code += "{ static int handler_idx = 0;\n";
+		code += "if (handler_idx) api.handlers[handler_idx](cpu, " + std::to_string(instr.whole) + ");\n";
+		code += "else handler_idx = api.execute(cpu, " + std::to_string(instr.whole) + "); }\n";
+		code += "#endif\n";
+	}
+
+	// The integer registers potentially used by a vector instruction handler
+	struct VectorScalarUse {
+		int reads[2] { -1, -1 };
+		int writes { -1 };
+	};
+	static VectorScalarUse vector_scalar_use(const rv32i_instruction& vinstr)
+	{
+		const rv32v_instruction vi { vinstr };
+		VectorScalarUse use;
+		switch (vinstr.opcode()) {
+		case RV32V_OP:
+			switch (vinstr.vwidth()) {
+			case 0x4: // OPI.VX: scalar operand from x[rs1]
+				use.reads[0] = vi.OPVI.imm;
+				break;
+			case 0x6: // OPM.VX: scalar operand from x[rs1] (VMV.S.X, VSLIDE1*.VX, ...)
+				use.reads[0] = vi.OPVV.vs1;
+				break;
+			case 0x2: // OPM.VV: VWXUNARY0 (VMV.X.S, VCPOP.M, VFIRST.M) writes x[rd]
+				if (vi.OPVV.funct6 == 0b010000)
+					use.writes = vi.OPVV.vd;
+				break;
+			case 0x7: // Vector configuration: AVL from x[rs1], resulting vl into x[rd]
+				switch (vinstr.vsetfunc()) {
+				case 0x0:
+				case 0x1: // VSETVLI
+					use.reads[0] = vi.VLI.rs1;
+					break;
+				case 0x2: // VSETVL: new vtype comes from x[rs2] as well
+					use.reads[0] = vi.VSETVL.rs1;
+					use.reads[1] = vi.VSETVL.rs2;
+					break;
+				default: // VSETIVLI: the AVL is a 5-bit immediate
+					break;
+				}
+				use.writes = vi.VLI.rd;
+				break;
+			default: // OPI.VV, OPI.VI, OPF.VV, OPF.VF: vector and fp registers only
+				break;
+			}
+			break;
+		case RV32F_LOAD:  // Vector loads address memory through x[rs1]
+			use.reads[0] = vi.VL.rs1;
+			// A strided access takes its byte stride from x[rs2] too.
+			if (vi.VL.mop == 0b10)
+				use.reads[1] = vi.VLS.rs2;
+			break;
+		case RV32F_STORE: // x[rs1] likewise
+			use.reads[0] = vi.VS.rs1;
+			if (vi.VS.mop == 0b10)
+				use.reads[1] = vi.VSS.rs2;
+			break;
+		default:
+			break;
+		}
+		return use;
+	}
+	// Realize the integer registers the handler reads.
+	void realize_vector_scalar_reads(const VectorScalarUse& use) {
+		for (const int reg : use.reads) {
+			if (reg > 0) {
+				this->load_register(reg);
+				this->potentially_realize_register(reg);
+			}
+		}
+	}
+	// Reload the one integer register the handler may have written.
+	void reload_vector_scalar_writes(const VectorScalarUse& use) {
+		if (use.writes > 0) {
+			this->reset_tracked_register(use.writes);
+			this->potentially_reload_register(use.writes);
+		}
+	}
+	// Group alignment: must be aligned to its size and fit in v0-v31. Fractional LMUL = single register.
+	bool vector_group_is_aligned(unsigned vreg) const noexcept
+	{
+		const unsigned regs = (m_vtype.lmul >= 0) ? (1u << m_vtype.lmul) : 0u;
+		return regs <= 1 || (vreg % regs == 0 && vreg + regs <= 32);
+	}
+	// True if this encoding's handler cannot trap. Three preconditions (valid vtype,
+	// supported SEW, aligned register group) are proven by an earlier inlined vsetvli;
+	// without a known vtype the answer is always yes.
+	bool vector_handler_can_trap(const rv32i_instruction& vinstr) const
+	{
+		// Loads and stores fault on an address that is not known here.
+		if (vinstr.opcode() != RV32V_OP)
+			return true;
+		if (!m_vtype.known || m_vtype.vill)
+			return true;
+		const rv32v_instruction vi { vinstr };
+		const unsigned f6 = vi.OPVV.funct6;
+		// The floating-point families are defined for SEW 32 and 64 only.
+		const bool fp_sew = (m_vtype.vsew == 2 || m_vtype.vsew == 3);
+		// vs1 shares its field with the immediate, and is only a register
+		// group in the .vv forms.
+		const bool vd_ok  = vector_group_is_aligned(vi.OPVV.vd);
+		const bool vs1_ok = vector_group_is_aligned(vi.OPVV.vs1);
+		const bool vs2_ok = vector_group_is_aligned(vi.OPVV.vs2);
+
+		switch (vinstr.vwidth()) {
+		case 0x0: // OPI.VV: elements out of three SEW-sized groups
+			if (!vd_ok || !vs1_ok || !vs2_ok)
+				return true;
+			switch (f6) {
+			case 0b000000: // VADD.VV
+			case 0b000001: // VANDN.VV
+			case 0b000010: // VSUB.VV
+			case 0b000100: // VMINU.VV
+			case 0b000101: // VMIN.VV
+			case 0b000110: // VMAXU.VV
+			case 0b000111: // VMAX.VV
+			case 0b001001: // VAND.VV
+			case 0b001010: // VOR.VV
+			case 0b001011: // VXOR.VV
+			case 0b001100: // VRGATHER.VV
+			case 0b010001: // VMADC.VV(M)
+			case 0b010011: // VMSBC.VV(M)
+			case 0b010111: // VMERGE.VVM / VMV.V.V
+			case 0b011000: // VMSEQ.VV
+			case 0b011001: // VMSNE.VV
+			case 0b011010: // VMSLTU.VV
+			case 0b011011: // VMSLT.VV
+			case 0b011100: // VMSLEU.VV
+			case 0b011101: // VMSLE.VV
+			case 0b100000: // VSADDU.VV
+			case 0b100001: // VSADD.VV
+			case 0b100010: // VSSUBU.VV
+			case 0b100011: // VSSUB.VV
+			case 0b100101: // VSLL.VV
+			case 0b101000: // VSRL.VV
+			case 0b101001: // VSRA.VV
+				return false;
+			case 0b010000: // VADC.VVM
+			case 0b010010: // VSBC.VVM
+				// vm=1 is reserved for these two: v0 is the carry, not a mask.
+				return vi.OPVV.vm != 0;
+			default:
+				return true;
+			}
+		case 0x3: // OPI.VI
+		case 0x4: // OPI.VX: the second source is an immediate or x[rs1]
+			if (!vd_ok || !vs2_ok)
+				return true;
+			switch (f6) {
+			case 0b000000: // VADD
+			case 0b000011: // VRSUB
+			case 0b001001: // VAND
+			case 0b001010: // VOR
+			case 0b001011: // VXOR
+			case 0b001100: // VRGATHER
+			case 0b001110: // VSLIDEUP
+			case 0b001111: // VSLIDEDOWN
+			case 0b010111: // VMERGE / VMV.V.I|X
+			case 0b011000: // VMSEQ
+			case 0b011001: // VMSNE
+			case 0b011010: // VMSLTU
+			case 0b011011: // VMSLT
+			case 0b011100: // VMSLEU
+			case 0b011101: // VMSLE
+			case 0b011110: // VMSGTU
+			case 0b011111: // VMSGT
+			case 0b100000: // VSADDU
+			case 0b100001: // VSADD
+			case 0b100010: // VSSUBU
+			case 0b100011: // VSSUB
+			case 0b100101: // VSLL
+			case 0b101000: // VSRL
+			case 0b101001: // VSRA
+				return false;
+			case 0b000001: // VANDN: there is no .vi form
+				return vinstr.vwidth() != 0x4;
+			default:
+				return true;
+			}
+		case 0x2: // OPM.VV
+		case 0x6: // OPM.VX
+			switch (f6) {
+			case 0b011000: // VMANDN.MM
+			case 0b011001: // VMAND.MM
+			case 0b011010: // VMOR.MM
+			case 0b011011: // VMXOR.MM
+			case 0b011100: // VMORN.MM
+			case 0b011101: // VMNAND.MM
+			case 0b011110: // VMNOR.MM
+			case 0b011111: // VMXNOR.MM
+				// Whole single mask registers: no group to align. The .vx
+				// forms are reserved and fall through to the handler's trap.
+				return vinstr.vwidth() != 0x2;
+			case 0b100000: // VDIVU
+			case 0b100001: // VDIV
+			case 0b100010: // VREMU
+			case 0b100011: // VREM
+			case 0b100100: // VMULHU
+			case 0b100101: // VMUL
+			case 0b100110: // VMULHSU
+			case 0b100111: // VMULH
+			case 0b101001: // VMADD
+			case 0b101011: // VNMSUB
+			case 0b101101: // VMACC
+			case 0b101111: // VNMSAC
+				return !vd_ok || !vs2_ok
+					|| (vinstr.vwidth() == 0x2 && !vs1_ok);
+			default:
+				return true;
+			}
+		case 0x1: // OPF.VV
+			// Only element-wise OPF.VV arithmetic; widening/reduction/conversion handlers have their own checks.
+			if (!RVV_IS_OPFVV_ARITH(f6))
+				return true;
+			return !fp_sew || !vd_ok || !vs1_ok || !vs2_ok;
+		case 0x5: // OPF.VF
+			if (!fp_sew || !vd_ok || !vs2_ok)
+				return true;
+			switch (f6) {
+			case 0b000000: // VFADD.VF
+			case 0b000010: // VFSUB.VF
+			case 0b000100: // VFMIN.VF
+			case 0b000110: // VFMAX.VF
+			case 0b001000: // VFSGNJ.VF
+			case 0b001001: // VFSGNJN.VF
+			case 0b001010: // VFSGNJX.VF
+			case 0b001110: // VFSLIDE1UP.VF
+			case 0b001111: // VFSLIDE1DOWN.VF
+			case 0b010000: // VFMV.S.F
+			case 0b010111: // VFMERGE.VFM / VFMV.V.F
+			case 0b011000: // VMFEQ.VF
+			case 0b011001: // VMFLE.VF
+			case 0b011011: // VMFLT.VF
+			case 0b011100: // VMFNE.VF
+			case 0b011101: // VMFGT.VF
+			case 0b011111: // VMFGE.VF
+			case 0b100000: // VFDIV.VF
+			case 0b100001: // VFRDIV.VF
+			case 0b100100: // VFMUL.VF
+			case 0b100111: // VFRSUB.VF
+			case 0b101000: case 0b101001: case 0b101010: case 0b101011:
+			case 0b101100: case 0b101101: case 0b101110: case 0b101111:
+				return false; // ... and the eight fused multiply-adds
+			default:
+				return true;
+			}
+		default: // 0x7: vector configuration
+			return true;
+		}
+	}
+	// True if the handler may modify vl or vtype. Only vsetvl* and fault-only-first loads do.
+	static bool vector_handler_can_reconfigure(const rv32i_instruction& vinstr)
+	{
+		if (vinstr.opcode() == RV32V_OP)
+			return vinstr.vwidth() == 0x7;
+		if (vinstr.opcode() != RV32F_LOAD)
+			return false; // vector stores never write vl
+		const rv32v_instruction vi { vinstr };
+		return vi.VL.mop == 0b00 && vi.VL.lumop == 0b10000;
+	}
+	// Leave the block when a vector handler has raised.
+	void emit_vector_trap_branch(const std::string& condition)
+	{
+		code += "if (UNLIKELY(" + condition + "))";
+		if (this->uses_register_caching()) {
+			this->m_used_vector_trap = true;
+			code += " goto " + this->vector_trap_label() + ";\n";
+		} else {
+			// Nothing to store, so the exit is already as small as the jump.
+			code += " {\nRETURN_VALUES(0, 0);\n}\n";
+		}
+	}
+	void emit_vector_handler_invoke()
+	{
+		if (!tinfo.is_libtcc) {
+			this->emit_vector_handler_call(instr);
+			return;
+		}
+		const uintptr_t handler = (uintptr_t)CPU<W>::decode(instr).handler;
+		const std::string call = "api.execute_handler(cpu, "
+			+ std::to_string(instr.whole) + ", " + std::to_string(handler) + ")";
+		// Nothing follows a call that has been proven unable to raise.
+		if (!this->m_vtrap_needed)
+			add_code(call + ";");
+		else
+			this->emit_vector_trap_branch(call);
+	}
+	std::string vector_trap_label() const {
+		return this->func + "_vtrap";
+	}
+	void emit_vector_trap_epilogue()
+	{
+		if (!this->m_used_vector_trap)
+			return;
+		add_code(this->vector_trap_label() + ":;");
+		this->store_registers(~0u); // Reached from anywhere in the block
+		add_code("RETURN_VALUES(0, 0);");
+	}
+	// Interpreter fallback: realize/reload only the named scalar registers.
+	void emit_vector_slowpath()
+	{
+		// Fault-only-first loads shorten vl; vsetvl* rewrites the whole vtype.
+		if (vector_handler_can_reconfigure(instr)) {
+			if (instr.opcode() == RV32V_OP)
+				this->reset_vector_config();
+			else
+				this->reset_vector_vl();
+		}
+		const auto use = vector_scalar_use(this->instr);
+		this->realize_vector_scalar_reads(use);
+		this->emit_vector_handler_invoke();
+		this->reload_vector_scalar_writes(use);
+	}
+	// Whether an arena bounds check is needed at runtime.
+	bool vector_memory_needs_bounds_check() noexcept {
+		return !tinfo.unsafe_remove_checks && !uses_Nbit_encompassing_arena();
+	}
+	// Element-wise float operator, or nullptr when not inlined.
+	static const char* vector_float_operator(const rv32i_instruction& vinstr)
+	{
+		if (vinstr.vwidth() != 0x1 && vinstr.vwidth() != 0x5) // OPF.VV / OPF.VF
+			return nullptr;
+		if (!rv32v_instruction{vinstr}.OPVV.vm)
+			return nullptr; // Masked: element activity depends on v0 at runtime
+		switch (rv32v_instruction{vinstr}.OPVV.funct6) {
+		case 0b000000: return " + "; // VFADD
+		case 0b000010: return " - "; // VFSUB
+		case 0b100000: return " / "; // VFDIV
+		case 0b100100: return " * "; // VFMUL
+		default:       return nullptr;
+		}
+	}
+	// True for the eight fused multiply-add encodings shared by OPFVV and
+	// OPFVF. They read the destination as their third operand.
+	static bool vector_is_float_fma(const rv32i_instruction& vinstr)
+	{
+		if (vinstr.vwidth() != 0x1 && vinstr.vwidth() != 0x5) // OPF.VV / OPF.VF
+			return false;
+		if (!rv32v_instruction{vinstr}.OPVV.vm)
+			return false; // Masked: element activity depends on v0 at runtime
+		return (rv32v_instruction{vinstr}.OPVV.funct6 & 0b111000) == 0b101000;
+	}
+	// EEW log2 for unit-stride widths, or -1 for non-standard widths.
+	static int vector_unit_stride_sew(uint32_t width) noexcept
+	{
+		switch (width) {
+		case 0b000: return 0; // VLE8  / VSE8
+		case 0b101: return 1; // VLE16 / VSE16
+		case 0b110: return 2; // VLE32 / VSE32
+		case 0b111: return 3; // VLE64 / VSE64
+		default:    return -1;
+		}
+	}
+	// Helpers to inline vector memory forms that are simple enough to be expressed in C
+	enum class VectorMemForm {
+		None,             // left to the interpreter handler
+		UnitStride,       // vle<eew>.v / vse<eew>.v: vl*EEW bytes
+		MaskedUnitStride, // ... the same, with v0 choosing the elements
+		WholeRegister,    // vl<n>re<eew>.v / vs<n>r.v: n registers, no vtype
+		Mask,             // vlm.v / vsm.v: ceil(vl/8) bytes
+	};
+	struct VectorMemInfo {
+		VectorMemForm form = VectorMemForm::None;
+		bool     is_store = false;
+		unsigned eew_log2 = 0; // log2(EEW / 8), the unit-stride forms
+		unsigned nregs    = 1; // registers moved by a whole-register transfer
+		unsigned vreg     = 0; // vd, or vs3 in a store
+		unsigned rs1      = 0; // the base address
+	};
+	// Max inlined transfer: 8 registers (LMUL=8 / widest whole-register form).
+	static constexpr uint64_t vector_max_transfer() noexcept {
+		return 8ull * VectorLane::size();
+	}
+	// Static classification of vector memory ops. Only vtype-dependent checks remain at runtime.
+	VectorMemInfo vector_memory_form(const rv32i_instruction& vinstr)
+	{
+		const rv32v_instruction vi { vinstr };
+		VectorMemInfo info;
+		if (vinstr.opcode() == RV32F_STORE)
+			info.is_store = true;
+		else if (vinstr.opcode() != RV32F_LOAD)
+			return {};
+		// Every body below reaches guest memory as a host pointer.
+		if (!uses_flat_memory_arena())
+			return {};
+		// MEW asks for an element wider than 64 bits, and a mop other than 00
+		// is a strided or indexed access: both belong to the handler.
+		if (vi.VL.mew || vi.VL.mop != 0b00)
+			return {};
+		info.vreg = info.is_store ? vi.VS.vs3 : vi.VL.vd;
+		info.rs1  = info.is_store ? vi.VS.rs1 : vi.VL.rs1;
+		const unsigned nf = vi.VL.nf + 1; // fields per segment
+		switch (info.is_store ? vi.VS.sumop : vi.VL.lumop) {
+		case 0b00000: { // The plain unit-stride access
+			if (nf != 1)
+				return {}; // Segmented: several fields share one address
+			const int eew = vector_unit_stride_sew(vi.VL.width);
+			if (eew < 0)
+				return {};
+			info.eew_log2 = unsigned(eew);
+			info.form = vi.VL.vm ? VectorMemForm::UnitStride
+			                     : VectorMemForm::MaskedUnitStride;
+			return info; }
+		case 0b01000: // vl<n>re<eew>.v / vs<n>r.v
+			// An illegal register count, or a group that is not aligned to
+			// its own size, has to trap: only the handler knows how.
+			if (!vi.VL.vm || (nf != 1 && nf != 2 && nf != 4 && nf != 8))
+				return {};
+			if ((info.vreg % nf) != 0 || info.vreg + nf > 32)
+				return {};
+			info.nregs = nf;
+			info.form = VectorMemForm::WholeRegister;
+			return info;
+		case 0b01011: // vlm.v / vsm.v
+			if (!vi.VL.vm || nf != 1 || vi.VL.width != 0)
+				return {};
+			info.form = VectorMemForm::Mask;
+			return info;
+		default: // Fault-only-first, and the encodings that trap
+			return {};
+		}
+	}
+	// Inlinable SEWs for float arithmetic. Empty = use interpreter.
+	std::vector<unsigned> vector_inlinable_sews(const rv32i_instruction& vinstr)
+	{
+		if (vinstr.opcode() != RV32V_OP)
+			return {};
+		if (vector_float_operator(vinstr) == nullptr && !vector_is_float_fma(vinstr))
+			return {};
+		// Both float widths are inlinable: a known vtype selects one,
+		// otherwise both bodies are emitted behind their own guard.
+		if (!m_vtype.known)
+			return { 2, 3 };
+		// An inline body is only reachable at the SEW and LMUL it was written
+		// for, so a known vtype decides it here, not at runtime.
+		if (m_vtype.vill || m_vtype.lmul != 0 || m_vtype.vsew < 2)
+			return {}; // Fractional/multi-register groups, and no 8/16-bit floats
+		return { m_vtype.vsew };
+	}
+	// The live vl, as a C expression: the local an inlined vsetvli left
+	// behind, or the field itself.
+	std::string vector_vl_expr() const {
+		return m_vl_local.empty() ? "cpu->rvv.vl" : m_vl_local;
+	}
+	// Runtime checks for a unit-stride transfer, minus what the proven vtype already settled.
+	struct VectorStridePlan {
+		std::vector<std::string> locals; // declared before the guard is tested
+		std::string guard;       // empty when nothing is left to test
+		std::string bytes;       // C expression for the length of the run
+		bool     bytes_known = false;
+		uint64_t known_bytes = 0;
+		unsigned dregs = 0;      // registers in the group, 0 when runtime-only
+	};
+	// Returns false when this encoding cannot be inlined here at all, in
+	// which case the caller hands the instruction over whole.
+	bool vector_plan_unit_stride(const VectorMemInfo& info, VectorStridePlan& plan)
+	{
+		constexpr uint64_t lane_size = VectorLane::size();
+		const unsigned eew = info.eew_log2;
+		if (m_vtype.known) {
+			// EMUL = LMUL * EEW / SEW, as a count of registers.
+			const int emul = m_vtype.lmul + int(eew) - int(m_vtype.vsew);
+			if (m_vtype.vill || emul > 3 || emul < -3)
+				return false;
+			// A group of one needs no alignment, which covers every EEW at
+			// LMUL <= 1; anything wider has to be aligned to its own size.
+			plan.dregs = (emul > 0) ? (1u << emul) : 1u;
+			if (plan.dregs > 1 && ((info.vreg % plan.dregs) != 0
+				|| info.vreg + plan.dregs > 32))
+				return false;
+			const uint64_t max_bytes = uint64_t(plan.dregs) * lane_size;
+			if (m_vl_known) {
+				plan.known_bytes = m_vl << eew;
+				plan.bytes_known = true;
+				// vl outliving the vtype that sized it is rare enough to
+				// leave to the handler.
+				if (plan.known_bytes > max_bytes)
+					return false;
+				plan.bytes = std::to_string(plan.known_bytes);
+			} else {
+				plan.bytes = "vnb" + PCRELS(0);
+				plan.locals.push_back("const addr_t " + plan.bytes + " = (addr_t)"
+					+ vector_vl_expr() + " << " + std::to_string(eew) + ";");
+				plan.guard = plan.bytes + " <= " + std::to_string(max_bytes);
+			}
+			return true;
+		}
+		// vtype is live, so the same arithmetic goes into the guard. The
+		// destination register is a constant, so the alignment test folds
+		// down to a compare once the C compiler knows EMUL.
+		const std::string emul = "vem" + PCRELS(0);
+		const std::string vd = std::to_string(info.vreg);
+		plan.bytes = "vnb" + PCRELS(0);
+		plan.locals.push_back("const int " + emul + " = (int)cpu->rvv.lmul + "
+			+ std::to_string(eew) + " - (int)cpu->rvv.vsew;");
+		plan.locals.push_back("const addr_t " + plan.bytes + " = (addr_t)"
+			+ vector_vl_expr() + " << " + std::to_string(eew) + ";");
+		plan.guard = "!cpu->rvv.vill && " + emul + " <= 3 && " + emul + " >= -3"
+			" && (" + emul + " <= 0 || ((" + vd + " & ((1 << " + emul + ") - 1)) == 0"
+			" && " + vd + " + (1 << " + emul + ") <= 32))"
+			" && " + plan.bytes + " <= ((addr_t)" + std::to_string(lane_size)
+			+ " << (" + emul + " > 0 ? " + emul + " : 0))";
+		return true;
+	}
+	// Emit prologue: base address, combined vtype+arena guard. Returns true if a fallback else-branch exists.
+	bool emit_vector_memory_prologue(const VectorMemInfo& info,
+		const std::string& addr, const std::vector<std::string>& locals,
+		const std::string& guard)
+	{
+		this->load_register(int(info.rs1));
+		add_code("{ const addr_t " + addr + " = " + from_untracked_reg(int(info.rs1)) + ";");
+		for (const auto& local : locals)
+			add_code("  " + local);
+
+		std::string cond = guard;
+		if (this->vector_memory_needs_bounds_check()) {
+			// The longest run still fits within the arena over-allocation, so
+			// a readable/writable start address covers all of it.
+			static_assert(vector_max_transfer() <= Memory<W>::OVERALLOCATE,
+				"A vector register group must fit within the arena over-allocation");
+			const std::string bounds =
+				std::string(info.is_store ? "ARENA_WRITABLE(" : "ARENA_READABLE(") + addr + ")";
+			cond = cond.empty() ? bounds : "(" + cond + ") && " + bounds;
+		}
+		if (!cond.empty())
+			add_code("if (LIKELY(" + cond + ")) {");
+		else
+			add_code("{");
+		return !cond.empty();
+	}
+	void emit_vector_memory_epilogue(const VectorMemInfo& info, bool has_fallback)
+	{
+		if (has_fallback) {
+			add_code("} else {");
+			// rs1 is the handler's only integer input, and it writes none.
+			this->potentially_realize_register(int(info.rs1));
+			this->emit_vector_handler_invoke();
+		}
+		add_code("}", "}");
+	}
+	// One VLEN-sized register, moved as a single struct assignment.
+	void emit_vector_lane_move(const VectorMemInfo& info,
+		const std::string& addr, unsigned index)
+	{
+		const uint64_t offset = uint64_t(index) * VectorLane::size();
+		const std::string at = offset
+			? "(" + addr + " + " + std::to_string(offset) + ")" : addr;
+		const std::string lane = "*(VectorLaneBytes *)&" + from_rvvreg(int(info.vreg + index));
+		const std::string mem  = "*(VectorLaneBytes *)" + arena_at(at);
+		add_code(info.is_store ? "  " + mem + " = " + lane + ";"
+		                       : "  " + lane + " = " + mem + ";");
+	}
+	// Byte-loop fallback for partial-register runs (strip-mine tail, mask loads).
+	void emit_vector_byte_move(const VectorMemInfo& info,
+		const std::string& addr, const std::string& count)
+	{
+		const std::string i   = "vbi" + PCRELS(0);
+		const std::string dst = "vbd" + PCRELS(0);
+		const std::string src = "vbs" + PCRELS(0);
+		const std::string reg = "(uint8_t *)&" + from_rvvreg(int(info.vreg));
+		const std::string mem = "(uint8_t *)" + arena_at(addr);
+		add_code("  { uint8_t *" + dst + " = " + (info.is_store ? mem : reg) + ";",
+			"    const uint8_t *" + src + " = " + (info.is_store ? reg : mem) + ";",
+			"    addr_t " + i + ";",
+			"    for (" + i + " = 0; " + i + " < " + count + "; " + i + "++)",
+			"      " + dst + "[" + i + "] = " + src + "[" + i + "]; }");
+	}
+	// Contiguous block copy. Constant-sized lanes compile to wide moves.
+	void emit_vector_contiguous_move(const VectorMemInfo& info,
+		const std::string& addr, const VectorStridePlan& plan)
+	{
+		constexpr uint64_t lane_size = VectorLane::size();
+		if (plan.bytes_known) {
+			if (plan.known_bytes % lane_size == 0) {
+				for (unsigned r = 0; r < plan.known_bytes / lane_size; r++)
+					this->emit_vector_lane_move(info, addr, r);
+			} else {
+				this->emit_vector_byte_move(info, addr, plan.bytes);
+			}
+			return;
+		}
+		add_code("  if (LIKELY(" + plan.bytes + " == " + std::to_string(lane_size) + ")) {");
+		this->emit_vector_lane_move(info, addr, 0);
+		if (plan.dregs > 1) {
+			// The whole group, for the iterations of a strip-mined loop that
+			// are not the last one at LMUL > 1.
+			add_code("  } else if (LIKELY(" + plan.bytes + " == "
+				+ std::to_string(uint64_t(plan.dregs) * lane_size) + ")) {");
+			for (unsigned r = 0; r < plan.dregs; r++)
+				this->emit_vector_lane_move(info, addr, r);
+		}
+		add_code("  } else {");
+		this->emit_vector_byte_move(info, addr, plan.bytes);
+		add_code("  }");
+	}
+	// Unit-stride: vl*EEW contiguous bytes. Adjacent group registers make wider EMUL a longer run.
+	void emit_vector_unit_stride(const VectorMemInfo& info)
+	{
+		VectorStridePlan plan;
+		if (!this->vector_plan_unit_stride(info, plan)) {
+			this->emit_vector_slowpath();
+			return;
+		}
+		// An empty transfer touches no memory, and so cannot fault.
+		if (plan.bytes_known && plan.known_bytes == 0)
+			return;
+
+		const std::string addr = "vaddr" + PCRELS(0);
+		const bool fallback = this->emit_vector_memory_prologue(info, addr, plan.locals, plan.guard);
+		this->emit_vector_contiguous_move(info, addr, plan);
+		this->emit_vector_memory_epilogue(info, fallback);
+	}
+	// Masked unit-stride: per-element v0 test over contiguous data.
+	void emit_vector_masked_unit_stride(const VectorMemInfo& info)
+	{
+		// May-alias types: the elements are guest memory on one side.
+		static const char* const element_types[4] =
+			{ "ga_uint8_t", "ga_uint16_t", "ga_uint32_t", "ga_uint64_t" };
+		VectorStridePlan plan;
+		if (!this->vector_plan_unit_stride(info, plan)) {
+			this->emit_vector_slowpath();
+			return;
+		}
+		if (plan.bytes_known && plan.known_bytes == 0)
+			return;
+		const std::string elems = m_vl_known
+			? std::to_string(m_vl) : this->vector_vl_expr();
+
+		const std::string addr = "vaddr" + PCRELS(0);
+		const bool fallback = this->emit_vector_memory_prologue(info, addr, plan.locals, plan.guard);
+
+		const char* const type = element_types[info.eew_log2];
+		const std::string i    = "vmi" + PCRELS(0);
+		const std::string dst  = "vmd" + PCRELS(0);
+		const std::string src  = "vms" + PCRELS(0);
+		const std::string mask = "vmm" + PCRELS(0);
+		const std::string reg = "(" + std::string(type) + " *)&" + from_rvvreg(int(info.vreg));
+		const std::string mem = "(" + std::string(type) + " *)" + arena_at(addr);
+		add_code("  { " + std::string(type) + " *" + dst + " = " + (info.is_store ? mem : reg) + ";",
+			"    const " + std::string(type) + " *" + src + " = " + (info.is_store ? reg : mem) + ";",
+			// v0 always holds the mask, one bit per element, and is read as
+			// the loop runs so that a destination overlapping it behaves as
+			// the handler's element loop does.
+			"    const uint8_t *" + mask + " = (const uint8_t *)&" + from_rvvreg(0) + ";",
+			"    addr_t " + i + ";",
+			"    for (" + i + " = 0; " + i + " < " + elems + "; " + i + "++)",
+			"      if ((" + mask + "[" + i + " >> 3] >> (" + i + " & 7)) & 1)",
+			"        " + dst + "[" + i + "] = " + src + "[" + i + "]; }");
+
+		this->emit_vector_memory_epilogue(info, fallback);
+	}
+	// vl<n>re<eew>.v / vs<n>r.v: a raw copy of n whole registers that reads
+	// neither vl nor vtype, leaving nothing to guard but the address.
+	void emit_vector_whole_register(const VectorMemInfo& info)
+	{
+		const std::string addr = "vaddr" + PCRELS(0);
+		const bool fallback = this->emit_vector_memory_prologue(info, addr, {}, "");
+		for (unsigned r = 0; r < info.nregs; r++)
+			this->emit_vector_lane_move(info, addr, r);
+		this->emit_vector_memory_epilogue(info, fallback);
+	}
+	// vlm.v / vsm.v: ceil(vl/8) bytes of mask, always EEW=8 with EMUL=1 and
+	// never masked. Only vill can stop it, and vl can never ask for more than
+	// the one register a mask lives in.
+	void emit_vector_mask_move(const VectorMemInfo& info)
+	{
+		constexpr uint64_t lane_size = VectorLane::size();
+		if (m_vtype.known && m_vtype.vill) {
+			this->emit_vector_slowpath();
+			return;
+		}
+		VectorStridePlan plan;
+		plan.guard = m_vtype.known ? "" : "!cpu->rvv.vill";
+		if (m_vl_known) {
+			plan.known_bytes = (m_vl + 7) / 8;
+			plan.bytes_known = true;
+			if (plan.known_bytes > lane_size) {
+				this->emit_vector_slowpath();
+				return;
+			}
+			if (plan.known_bytes == 0)
+				return;
+			plan.bytes = std::to_string(plan.known_bytes);
+		} else {
+			plan.bytes = "vnb" + PCRELS(0);
+			plan.locals.push_back("const addr_t " + plan.bytes + " = ((addr_t)"
+				+ vector_vl_expr() + " + 7) / 8;");
+			plan.guard += (plan.guard.empty() ? "" : " && ")
+				+ plan.bytes + " <= " + std::to_string(lane_size);
+		}
+		const std::string addr = "vaddr" + PCRELS(0);
+		const bool fallback = this->emit_vector_memory_prologue(info, addr, plan.locals, plan.guard);
+		this->emit_vector_contiguous_move(info, addr, plan);
+		this->emit_vector_memory_epilogue(info, fallback);
+	}
+	// Emit one vector load or store that does not need the interpreter.
+	void emit_vector_memory(const VectorMemInfo& info)
+	{
+		switch (info.form) {
+		case VectorMemForm::UnitStride:       this->emit_vector_unit_stride(info); break;
+		case VectorMemForm::MaskedUnitStride: this->emit_vector_masked_unit_stride(info); break;
+		case VectorMemForm::WholeRegister:    this->emit_vector_whole_register(info); break;
+		case VectorMemForm::Mask:             this->emit_vector_mask_move(info); break;
+		default:                              this->emit_vector_slowpath(); break;
+		}
+	}
+	// Per-element FMA expression matching the interpreter's OPFVV/OPFVF handlers.
+	static std::string vector_fma_expression(unsigned funct6, const std::string& fma,
+		const std::string& a, const std::string& b, const std::string& c)
+	{
+		const std::string call = fma + "(";
+		switch (funct6) {
+		case 0b101000: return       call +       a + ", " + c + ", " + b + ")"; // VFMADD
+		case 0b101001: return "-" + call +       a + ", " + c + ", " + b + ")"; // VFNMADD
+		case 0b101010: return       call +       a + ", " + c + ", -" + b + ")"; // VFMSUB
+		case 0b101011: return       call + "-" + a + ", " + c + ", " + b + ")"; // VFNMSUB
+		case 0b101100: return       call +       a + ", " + b + ", " + c + ")"; // VFMACC
+		case 0b101101: return "-" + call +       a + ", " + b + ", " + c + ")"; // VFNMACC
+		case 0b101110: return       call +       a + ", " + b + ", -" + c + ")"; // VFMSAC
+		default:       return       call + "-" + a + ", " + b + ", " + c + ")"; // VFNMSAC
+		}
+	}
+	// Inline float arithmetic: guard ensures full m1 register, all elements active.
+	void emit_vector_float_arith_body(unsigned vsew)
+	{
+		const rv32v_instruction vi { instr };
+		const bool dbl = (vsew == 3);
+		const bool is_scalar = instr.vwidth() == 0x5; // OPF.VF takes f[rs1]
+		const char* const elem = dbl ? ".f64[" : ".f32[";
+		std::string rhs;
+		if (is_scalar) {
+			// The guard pins SEW, so the scalar is the low element.
+			rhs = "vscalar" + PCRELS(0) + "_" + std::to_string(vsew);
+			add_code(std::string("  const ") + (dbl ? "double " : "float ") + rhs + " = "
+				+ from_fpreg(vi.OPVV.vs1) + (dbl ? ".f64;" : ".f32[0];"));
+		}
+		const char* const op = vector_float_operator(instr);
+		const std::string fma = dbl ? "api.vfmaf64" : "api.vfmaf32";
+		const unsigned elements = VectorLane::size() >> vsew;
+		for (unsigned i = 0; i < elements; i++) {
+			const std::string e = elem + std::to_string(i) + "]";
+			const std::string a = is_scalar ? rhs : from_rvvreg(vi.OPVV.vs1) + e;
+			const std::string b = from_rvvreg(vi.OPVV.vs2) + e;
+			const std::string d = from_rvvreg(vi.OPVV.vd) + e;
+			add_code("  " + d + " = " + (op != nullptr
+				? b + op + a
+				: vector_fma_expression(vi.OPVV.funct6, fma, a, b, d)) + ";");
+		}
+	}
+	// True for the two configuration forms with an immediate vtype, which is
+	// what compilers emit. VSETVL takes it from a register instead, so its
+	// vtype is only known at runtime.
+	bool vector_is_inlinable_setvl(const rv32i_instruction& vinstr) const noexcept
+	{
+		if (vinstr.opcode() != RV32V_OP || vinstr.vwidth() != 0x7)
+			return false;
+		const auto func = vinstr.vsetfunc();
+		return func == 0x0 || func == 0x1 || func == 0x3;
+	}
+	// Inline vsetvli: avoids per-iteration register spill/reload in strip-mined loops.
+	void emit_vector_setvl()
+	{
+		const rv32v_instruction vi { instr };
+		const bool imm_avl = instr.vsetfunc() == 0x3; // VSETIVLI
+		// vsetivli's vtype is ten bits. The two above it mark the form.
+		const uint32_t vtypei = imm_avl ? (vi.IVLI.zimm & 0x3FF) : vi.VLI.zimm;
+		const int rd  = imm_avl ? vi.IVLI.rd : vi.VLI.rd;
+		const int rs1 = imm_avl ? 0 : int(vi.VLI.rs1);
+
+		// Decode with the interpreter's own code, so the two can never
+		// disagree about what is legal or how large VLMAX is.
+		VectorRegisters<W> newtype;
+		const bool legal = newtype.set_vtype(vtypei);
+		const uint64_t vlmax = newtype.vlmax();
+
+		this->reset_vector_config();
+		if (!legal) {
+			// Unsupported vtype: vl = 0 and vtype reads back as vill alone.
+			// vsew/lmul keep their old values, as set_vtype leaves them.
+			add_code("cpu->rvv.vta = " + std::to_string(newtype.vta()) + ";",
+				"cpu->rvv.vma = " + std::to_string(newtype.vma()) + ";",
+				"cpu->rvv.vill = 1;", "cpu->rvv.vl = 0;");
+			if (rd != 0)
+				add_code(to_reg(rd) + " = 0;");
+			this->m_vtype = { true, true, 0, 0 };
+			this->m_vl_known = true;
+			this->m_vl = 0;
+			return;
+		}
+		// A strip-mined loop sets the same vtype every iteration, and only
+		// vl changes. The raw encoding decides every other field, so when it
+		// is already in place, and not disowned by vill, the configuration
+		// is a no-op worth branching over.
+		add_code("if (UNLIKELY(cpu->rvv.vtype != " + std::to_string(vtypei)
+			+ " || cpu->rvv.vill)) {",
+			"  cpu->rvv.vill = 0;",
+			"  cpu->rvv.vta = " + std::to_string(newtype.vta()) + ";",
+			"  cpu->rvv.vma = " + std::to_string(newtype.vma()) + ";",
+			"  cpu->rvv.vsew = " + std::to_string(newtype.encoded_sew()) + ";",
+			"  cpu->rvv.lmul = " + std::to_string(newtype.lmul_shift()) + ";",
+			"  cpu->rvv.vtype = " + std::to_string(vtypei) + ";",
+			"}");
+
+		// AVL: the immediate, x[rs1], VLMAX when rs1 is x0 but rd is not,
+		// and otherwise the current vl clamped to the new VLMAX.
+		const std::string vl = "cpu->rvv.vl";
+		const std::string newvl = "vnewvl" + PCRELS(0);
+		if (imm_avl || rs1 == 0) {
+			const uint64_t avl = imm_avl ? vi.IVLI.uimm : (rd != 0 ? vlmax : 0);
+			if (imm_avl || rd != 0) {
+				add_code(vl + " = " + std::to_string(std::min(avl, vlmax)) + ";");
+				this->m_vl_known = true;
+				this->m_vl = std::min(avl, vlmax);
+			} else {
+				add_code("if (" + vl + " > " + std::to_string(vlmax) + ") "
+					+ vl + " = " + std::to_string(vlmax) + ";");
+			}
+		} else {
+			// Downstream reads vl from this local, not from the field.
+			const std::string avl = "vavl" + PCRELS(0);
+			this->load_register(rs1);
+			add_code("addr_t " + avl + "; " + avl + " = " + from_untracked_reg(rs1) + ";",
+				"addr_t " + newvl + "; " + newvl + " = (" + avl + " < "
+				+ std::to_string(vlmax) + ") ? " + avl + " : "
+				+ std::to_string(vlmax) + ";",
+				vl + " = " + newvl + ";");
+			this->m_vl_local = newvl;
+		}
+		this->m_vtype = { true, false, newtype.encoded_sew(), newtype.lmul_shift() };
+		if (rd != 0) {
+			this->reset_tracked_register(rd);
+			if (this->m_vl_known)
+				this->track_register_value(rd, this->m_vl);
+			add_code(to_reg(rd) + " = " + (m_vl_local.empty() ? vl : m_vl_local) + ";");
+		}
+	}
+	// Emit one vector instruction: inlined when the encoding allows it,
+	// otherwise straight to the handler.
+	void emit_vector_instruction()
+	{
+		// Settle this before emitting anything: it reads the vtype the block
+		// has proven, which the emission below can change.
+		this->m_vtrap_needed = this->vector_handler_can_trap(instr);
+
+		if (this->vector_is_inlinable_setvl(instr)) {
+			this->emit_vector_setvl();
+			return;
+		}
+		// A load or store carries its own EEW and brings its own guard, so
+		// it does not go through the SEW machinery the arithmetic needs.
+		const auto meminfo = this->vector_memory_form(instr);
+		if (meminfo.form != VectorMemForm::None) {
+			this->emit_vector_memory(meminfo);
+			return;
+		}
+		const auto sews = this->vector_inlinable_sews(instr);
+		if (sews.empty()) {
+			this->emit_vector_slowpath();
+			return;
+		}
+		// Materialize every guard first: they are C locals, and the bodies
+		// below open scopes a later declaration could not escape.
+		for (const unsigned vsew : sews)
+			(void)this->rvv_guard(vsew);
+
+		for (const unsigned vsew : sews) {
+			add_code("if (LIKELY(" + rvv_guard(vsew) + ")) {");
+			this->emit_vector_float_arith_body(vsew);
+			add_code("} else {");
+		}
+		this->emit_vector_slowpath();
+		for (size_t i = 0; i < sews.size(); i++)
+			add_code("}");
 	}
 #endif
 	std::string from_imm(int64_t imm) {
@@ -255,13 +1201,17 @@ struct Emitter
 
 	void emit_branch(const BranchInfo& binfo, const std::string& op);
 
-	void emit_system_call(std::string syscall_reg, bool clobber_all);
+	void emit_system_call(std::string syscall_reg);
 
 	// Returns true if the function call has exited/returned from the block
 	bool emit_function_call(address_t target, address_t dest_pc);
 
-	bool gpr_exists_at(int reg) const noexcept { return this->gpr_exists.at(reg); }
+	bool gpr_exists_at(int reg) const { return this->gpr_exists.at(reg); }
+	bool gpr_written_at(int reg) const { return this->gpr_written.at(reg); }
 	auto& get_gpr_exists() const noexcept { return this->gpr_exists; }
+	bool gpr_needs_store(size_t reg) const {
+		return this->gpr_exists_at(reg) && this->gpr_written_at(reg);
+	}
 
 	bool uses_flat_memory_arena() noexcept {
 		return riscv::flat_readwrite_arena && tinfo.arena_ptr != 0;
@@ -282,11 +1232,17 @@ struct Emitter
 			return 0;
 	}
 
+	// The C type used to access guest memory: the may_alias twin of `type`,
+	// see the ga_* typedefs in tr_api.cpp.
+	static std::string guest_access_type(const std::string& type) {
+		const std::string volatile_prefix = "volatile ";
+		if (type.rfind(volatile_prefix, 0) == 0)
+			return volatile_prefix + "ga_" + type.substr(volatile_prefix.size());
+		return "ga_" + type;
+	}
+
 	std::string arena_at(const std::string& address) {
-		// libtcc direct arena pointer access
-		// This is a performance optimization for libtcc, which allows direct access to the memory arena
-		// however, with it execute segments can no longer be shared between different machines.
-		// So, for a simple CLI tool, this is a good optimization. But not for a system of multiple machines.
+		// Direct arena pointer for libtcc (non-shared segments only).
 		if (tinfo.is_libtcc && !tinfo.use_shared_execute_segments) {
 			if (uses_Nbit_encompassing_arena()) {
 				if (riscv::encompassing_Nbit_arena == 32)
@@ -306,7 +1262,8 @@ struct Emitter
 		}
 	}
 
-	std::string arena_at_fixed(const std::string& type, address_t address) {
+	std::string arena_at_fixed(const std::string& access_type, address_t address) {
+		const std::string type = guest_access_type(access_type);
 		if (tinfo.is_libtcc && !tinfo.use_shared_execute_segments) {
 			if (uses_Nbit_encompassing_arena()) {
 				return "*(" + type + "*)" + hex_address(tinfo.arena_ptr + (address & address_t(get_Nbit_encompassing_arena_mask()))) + "";
@@ -320,8 +1277,29 @@ struct Emitter
 		}
 	}
 
-	static bool offset_is_within_overallocation(int64_t old_offset, int64_t new_offset, size_t size) {
-		return std::abs(new_offset - old_offset) <= int64_t(Memory<W>::OVERALLOCATE - size);
+	// A bounds check on `base + anchor` proves that address lies inside the arena.
+	// The arena is over-allocated by OVERALLOCATE bytes on both ends, so any access
+	// through the same base register at an offset within that window of the anchor
+	// is also guaranteed to land in mapped memory, and needs no check of its own.
+	static bool offset_is_within_overallocation(int64_t anchor, int64_t offset, size_t size) {
+		if (UNLIKELY(size > Memory<W>::OVERALLOCATE))
+			return false;
+		return std::abs(offset - anchor) <= int64_t(Memory<W>::OVERALLOCATE - size);
+	}
+
+	// Window survives not-taken branches but dies at labels, calls, or base-register writes.
+	void invalidate_bounds_checks(int reg) {
+		if (reg > 0 && reg < 32) {
+			this->m_read_checked[reg].valid = false;
+			this->m_write_checked[reg].valid = false;
+		}
+	}
+	void invalidate_all_bounds_checks() {
+		for (auto& entry : this->m_read_checked) entry.valid = false;
+		for (auto& entry : this->m_write_checked) entry.valid = false;
+#ifdef RISCV_EXT_VECTOR
+		this->reset_vector_config();
+#endif
 	}
 
 	bool skip_load_bounds_check(int reg, int64_t offset, size_t size) {
@@ -329,46 +1307,30 @@ struct Emitter
 			|| uses_Nbit_encompassing_arena()) return true; // No bounds check
 		if (tinfo.use_virtual_paging_fallback) return false; // Always check
 
-		if (last_read_check_pc == m_last_pc
-			&& last_read_check_register == reg
-			&& offset_is_within_overallocation(last_read_check_offset, offset, size)) {
-			// Skip bounds check, but continue (same register, same original bounds-checked offset)
-			last_read_check_pc = pc();
+		if (m_read_checked[reg].valid
+			&& offset_is_within_overallocation(m_read_checked[reg].anchor, offset, size))
 			return true;
-		} else if (last_write_check_pc == m_last_pc
-			&& last_write_check_register == reg
-			&& offset_is_within_overallocation(last_write_check_offset, offset, size)) {
-			// Previous was a write check for same register + offset range
-			// The arena is divided into unreadable, readable and writable regions,
-			// and any region that is writable is also readable, so we inherit the check:
-			last_read_check_pc = pc();
-			last_read_check_register = reg;
-			last_read_check_offset = offset;
+		// Writable implies readable; inherit the write-check.
+		if (m_write_checked[reg].valid
+			&& offset_is_within_overallocation(m_write_checked[reg].anchor, offset, size))
 			return true;
-		} else {
-			last_read_check_pc = pc();
-			last_read_check_register = reg;
-			last_read_check_offset = offset;
-			return false;
-		}
+
+		m_read_checked[reg] = { true, offset };
+		return false;
 	}
 	bool skip_store_bounds_check(int reg, int64_t offset, size_t size) {
 		if (tinfo.unsafe_remove_checks
 			|| uses_Nbit_encompassing_arena()) return true; // No bounds check
 		if (tinfo.use_virtual_paging_fallback) return false; // Always check
 
-		if (last_write_check_pc == m_last_pc
-			&& last_write_check_register == reg
-			&& offset_is_within_overallocation(last_write_check_offset, offset, size)) {
-			// Skip bounds check
-			last_write_check_pc = pc();
+		// NOTE: A live read check does *not* cover a write: the readable region
+		// includes read-only data, which the writable region excludes.
+		if (m_write_checked[reg].valid
+			&& offset_is_within_overallocation(m_write_checked[reg].anchor, offset, size))
 			return true;
-		} else {
-			last_write_check_pc = pc();
-			last_write_check_register = reg;
-			last_write_check_offset = offset;
-			return false;
-		}
+
+		m_write_checked[reg] = { true, offset };
+		return false;
 	}
 
 	template <typename T>
@@ -411,14 +1373,15 @@ struct Emitter
 		}
 
 		const std::string address = from_untracked_reg(reg) + " + " + from_imm(imm);
+		const std::string access = "*(" + guest_access_type(type) + "*)";
 		if (skip_load_bounds_check(reg, imm, sizeof(T)))
 		{
-			add_code(dst + " = *(" + type + "*)" + arena_at(address) + ";");
+			add_code(dst + " = " + access + arena_at(address) + ";");
 		}
 		else if (uses_flat_memory_arena()) {
 			add_code(
 				"if (LIKELY(ARENA_READABLE(" + address + ")))",
-					dst + " = *(" + type + "*)" + arena_at(address) + ";",
+					dst + " = " + access + arena_at(address) + ";",
 				"else {");
 			if (!tinfo.use_virtual_paging_fallback) {
 				add_code("  cpu->pc = " + hex_address(this->pc()) + "LL; goto exception;",
@@ -455,7 +1418,14 @@ struct Emitter
 			throw MachineException(INVALID_PROGRAM, "Unsupported memory store type");
 		}
 	}
-	void memory_store(std::string type, int reg, int32_t imm, std::string value)
+	// TCC truncates 64-bit addresses; materialize pointer in a function-scope scratch.
+	void fixed_store(const std::string& type, address_t address, const std::string& value)
+	{
+		this->m_used_fixed_store = true;
+		add_code("mstore = (char*)&" + arena_at_fixed(type, address) + ";",
+			"*(" + guest_access_type(type) + "*)mstore = " + value + ";");
+	}
+	void memory_store(std::string type, size_t size, int reg, int32_t imm, std::string value)
 	{
 		if (uses_flat_memory_arena()) {
 			address_t absolute_vaddr = 0;
@@ -464,27 +1434,28 @@ struct Emitter
 			}
 			constexpr bool good = riscv::encompassing_Nbit_arena != 0;
 			if (absolute_vaddr != 0 && absolute_vaddr >= tinfo.arena_roend && (good || absolute_vaddr < tinfo.arena_size)) {
-				add_code("{" + type + "* t = &" + arena_at_fixed(type, absolute_vaddr) + "; *t = " + value + "; }");
+				fixed_store(type, absolute_vaddr, value);
 				return;
 			}
 			if (auto tracked_value = get_tracked_register(reg)) {
 				const address_t vaddr = *tracked_value + imm;
 				if (vaddr >= tinfo.arena_roend && vaddr <= tinfo.arena_size - 32) {
-					add_code("{" + type + "* t = &" + arena_at_fixed(type, vaddr) + "; *t = " + value + "; }");
+					fixed_store(type, vaddr, value);
 					return;
 				}
 			}
 		}
 
 		const std::string address = from_untracked_reg(reg) + " + " + from_imm(imm);
-		if (skip_store_bounds_check(reg, imm, sizeof(type)))
+		const std::string access = "*(" + guest_access_type(type) + "*)";
+		if (skip_store_bounds_check(reg, imm, size))
 		{
-			add_code("*(" + type + "*)" + arena_at(address) + " = " + value + ";");
+			add_code(access + arena_at(address) + " = " + value + ";");
 		}
 		else if (uses_flat_memory_arena()) {
 			add_code(
 				"if (LIKELY(ARENA_WRITABLE(" + address + ")))",
-				"  *(" + type + "*)" + arena_at(address) + " = " + value + ";",
+				"  " + access + arena_at(address) + " = " + value + ";",
 				"else {");
 			if (!tinfo.use_virtual_paging_fallback) {
 				add_code("  cpu->pc = " + hex_address(this->pc()) + "LL; goto exception;",
@@ -514,8 +1485,6 @@ struct Emitter
 	auto& get_mappings() { return this->mappings; }
 
 	bool add_reentry_next() {
-		// Avoid re-entering at the end of the function
-		// WARNING: End-of-function can be empty
 		if (this->pc() + this->m_instr_length >= end_pc())
 			return false;
 		this->mapping_labels.insert(index() + 1);
@@ -563,9 +1532,10 @@ struct Emitter
 	bool within_segment(address_t addr) const noexcept {
 		return addr >= this->tinfo.segment_basepc && addr < this->tinfo.segment_endpc;
 	}
-	bool used_store_syscalls() const noexcept { return this->m_used_store_syscalls; }
+	bool used_fixed_store() const noexcept { return this->m_used_fixed_store; }
 
 	const std::string get_func() const noexcept { return this->func; }
+	void analyze_dirty_registers();
 	void emit();
 	rv32i_instruction emit_rvc();
 
@@ -599,11 +1569,15 @@ private:
 			throw MachineException(INVALID_PROGRAM, "Invalid register index for tracking", idx);
 		}
 		this->m_is_tracked_register[idx] = false;
+		this->invalidate_bounds_checks(idx);
+	}
+	// Reset tracked constants only; bounds-check windows are handled separately.
+	void reset_all_tracked_constants() {
+		this->m_is_tracked_register.fill(false);
 	}
 	void reset_all_tracked_registers() {
-		this->m_is_tracked_register.fill(false);
-		this->last_read_check_pc = 0;
-		this->last_write_check_pc = 0;
+		this->reset_all_tracked_constants();
+		this->invalidate_all_bounds_checks();
 	}
 
 	std::string code;
@@ -614,16 +1588,43 @@ private:
 	unsigned m_instr_length = 0;
 	uint64_t m_instr_counter = 0;
 	uint32_t m_zero_insn_counter = 0;
+#ifdef RISCV_EXT_VECTOR
+	// vtype as proven by an inlined vsetvli earlier in this block. Dropped
+	// where control flow joins, or where a handler may reconfigure it.
+	struct KnownVtype {
+		bool     known = false;
+		bool     vill  = false;
+		unsigned vsew  = 0;  // log2(SEW / 8)
+		int      lmul  = 0;  // log2(LMUL)
+	};
+	KnownVtype m_vtype;
+	// vl when the vsetvli that produced it had a compile-time AVL
+	bool     m_vl_known = false;
+	uint64_t m_vl = 0;
+	// C local holding the live vl, when an inlined vsetvli computed one
+	std::string m_vl_local;
+	// Live C local holding the vl/vtype fast-path test per SEW, see rvv_guard()
+	std::array<std::string, 4> m_rvv_guard;
+	// Whether the current vector instruction's handler can raise at all
+	bool m_vtrap_needed = true;
+#endif
 	address_t m_encompassing_arena_mask = 0;
-	address_t last_read_check_pc = 0;
-	address_t last_write_check_pc = 0;
-	int last_read_check_register = 0;
-	int last_read_check_offset = 0;
-	int last_write_check_register = 0;
-	int last_write_check_offset = 0;
-	bool m_used_store_syscalls = false;
+	bool m_used_fixed_store = false;
+	bool m_used_vector_trap = false;
+
+	// Per-register live bounds-check window (see offset_is_within_overallocation)
+	struct BoundsCheck {
+		bool    valid  = false;
+		int64_t anchor = 0;
+	};
+	std::array<BoundsCheck, 32> m_read_checked {};
+	std::array<BoundsCheck, 32> m_write_checked {};
 
 	std::array<bool, 32> gpr_exists {};
+	std::array<bool, 32> gpr_written {};
+	std::vector<uint32_t> m_dirty_at;  // dirty when the instruction executes (what a sync here stores)
+	std::vector<uint32_t> m_dirty_out; // dirty after it, for the flow
+	std::set<uint32_t> m_store_masks;
 	std::array<bool, 32> m_is_tracked_register {};
 	std::array<address_t, 32> m_tracked_registers {};
 
@@ -651,7 +1652,7 @@ inline void Emitter<W>::emit_branch(const BranchInfo& binfo, const std::string& 
 	if (UNLIKELY(PCRELA(instr.Btype.signed_imm()) & ALIGN_MASK))
 	{
 		// TODO: Make exception a helper function, as return values are implementation detail
-		code += "\n  { api.exception(cpu, " + PCRELS(0) + ", MISALIGNED_INSTRUCTION); return (ReturnValues){0, 0}; }\n";
+		code += "\n  { api.exception(cpu, " + PCRELS(0) + ", MISALIGNED_INSTRUCTION); RETURN_VALUES(0, 0); }\n";
 		return;
 	}
 
@@ -683,6 +1684,8 @@ inline void Emitter<W>::emit_branch(const BranchInfo& binfo, const std::string& 
 template <int W>
 inline bool Emitter<W>::emit_function_call(address_t target_funcaddr, address_t dest_pc)
 {
+	// The callee may write any register
+	this->invalidate_all_bounds_checks();
 	// Store the registers
 	this->store_loaded_registers();
 
@@ -690,12 +1693,12 @@ inline bool Emitter<W>::emit_function_call(address_t target_funcaddr, address_t 
 	add_forward(target_func);
 	if (!tinfo.ignore_instruction_limit) {
 		// Call the function and get the return values
-		add_code("{ReturnValues rv = " + target_func + "(cpu, ic, max_ic, " + STRADDR(dest_pc) + ");");
+		add_code("retvals = " + target_func + "(cpu, ic, max_ic, " + STRADDR(dest_pc) + ");");
 		// Update the local counter registers
-		add_code("ic = rv.ic; max_ic = rv.max_ic;}");
+		add_code("ic = retvals.ic; max_ic = retvals.max_ic;");
 	} else {
-		add_code("{ReturnValues rv = " + target_func + "(cpu, 0, max_ic, " + STRADDR(dest_pc) + ");");
-		add_code("max_ic = rv.max_ic;}");
+		add_code("retvals = " + target_func + "(cpu, 0, max_ic, " + STRADDR(dest_pc) + ");");
+		add_code("max_ic = retvals.max_ic;");
 	}
 
 	// Restore the registers
@@ -708,39 +1711,56 @@ inline bool Emitter<W>::emit_function_call(address_t target_funcaddr, address_t 
 	// Hope and pray that the next PC is local to this block
 	if (!tinfo.ignore_instruction_limit) {
 		add_code("if (" + LOOP_EXPRESSION + ") { pc = cpu->pc; goto " + this->func + "_jumptbl; }");
-		add_code("return (ReturnValues){ic, max_ic};");
+		add_code("RETURN_VALUES(ic, max_ic);");
 	} else {
 		add_code("if (max_ic) { pc = cpu->pc; goto " + this->func + "_jumptbl; }");
-		add_code("return (ReturnValues){0, 0};");
+		add_code("RETURN_VALUES(0, 0);");
 	}
 	return true;
 }
 
-template <int W>
-inline void Emitter<W>::emit_system_call(std::string syscall_reg, bool clobber_all)
+// Linux system calls that hand control to another thread, which comes back
+// with that thread's register file restored in place. clone(2) is the one that
+// also leaves the PC where it was, so nothing downstream can notice the swap:
+// the child resumes at the very instruction that made the call. The rest are
+// here because two threads can be parked at the same system call - a spin loop
+// that yields, or a futex wait - and then the PC does not move either.
+static bool syscall_switches_thread(uint64_t sysno) noexcept
 {
-	if (auto tracked_value = get_tracked_register(17); tracked_value) {
-		// Don't clobber when the value is known and it's not in the list
-		// of known system calls that clobber all registers
-		if (tinfo.use_syscall_clobbering_optimization && this->uses_register_caching() && !clobber_all) {
-			clobber_all = Machine<W>::is_clobbering_syscall(*tracked_value);
-		} else {
-			clobber_all = true;
-		}
+	switch (sysno) {
+	case 93:  // exit
+	case 94:  // exit_group, installed as the exit handler, see setup_posix_threads()
+	case 98:  // futex
+	case 124: // sched_yield
+	case 131: // tgkill
+	case 139: // rt_sigreturn
+	case 220: // clone
+	case 422: // futex_time64
+	case 435: // clone3
+		return true;
+	default:
+		return false;
+	}
+}
 
-		if (syscall_reg != std::to_string(SYSCALL_EBREAK)) {
+template <int W>
+inline void Emitter<W>::emit_system_call(std::string syscall_reg)
+{
+	// A7 is loaded with an immediate right before the ECALL in almost all code,
+	// so the system call number is usually known here.
+	std::optional<uint64_t> sysno;
+	if (syscall_reg == std::to_string(SYSCALL_EBREAK)) {
+		sysno = SYSCALL_EBREAK;
+	} else if (auto tracked_value = get_tracked_register(REG_ECALL); tracked_value) {
+		if (*tracked_value < address_t(1) << 20) {
+			sysno = uint64_t(*tracked_value);
 			if constexpr (W != 16) { // No 128-bit to_string in C++
 				syscall_reg = std::to_string(*tracked_value);
 			}
 		}
-	} else {
-		clobber_all = true;
 	}
-	if (clobber_all) {
-		this->store_loaded_registers();
-	} else {
-		this->store_syscall_registers();
-	}
+	const bool switches_thread = sysno && syscall_switches_thread(*sysno);
+	this->store_loaded_registers();
 	if (tinfo.is_libtcc)
 	{
 		if (!tinfo.ignore_instruction_limit) {
@@ -750,31 +1770,11 @@ inline void Emitter<W>::emit_system_call(std::string syscall_reg, bool clobber_a
 			code += "max_ic = api.system_call(cpu, " + PCRELS(0) + ", 0, max_ic, " + syscall_reg + ");\n";
 		}
 		code += "if (!max_ic) {\n";
-		if (this->uses_register_caching() && !clobber_all)
-		{
-			// Non-clobbering syscall, but we are about to leave, so
-			// restore all the remaining registers
-			if (!tinfo.ignore_instruction_limit) {
-				code += "max_ic = MAX_COUNTER(cpu);\n"
-						"if (ic >= max_ic) {\n"
-						"  STORE_NON_SYS_REGS_" + this->func + "();\n"
-						"}\n"
-						"  return (ReturnValues){ic, max_ic};\n"
-						"}\n";
-			} else {
-				code += "max_ic = MAX_COUNTER(cpu);\n"
-						"if (max_ic == 0) {\n"
-						"  STORE_NON_SYS_REGS_" + this->func + "();\n"
-						"}\n"
-						"  return (ReturnValues){0, max_ic};\n"
-						"}\n";
-			}
-		}
-		else if (!tinfo.ignore_instruction_limit) {
-			code += "  return (ReturnValues){ic, MAX_COUNTER(cpu)};\n"
+		if (!tinfo.ignore_instruction_limit) {
+			code += "  RETURN_VALUES(ic, MAX_COUNTER(cpu));\n"
 					"}\n";
 		} else {
-			code += "  return (ReturnValues){0, MAX_COUNTER(cpu)};\n"
+			code += "  RETURN_VALUES(0, MAX_COUNTER(cpu));\n"
 					"}\n";
 		}
 	}
@@ -783,27 +1783,27 @@ inline void Emitter<W>::emit_system_call(std::string syscall_reg, bool clobber_a
 		code += "cpu->pc = " + PCRELS(0) + ";\n";
 		if (!tinfo.ignore_instruction_limit) {
 			code += "if (UNLIKELY(do_syscall(cpu, ic, max_ic, " + syscall_reg + "))) {\n";
-			if (this->uses_register_caching() && !clobber_all)
-			{
-				// If we didn't clobber all registers, and the machine timed out,
-				// we need to store back the registers so that the timed out machine
-				// can resume from where it left off, if it is re-entered.
-				code += "if (ic >= MAX_COUNTER(cpu)) {\n";
-				code += "  STORE_NON_SYS_REGS_" + this->func + "();\n";
-				code += "}\n";
-			}
-			code += "  cpu->pc += 4; return (ReturnValues){ic, MAX_COUNTER(cpu)};}\n"; // Correct for +4 expectation outside of bintr
+			code += "  cpu->pc += 4; RETURN_VALUES(ic, MAX_COUNTER(cpu));}\n"; // Correct for +4 expectation outside of bintr
 			code += "max_ic = MAX_COUNTER(cpu);\n"; // Restore max counter
 		} else {
 			code += "if (UNLIKELY(do_syscall(cpu, 0, max_ic, " + syscall_reg + "))) {\n";
-			code += "  cpu->pc += 4; return (ReturnValues){0, MAX_COUNTER(cpu)};}\n";
+			code += "  cpu->pc += 4; RETURN_VALUES(0, MAX_COUNTER(cpu));}\n";
 		}
 	}
-	if (clobber_all) {
-		this->reset_all_tracked_registers();
-	} else {
-		this->reset_tracked_register(10);
-		this->reset_tracked_register(11);
+	this->reset_all_tracked_registers();
+#ifdef RISCV_EXT_VECTOR
+	this->reset_vector_config();
+#endif
+	if (switches_thread) {
+		// The handler swapped in another thread's register file. Exit without
+		// storing the cached registers, which belong to the thread that made
+		// the call; re-entering the block loads the new thread's registers.
+		const char* counter = (tinfo.ignore_instruction_limit) ? "0" : "ic";
+		add_code("cpu->pc = " + PCRELS(4) + ";",
+			std::string("RETURN_VALUES(") + counter + ", MAX_COUNTER(cpu));");
+		// Whatever follows is only reachable through the dispatch table now
+		this->add_reentry_next();
+		return;
 	}
 	this->reload_syscall_registers();
 }
@@ -813,8 +1813,157 @@ inline void Emitter<W>::emit_system_call(std::string syscall_reg, bool clobber_a
 #endif
 
 template <int W>
+void Emitter<W>::analyze_dirty_registers()
+{
+	const auto& instrs = tinfo.instr;
+	const size_t n = instrs.size();
+	m_dirty_at.assign(n, 0);
+	m_dirty_out.assign(n, 0);
+	if (!uses_register_caching() || n == 0)
+		return;
+
+	enum Kind { SIMPLE, BRANCH, JUMP, INDIRECT, SYSCALL, OTHER };
+	struct Node {
+		uint32_t writes = 0;
+		Kind kind = SIMPLE;
+		int  target = -1; // instruction index, for BRANCH and JUMP inside the block
+	};
+	std::vector<Node> nodes(n);
+	std::vector<address_t> addr_of(n);
+	std::unordered_map<address_t, int> index_of;
+	address_t pc = tinfo.basepc;
+	for (size_t i = 0; i < n; i++) {
+		addr_of[i] = pc;
+		index_of.emplace(pc, int(i));
+		pc += compressed_enabled ? instrs[i].length() : 4;
+	}
+	const auto lookup = [&] (address_t target) -> int {
+		auto it = index_of.find(target);
+		return (it != index_of.end()) ? it->second : -1;
+	};
+	const auto reg_bit = [] (unsigned reg) -> uint32_t {
+		return (reg != 0) ? (1u << reg) : 0u;
+	};
+
+	for (size_t i = 0; i < n; i++) {
+		const auto& instr = instrs[i];
+		Node& node = nodes[i];
+		if (compressed_enabled && instr.is_compressed()) {
+#ifdef RISCV_EXT_C
+			const rv32c_instruction ci { instr };
+			// Every rd field of every compressed format, plus x1 for the links
+			node.writes = reg_bit(instr.whole >> 7 & 0x1F)
+				| reg_bit(8 + (instr.whole >> 2 & 0x7))
+				| reg_bit(8 + (instr.whole >> 7 & 0x7)) | reg_bit(1);
+			const unsigned quadrant = instr.whole & 0x3;
+			const unsigned funct3 = instr.whole >> 13 & 0x7;
+			if (quadrant == 0b01 && (funct3 == 0b101 || (W == 4 && funct3 == 0b001))) {
+				node.kind = JUMP; // C.J, C.JAL
+				node.target = lookup(addr_of[i] + ci.CJ.signed_imm());
+			} else if (quadrant == 0b01 && (funct3 == 0b110 || funct3 == 0b111)) {
+				node.kind = BRANCH; // C.BEQZ, C.BNEZ
+				node.target = lookup(addr_of[i] + ci.CB.signed_imm());
+			} else if (quadrant == 0b10 && funct3 == 0b100 && ci.CR.rs2 == 0) {
+				// C.JR, C.JALR, C.EBREAK
+				node.kind = (ci.CR.rd != 0) ? INDIRECT : SYSCALL;
+			}
+#endif
+			continue;
+		}
+		node.writes = reg_bit(instr.Itype.rd);
+		switch (instr.opcode()) {
+		case RV32I_LOAD: case RV32I_STORE: case RV32I_OP_IMM: case RV32I_OP:
+		case RV32I_LUI: case RV32I_AUIPC: case RV64I_OP_IMM32: case RV64I_OP32:
+		case RV32F_LOAD: case RV32F_STORE: case RV32F_FMADD: case RV32F_FMSUB:
+		case RV32F_FNMSUB: case RV32F_FNMADD: case RV32F_FPFUNC: case RV32A_ATOMIC:
+			break;
+		case RV32I_BRANCH:
+			node.kind = BRANCH;
+			node.target = lookup(addr_of[i] + instr.Btype.signed_imm());
+			break;
+		case RV32I_JAL:
+			node.kind = JUMP;
+			node.target = lookup((addr_of[i] + instr.Jtype.jump_offset()) & ~address_t(ALIGN_MASK));
+			break;
+		case RV32I_JALR:
+			node.kind = INDIRECT;
+			break;
+		case RV32I_SYSTEM:
+			// ECALL and EBREAK store everything dirty, and reload a0/a1
+			node.kind = (instr.Itype.funct3 == 0 && instr.Itype.imm < 2) ? SYSCALL : OTHER;
+			break;
+		case Dyncall::opcode:
+			// Count fields are not register operands. Keep unsaved dirty
+			// registers flowing through the call, including around backedges.
+			node.writes = Dyncall::valid(instr.whole)
+				? Dyncall::arg_mask(Dyncall::outputs(instr.whole)) : ~0u;
+			node.kind = OTHER;
+			break;
+		default:
+			node.kind = OTHER;
+			break;
+		}
+	}
+
+	// Which instructions can be entered from the dispatch switch, or through a
+	// label at all: the block entry, every jump target, whatever follows an
+	// instruction that is not straight-line, and code after a run of zeroes.
+	std::vector<bool> is_label(n, false);
+	is_label[0] = true;
+	for (const auto addr : tinfo.jump_locations)
+		if (const int idx = lookup(addr); idx >= 0) is_label[idx] = true;
+	for (const auto addr : tinfo.global_jump_locations)
+		if (const int idx = lookup(addr); idx >= 0) is_label[idx] = true;
+	unsigned zeroes = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (nodes[i].kind != SIMPLE && i + 1 < n)
+			is_label[i + 1] = true;
+		if (instrs[i].is_illegal())
+			zeroes++;
+		else {
+			if (zeroes >= 4) is_label[i] = true;
+			zeroes = 0;
+		}
+	}
+
+	// Fixpoint over the may-dirty sets. The dispatch switch is one node:
+	// its input is the union over every indirect jump, and it flows into
+	// every label.
+	std::vector<uint32_t> in(n, 0);
+	uint32_t dispatch = 0;
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		uint32_t new_dispatch = 0;
+		for (size_t i = 0; i < n; i++) {
+			const Node& node = nodes[i];
+			uint32_t d = in[i];
+			if (is_label[i]) d |= dispatch;
+			if (i > 0 && nodes[i - 1].kind != JUMP && nodes[i - 1].kind != INDIRECT)
+				d |= m_dirty_out[i - 1]; // fall-through
+			if (d != in[i]) { in[i] = d; changed = true; }
+			// A sync at this instruction stores what is dirty on entry plus
+			// whatever the instruction itself wrote before it. A system call
+			// syncs everything, so nothing is dirty after it.
+			m_dirty_at[i] = d | node.writes;
+			const uint32_t out = (node.kind == SYSCALL) ? 0u : m_dirty_at[i];
+			if (out != m_dirty_out[i]) { m_dirty_out[i] = out; changed = true; }
+			if ((node.kind == BRANCH || node.kind == JUMP) && node.target >= 0) {
+				if ((in[node.target] | out) != in[node.target]) {
+					in[node.target] |= out; changed = true;
+				}
+			}
+			if (node.kind == INDIRECT)
+				new_dispatch |= out;
+		}
+		if (new_dispatch != dispatch) { dispatch = new_dispatch; changed = true; }
+	}
+}
+
+template <int W>
 void Emitter<W>::emit()
 {
+	this->analyze_dirty_registers();
 	this->add_mapping(this->pc(), this->func);
 	code.append(FUNCLABEL(this->pc()) + ":;\n");
 	auto next_pc = tinfo.basepc;
@@ -862,31 +2011,19 @@ void Emitter<W>::emit()
 			this->reset_all_tracked_registers();
 		}
 
-		// With garbage instructions, it's possible that someone is trying to jump to
-		// the middle of an instruction. This technically allowed, so we need to check
-		// there's a jump label in the middle of this instruction.
+		// Rare: jump target at PC+2 inside a 4-byte instruction. Emit a skip-over trap.
 		if (UNLIKELY(compressed_enabled && this->m_instr_length == 4 && tinfo.jump_locations.count(this->pc() + 2))) {
-			// This occurence should be very rare, so we permit outselves to jump over it, so that
-			// we can trigger an exception for anyone trying to jump to the middle of an instruction.
-			// It is technically possible to create an endless loop without this, as we are not
-			// counting instructions correctly for this case.
 			code.append("goto " + FUNCLABEL(this->pc() + 2) + "_skip;\n");
 			code.append(FUNCLABEL(this->pc() + 2) + ":;\n");
-			code.append("api.exception(cpu, " + STRADDR(this->pc() + 2) + ", MISALIGNED_INSTRUCTION); return (ReturnValues){0, 0};\n");
+			code.append("api.exception(cpu, " + STRADDR(this->pc() + 2) + ", MISALIGNED_INSTRUCTION); RETURN_VALUES(0, 0);\n");
 			code.append(FUNCLABEL(this->pc() + 2) + "_skip:;\n");
 			this->reset_all_tracked_registers();
 		}
 
-		auto it = tinfo.single_return_locations.find(this->pc());
-		if (it != tinfo.single_return_locations.end()) {
-			// We don't know what function we are in, but we do know what functions get called
-			// Track the current callable PC, so that we can use that for JALR return addresses
-			// If the address is zero, it means many places call this function, so we can't predict
-			// a single return address.
-			if (it->second != 0)
-				current_callable_pc = this->pc();
-			else
-				current_callable_pc = 0;
+		if (tinfo.return_locations.count(this->pc())) {
+			// A called function starts here: its returns can be predicted
+			// from the call sites, see RV32I_JALR below.
+			current_callable_pc = this->pc();
 		}
 
 		this->m_instr_counter += 1;
@@ -900,7 +2037,7 @@ void Emitter<W>::emit()
 		}
 
 		if (tinfo.ebreak_locations->count(this->pc())) {
-			this->emit_system_call(std::to_string(SYSCALL_EBREAK), true);
+			this->emit_system_call(std::to_string(SYSCALL_EBREAK));
 		}
 
 		// instruction generation
@@ -920,7 +2057,7 @@ void Emitter<W>::emit()
 				if (m_zero_insn_counter <= 1 || compressed_instr != 0x0) {
 					code += "api.exception(cpu, " + STRADDR(this->pc()) + ", ILLEGAL_OPCODE);\n";
 					if (tinfo.is_libtcc) {
-						code += "return (ReturnValues){0, 0};\n";
+						code += "RETURN_VALUES(0, 0);\n";
 					}
 				}
 				this->reset_all_tracked_registers();
@@ -970,16 +2107,16 @@ void Emitter<W>::emit()
 			load_register(instr.Stype.rs1);
 			switch (instr.Stype.funct3) {
 			case 0x0: // I8
-				this->memory_store("int8_t", instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
+				this->memory_store("int8_t", sizeof(int8_t), instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
 				break;
 			case 0x1: // I16
-				this->memory_store("int16_t", instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
+				this->memory_store("int16_t", sizeof(int16_t), instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
 				break;
 			case 0x2: // I32
-				this->memory_store("int32_t", instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
+				this->memory_store("int32_t", sizeof(int32_t), instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
 				break;
 			case 0x3: // I64
-				this->memory_store("int64_t", instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
+				this->memory_store("int64_t", sizeof(int64_t), instr.Stype.rs1, instr.Stype.signed_imm(), from_reg(instr.Stype.rs2));
 				break;
 			default:
 				UNKNOWN_INSTRUCTION();
@@ -1036,7 +2173,8 @@ void Emitter<W>::emit()
 				emit_branch({ false, tinfo.ignore_instruction_limit, jump_pc, call_pc }, " >= ");
 				break;
 			}
-			this->reset_all_tracked_registers(); // For now
+			// Not-taken path: bounds-check windows survive (no register writes).
+			this->reset_all_tracked_constants(); // For now
 			} break;
 		case RV32I_JALR: {
 			// jump to register + immediate
@@ -1044,10 +2182,11 @@ void Emitter<W>::emit()
 			this->increment_counter_so_far();
 			if (instr.Itype.rd != 0 && instr.Itype.rd == instr.Itype.rs1) {
 				// NOTE: We need to remember RS1 because it is clobbered by RD
+				const auto src = from_reg(instr.Itype.rs1);
+				const auto dst = to_reg(instr.Itype.rd);
 				add_code(
-					"{addr_t rs1 = " + from_reg(instr.Itype.rs1) + ";",
-					to_reg(instr.Itype.rd) + " = " + PCRELS(m_instr_length) + ";",
-					"JUMP_TO(rs1 + " + from_imm(instr.Itype.signed_imm()) + "); }"
+					"JUMP_TO(" + src + " + " + from_imm(instr.Itype.signed_imm()) + ");",
+					dst + " = " + PCRELS(m_instr_length) + ";"
 				);
 			} else if (instr.Itype.rd != 0) {
 				add_code(
@@ -1055,35 +2194,46 @@ void Emitter<W>::emit()
 					"JUMP_TO(" + from_reg(instr.Itype.rs1) + " + " + from_imm(instr.Itype.signed_imm()) + ");"
 				);
 			} else {
-				// If this is JALR ra, check if the return address is a single return location
+				// A plain return from a function with known call sites: compare
+				// the return address against the sites in this block and jump
+				// directly, which is always correct whichever function we are
+				// really in, and skips the indirect dispatch when it hits.
+				std::vector<address_t> predicted;
 				if (instr.Itype.rs1 != 0 && instr.Itype.signed_imm() == 0 && current_callable_pc != 0) {
-					// Return locations are stored from the callee's perspective
-					auto it = tinfo.single_return_locations.find(current_callable_pc);
-					if (it == tinfo.single_return_locations.end()) {
-						throw std::runtime_error("JALR ra with current callable PC, without a return location");
+					auto it = tinfo.return_locations.find(current_callable_pc);
+					if (it != tinfo.return_locations.end()) {
+						for (const address_t site : it->second) {
+							if (site > this->begin_pc() && site < this->end_pc()
+								&& std::find(predicted.begin(), predicted.end(), site) == predicted.end())
+								predicted.push_back(site);
+						}
+						if (predicted.size() > MAX_PREDICTED_RETURN_SITES)
+							predicted.clear();
 					}
-					// TODO: Check if the return location is in the current block
-					// If it is, we can jump directly to it
-					// Otherwise, we should immediately exit the function
-					//printf("Single return location: 0x%lX (pc=0x%lX) -> 0x%lX\n",
-					//	long(current_callable_pc), long(this->pc()), long(it->second));
-					if (it->second >= this->begin_pc() && it->second < this->end_pc()) {
-						// Jump directly to the return location
-						add_code("if (" + from_reg(instr.Itype.rs1) + " == " + STRADDR(current_callable_pc) + ") goto " + FUNCLABEL(it->second) + ";");
-					}
-					// Otherwise, we need to use unknown register values to jump
 				}
+				// In counting mode the whole dispatch is guarded by the limit
+				// below, so a predicted (possibly backward) jump is also counted.
+				if (!predicted.empty() && !tinfo.ignore_instruction_limit)
+					add_code("if (" + LOOP_EXPRESSION + ") {");
+				for (const address_t site : predicted) {
+					add_code("if (" + from_reg(instr.Itype.rs1) + " == " + STRADDR(site) + ") goto " + FUNCLABEL(site) + ";");
+				}
+				if (!predicted.empty() && !tinfo.ignore_instruction_limit)
+					add_code("}");
 				add_code(
 					"JUMP_TO(" + from_reg(instr.Itype.rs1) + " + " + from_imm(instr.Itype.signed_imm()) + ");"
 				);
 			}
 			// Untrack current callable PC
 			current_callable_pc = 0;
-			if (!tinfo.ignore_instruction_limit)
-				code += "if (pc >= " + STRADDR(this->begin_pc()) + " && pc < " + STRADDR(this->end_pc()) + " && " + LOOP_EXPRESSION + ") goto " + this->func + "_jumptbl;\n";
-			else
-				code += "if (pc >= " + STRADDR(this->begin_pc()) + " && pc < " + STRADDR(this->end_pc()) + ") goto " + this->func + "_jumptbl;\n";
-			exit_function("pc", false);
+			// The dispatch table covers the whole block, and exits the
+			// function for any address outside of it.
+			if (!tinfo.ignore_instruction_limit) {
+				add_code("if (" + LOOP_EXPRESSION + ") goto " + this->func + "_jumptbl;");
+				exit_function("pc", false);
+			} else {
+				add_code("goto " + this->func + "_jumptbl;");
+			}
 			this->add_reentry_next();
 			} break;
 		case RV32I_JAL: {
@@ -1203,21 +2353,24 @@ void Emitter<W>::emit()
 							dst + " = do_cpopl(" + src + ");");
 					break;
 				default:
-					if (instr.Itype.high_bits() == 0) {
+					if (instr.Itype.high_bits() == 0 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 						// SLLI: Logical left-shift immediate
 						emit_op(" << ", " <<= ", instr.Itype.rd, instr.Itype.rs1,
 							std::to_string(instr.Itype.shift64_imm() & (XLEN-1)));
-					} else if (instr.Itype.high_bits() == 0x280) {
+					} else if (instr.Itype.high_bits() == 0x280 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 						// BSETI: Bit-set immediate
 						add_code(dst + " = " + src + " | ((addr_t)1 << (" + std::to_string(instr.Itype.imm & (XLEN-1)) + "));");
 					}
-					else if (instr.Itype.high_bits() == 0x480) {
+					else if (instr.Itype.high_bits() == 0x480 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 						// BCLRI: Bit-clear immediate
 						add_code(dst + " = " + src + " & ~((addr_t)1 << (" + std::to_string(instr.Itype.imm & (XLEN-1)) + "));");
 					}
-					else if (instr.Itype.high_bits() == 0x680) {
+					else if (instr.Itype.high_bits() == 0x680 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 						// BINVI: Bit-invert immediate
 						add_code(dst + " = " + src + " ^ ((addr_t)1 << (" + std::to_string(instr.Itype.imm & (XLEN-1)) + "));");
+					}
+					else if (W == 4 && instr.Itype.imm == 0b000010001111) {
+						add_code(dst + " = do_zip32(" + src + ");");
 					} else {
 						UNKNOWN_INSTRUCTION();
 					}
@@ -1230,17 +2383,17 @@ void Emitter<W>::emit()
 				break;
 			case 0x3: // SLTU:
 				add_code(
-					dst + " = (" + src + " < (unsigned) " + from_imm(instr.Itype.signed_imm()) + ") ? 1 : 0;");
+					dst + " = (" + src + " < (addr_t) " + from_imm(instr.Itype.signed_imm()) + ") ? 1 : 0;");
 				break;
 			case 0x4: // XORI:
 				emit_op(" ^ ", " ^= ", instr.Itype.rd, instr.Itype.rs1, from_imm(instr.Itype.signed_imm()));
 				break;
 			case 0x5: // SRLI / SRAI / ORC.B:
-				if (instr.Itype.is_rori()) {
+				if (instr.Itype.is_rori() && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 					// RORI: Rotate right immediate
 					add_code(
 					"{const unsigned shift = " + from_imm(instr.Itype.imm & (XLEN-1)) + ";\n",
-						dst + " = (" + src + " >> shift) | (" + src + " << (XLEN - shift)); }"
+						dst + " = (" + src + " >> shift) | (" + src + " << ((XLEN - shift) & (XLEN-1))); }"
 					);
 				} else if (instr.Itype.imm == 0x287) {
 					// ORC.B: Bitwise OR-combine
@@ -1254,17 +2407,21 @@ void Emitter<W>::emit()
 						add_code(dst + " = do_bswap32(" + src + ");");
 					else
 						add_code(dst + " = do_bswap64(" + src + ");");
-				} else if (instr.Itype.high_bits() == 0x0) {
+				} else if (instr.Itype.high_bits() == 0x0 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 					// SRLI: Logical right-shift immediate
 					emit_op(" >> ", " >>= ", instr.Itype.rd, instr.Itype.rs1,
 						std::to_string(instr.Itype.shift64_imm() & (XLEN-1)));
-				} else if (instr.Itype.high_bits() == 0x400) {
+				} else if (instr.Itype.high_bits() == 0x400 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) {
 					// SRAI: Arithmetic right-shift immediate
 					add_code(
 						dst + " = (saddr_t)" + src + " >> " + std::to_string(instr.Itype.imm & (XLEN-1)) + ";");
-				} else if (instr.Itype.high_bits() == 0x480) { // BEXTI: Bit-extract immediate
+				} else if (instr.Itype.high_bits() == 0x480 && (W != 4 || (instr.Itype.imm & 0x20) == 0)) { // BEXTI: Bit-extract immediate
 					add_code(
 						dst + " = (" + src + " >> (" + std::to_string(instr.Itype.imm & (XLEN-1)) + ")) & 1;");
+				} else if (instr.Itype.imm == 0b011010000111) {
+					add_code(dst + " = do_brev8(" + src + ");");
+				} else if (W == 4 && instr.Itype.imm == 0b000010001111) {
+					add_code(dst + " = do_unzip32(" + src + ");");
 				} else {
 					UNKNOWN_INSTRUCTION();
 				}
@@ -1343,21 +2500,32 @@ void Emitter<W>::emit()
 			// extension RV32M / RV64M
 			case 0x10: // MUL
 				add_code(
-					to_reg(instr.Rtype.rd) + " = (saddr_t)" + from_reg(instr.Rtype.rs1) + " * (saddr_t)" + from_reg(instr.Rtype.rs2) + ";");
+					to_reg(instr.Rtype.rd) + " = (addr_t)" + from_reg(instr.Rtype.rs1) + " * (addr_t)" + from_reg(instr.Rtype.rs2) + ";");
 				break;
 			case 0x11: // MULH (signed x signed)
-				add_code(
-					(W == 4) ?
-					to_reg(instr.Rtype.rd) + " = (uint64_t)((int64_t)(saddr_t)" + from_reg(instr.Rtype.rs1) + " * (int64_t)(saddr_t)" + from_reg(instr.Rtype.rs2) + ") >> 32u;" :
-					"MUL128(&" + to_reg(instr.Rtype.rd) + ", " + from_reg(instr.Rtype.rs1) + ", " + from_reg(instr.Rtype.rs2) + ");"
-				);
+				if constexpr (W == 4) {
+					add_code(
+						to_reg(instr.Rtype.rd) + " = (uint64_t)((int64_t)(saddr_t)" + from_reg(instr.Rtype.rs1) + " * (int64_t)(saddr_t)" + from_reg(instr.Rtype.rs2) + ") >> 32u;");
+				} else {
+					add_code(
+						"{ addr_t lhs = " + from_reg(instr.Rtype.rs1) + "; addr_t rhs = " + from_reg(instr.Rtype.rs2) + ";",
+						"MUL128(&" + to_reg(instr.Rtype.rd) + ", lhs, rhs);",
+						"if ((saddr_t)lhs < 0) " + to_reg(instr.Rtype.rd) + " -= rhs;",
+						"if ((saddr_t)rhs < 0) " + to_reg(instr.Rtype.rd) + " -= lhs; }"
+					);
+				}
 				break;
 			case 0x12: // MULHSU (signed x unsigned)
-				add_code(
-					(W == 4) ?
-					to_reg(instr.Rtype.rd) + " = (uint64_t)((int64_t)(saddr_t)" + from_reg(instr.Rtype.rs1) + " * (uint64_t)" + from_reg(instr.Rtype.rs2) + ") >> 32u;" :
-					"MUL128(&" + to_reg(instr.Rtype.rd) + ", " + from_reg(instr.Rtype.rs1) + ", " + from_reg(instr.Rtype.rs2) + ");"
-				);
+				if constexpr (W == 4) {
+					add_code(
+						to_reg(instr.Rtype.rd) + " = (uint64_t)((int64_t)(saddr_t)" + from_reg(instr.Rtype.rs1) + " * (uint64_t)" + from_reg(instr.Rtype.rs2) + ") >> 32u;");
+				} else {
+					add_code(
+						"{ addr_t lhs = " + from_reg(instr.Rtype.rs1) + "; addr_t rhs = " + from_reg(instr.Rtype.rs2) + ";",
+						"MUL128(&" + to_reg(instr.Rtype.rd) + ", lhs, rhs);",
+						"if ((saddr_t)lhs < 0) " + to_reg(instr.Rtype.rd) + " -= rhs; }"
+					);
+				}
 				break;
 			case 0x13: // MULHU (unsigned x unsigned)
 				add_code(
@@ -1367,50 +2535,66 @@ void Emitter<W>::emit()
 				);
 				break;
 			case 0x14: // DIV
-				// division by zero is not an exception
+				// Division by zero is not an exception: rd = -1
+				// Signed overflow is not an exception either: rd = the dividend
 				if constexpr (W == 8) {
 					add_code(
 						"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0)) {",
-						"	if (LIKELY(!(" + from_reg(instr.Rtype.rs1) + " == -9223372036854775808ull && " + from_reg(instr.Rtype.rs2) + " == -1ull)))"
+						"	if (LIKELY(!(" + from_reg(instr.Rtype.rs1) + " == -9223372036854775808ull && " + from_reg(instr.Rtype.rs2) + " == -1ull)))",
 						"		" + to_reg(instr.Rtype.rd) + " = (int64_t)" + from_reg(instr.Rtype.rs1) + " / (int64_t)" + from_reg(instr.Rtype.rs2) + ";",
-						"}");
+						"	else " + to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + ";",
+						"} else " + to_reg(instr.Rtype.rd) + " = (addr_t)-1;");
 				} else {
 					add_code(
 						"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0)) {",
 						"	if (LIKELY(!(" + from_reg(instr.Rtype.rs1) + " == 2147483648 && " + from_reg(instr.Rtype.rs2) + " == 4294967295)))",
 						"		" + to_reg(instr.Rtype.rd) + " = (int32_t)" + from_reg(instr.Rtype.rs1) + " / (int32_t)" + from_reg(instr.Rtype.rs2) + ";",
-						"}");
+						"	else " + to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + ";",
+						"} else " + to_reg(instr.Rtype.rd) + " = (addr_t)-1;");
 				}
 				break;
 			case 0x15: // DIVU
 				add_code(
 					"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0))",
-					to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + " / " + from_reg(instr.Rtype.rs2) + ";"
+					to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + " / " + from_reg(instr.Rtype.rs2) + ";",
+					"else " + to_reg(instr.Rtype.rd) + " = (addr_t)-1;"
 				);
 				break;
 			case 0x16: // REM
+				// Division by zero is not an exception: rd = the dividend
+				// Signed overflow is not an exception either: rd = 0
 				if constexpr (W == 8) {
 					add_code(
 					"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0)) {",
 					"	if (LIKELY(!(" + from_reg(instr.Rtype.rs1) + " == -9223372036854775808ull && " + from_reg(instr.Rtype.rs2) + " == -1ull)))",
 					"		" + to_reg(instr.Rtype.rd) + " = (int64_t)" + from_reg(instr.Rtype.rs1) + " % (int64_t)" + from_reg(instr.Rtype.rs2) + ";",
-					"}");
+					"	else " + to_reg(instr.Rtype.rd) + " = 0;",
+					"} else " + to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + ";");
 				} else {
 					add_code(
 					"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0)) {",
 					"	if (LIKELY(!(" + from_reg(instr.Rtype.rs1) + " == 2147483648 && " + from_reg(instr.Rtype.rs2) + " == 4294967295)))",
 					"		" + to_reg(instr.Rtype.rd) + " = (int32_t)" + from_reg(instr.Rtype.rs1) + " % (int32_t)" + from_reg(instr.Rtype.rs2) + ";",
-					"}");
+					"	else " + to_reg(instr.Rtype.rd) + " = 0;",
+					"} else " + to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + ";");
 				}
 				break;
 			case 0x17: // REMU
 				add_code(
 				"if (LIKELY(" + from_reg(instr.Rtype.rs2) + " != 0))",
-					to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + " % " + from_reg(instr.Rtype.rs2) + ";"
+					to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + " % " + from_reg(instr.Rtype.rs2) + ";",
+					"else " + to_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs1) + ";"
 				);
 				break;
-			case 0x44: // ZEXT.H: Zero-extend 16-bit
-				add_code(to_reg(instr.Rtype.rd) + " = (uint16_t)" + from_reg(instr.Rtype.rs1) + ";");
+			case 0x44: // PACK (ZEXT.H on RV32 when rs2 == 0)
+				if constexpr (W == 4) {
+					add_code(to_reg(instr.Rtype.rd) + " = (addr_t)(uint16_t)(" + from_reg(instr.Rtype.rs1) + ") | ((addr_t)(uint16_t)(" + from_reg(instr.Rtype.rs2) + ") << 16);");
+				} else {
+					add_code(to_reg(instr.Rtype.rd) + " = (addr_t)(uint32_t)(" + from_reg(instr.Rtype.rs1) + ") | ((addr_t)(uint32_t)(" + from_reg(instr.Rtype.rs2) + ") << 32);");
+				}
+				break;
+			case 0x47: // PACKH
+				add_code(to_reg(instr.Rtype.rd) + " = (addr_t)(uint8_t)(" + from_reg(instr.Rtype.rs1) + ") | ((addr_t)(uint8_t)(" + from_reg(instr.Rtype.rs2) + ") << 8);");
 				break;
 			case 0x51: // CLMUL
 				add_code(
@@ -1423,7 +2607,7 @@ void Emitter<W>::emit()
 			case 0x52: // CLMULR
 				add_code(
 					"{ addr_t result = 0;",
-					"for (unsigned i = 0; i < XLEN-1; i++)",
+					"for (unsigned i = 0; i < XLEN; i++)",
 					"  if ((" + from_reg(instr.Rtype.rs2) + " >> i) & 1)",
 					"    result ^= (" + from_reg(instr.Rtype.rs1) + " >> (XLEN - i - 1));",
 					to_reg(instr.Rtype.rd) + " = result; }");
@@ -1487,16 +2671,18 @@ void Emitter<W>::emit()
 				// dst = (src2 != 0) ? 0 : src1;
 				add_code(to_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs2) + " != 0) ? 0 : " + from_reg(instr.Rtype.rs1) + ";");
 				break;
+			// The complementary shift count is masked, as a zero rotate would
+			// otherwise shift by the full register width
 			case 0x301: // ROL: Rotate left
 				add_code(
 				"{const unsigned shift = " + from_reg(instr.Rtype.rs2) + " & (XLEN-1);\n",
-					to_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " << shift) | (" + from_reg(instr.Rtype.rs1) + " >> (XLEN - shift)); }"
+					to_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " << shift) | (" + from_reg(instr.Rtype.rs1) + " >> ((XLEN - shift) & (XLEN-1))); }"
 				);
 				break;
 			case 0x305: // ROR: Rotate right
 				add_code(
 				"{const unsigned shift = " + from_reg(instr.Rtype.rs2) + " & (XLEN-1);\n",
-					to_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " >> shift) | (" + from_reg(instr.Rtype.rs1) + " << (XLEN - shift)); }"
+					to_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " >> shift) | (" + from_reg(instr.Rtype.rs1) + " << ((XLEN - shift) & (XLEN-1))); }"
 				);
 				break;
 			case 0x341: // BINV
@@ -1524,6 +2710,13 @@ void Emitter<W>::emit()
 			this->track_register_value(instr.Utype.rd, PCRELA(instr.Utype.upper_imm()));
 			break;
 		case RV32I_FENCE:
+			if (instr.Itype.funct3 == 0x1) {
+				WELL_KNOWN_INSTRUCTION();
+				exit_function(PCRELS(4), false);
+				this->add_reentry_next();
+			} else if (instr.Itype.funct3 != 0x0) {
+				UNKNOWN_INSTRUCTION();
+			}
 			break;
 		case RV32I_SYSTEM:
 			if (instr.Itype.funct3 == 0x0) {
@@ -1534,10 +2727,10 @@ void Emitter<W>::emit()
 					if (instr.Itype.imm == 0) {
 						// ECALL: System call
 						syscall_reg = this->from_reg(REG_ECALL);
-						this->emit_system_call(syscall_reg, false);
+						this->emit_system_call(syscall_reg);
 					} else { // EBREAK
 						syscall_reg = std::to_string(SYSCALL_EBREAK);
-						this->emit_system_call(syscall_reg, true);
+						this->emit_system_call(syscall_reg);
 					}
 					break;
 				} else if (instr.Itype.imm == 261 || instr.Itype.imm == 0x7FF) { // WFI / STOP
@@ -1551,10 +2744,12 @@ void Emitter<W>::emit()
 					this->load_register(instr.Itype.rs1);
 					this->potentially_realize_register(instr.Itype.rs1);
 					// Zero funct3, unknown imm: Don't exit
+					// The system handler is opaque and may write any register
+					this->invalidate_all_bounds_checks();
 					code += "cpu->pc = " + PCRELS(0) + ";\n";
 					if (tinfo.is_libtcc) {
 						code += "if (api.system(cpu, " + std::to_string(instr.whole) +"))\n";
-						code += "  return (ReturnValues){0, 0};\n";
+						code += "  RETURN_VALUES(0, 0);\n";
 					} else {
 						code += "api.system(cpu, " + std::to_string(instr.whole) +");\n";
 					}
@@ -1568,13 +2763,15 @@ void Emitter<W>::emit()
 				this->potentially_realize_register(instr.Itype.rd);
 				this->load_register(instr.Itype.rs1);
 				this->potentially_realize_register(instr.Itype.rs1);
+				// The system handler is opaque and may write any register
+				this->invalidate_all_bounds_checks();
 				code += "cpu->pc = " + PCRELS(0) + ";\n";
 				if (!tinfo.ignore_instruction_limit)
 					code += "INS_COUNTER(cpu) = ic;\n"; // Reveal instruction counters
 				code += "MAX_COUNTER(cpu) = max_ic;\n";
 				if (tinfo.is_libtcc) {
 					code += "if (api.system(cpu, " + std::to_string(instr.whole) +"))\n";
-					code += "  return (ReturnValues){0, 0};\n";
+					code += "  RETURN_VALUES(0, 0);\n";
 				} else {
 					code += "api.system(cpu, " + std::to_string(instr.whole) +");\n";
 				}
@@ -1606,11 +2803,11 @@ void Emitter<W>::emit()
 				add_code(dst + " = " + SIGNEXTW + " (" + src + " + " + from_imm(instr.Itype.signed_imm()) + ");");
 				break;
 			case 0x1: // SLLI.W / SLLI.UW:
-				if (instr.Itype.high_bits() == 0x000) {
+				if (instr.Itype.high_bits() == 0x000 && (instr.Itype.imm & 0x20) == 0) {
 					add_code(dst + " = " + SIGNEXTW + " (" + src + " << " + from_imm(instr.Itype.shift_imm()) + ");");
 				} else if (instr.Itype.high_bits() == 0x080) {
-					// SLLI.UW
-					add_code(dst + " = ((addr_t)" + src + " << " + from_imm(instr.Itype.shift_imm()) + ");");
+					// SLLI.UW (full 6-bit RV64 shamt)
+					add_code(dst + " = ((addr_t)" + src + " << " + from_imm(instr.Itype.shift64_imm()) + ");");
 				} else {
 					switch (instr.Itype.imm) {
 					case 0b011000000000: // CLZ.W
@@ -1628,15 +2825,16 @@ void Emitter<W>::emit()
 				}
 				break;
 			case 0x5: // SRLIW / SRAIW:
-				if (instr.Itype.high_bits() == 0x0) { // SRLIW
+				if (instr.Itype.high_bits() == 0x0 && (instr.Itype.imm & 0x20) == 0) { // SRLIW
 					add_code(dst + " = " + SIGNEXTW + " (" + src + " >> " + from_imm(instr.Itype.shift_imm()) + ");");
-				} else if (instr.Itype.high_bits() == 0x400) { // SRAIW: preserve the sign bit
+				} else if (instr.Itype.high_bits() == 0x400 && (instr.Itype.imm & 0x20) == 0) { // SRAIW: preserve the sign bit
 					add_code(
 						dst + " = (int32_t)" + src + " >> " + from_imm(instr.Itype.shift_imm()) + ";");
-				} else if (instr.Itype.high_bits() == 0x600) { // RORIW
+				} else if (instr.Itype.high_bits() == 0x600 && (instr.Itype.imm & 0x20) == 0) { // RORIW
 					add_code(
-					"{const unsigned shift = " + from_imm(instr.Itype.imm) + " & 31;\n",
-						dst + " = (int32_t)(" + src + " >> shift) | (" + src + " << (32 - shift)); }"
+						"{const unsigned shift = " + from_imm(instr.Itype.imm) + " & 31;\n",
+						"const uint32_t word = " + src + ";\n",
+						dst + " = (int32_t)((word >> shift) | (word << ((32 - shift) & 31))); }"
 					);
 				} else {
 					UNKNOWN_INSTRUCTION();
@@ -1678,33 +2876,46 @@ void Emitter<W>::emit()
 				add_code(dst + " = " + SIGNEXTW + "(" + src1 + " * " + src2 + ");");
 				break;
 			case 0x14: // DIVW
-				// division by zero is not an exception
+				// Division by zero is not an exception: rd = -1
+				// Signed overflow is not an exception either: rd = the dividend
 				add_code(
-				"if (LIKELY(" + src2 + " != 0))",
-				"if (LIKELY(!((int32_t)" + src1 + " == -2147483648 && (int32_t)" + src2 + " == -1)))",
-				dst + " = " + SIGNEXTW + " ((int32_t)" + src1 + " / (int32_t)" + src2 + ");");
+				"if (LIKELY(" + src2 + " != 0)) {",
+				"	if (LIKELY(!((int32_t)" + src1 + " == -2147483648 && (int32_t)" + src2 + " == -1)))",
+				"		" + dst + " = " + SIGNEXTW + " ((int32_t)" + src1 + " / (int32_t)" + src2 + ");",
+				"	else " + dst + " = " + SIGNEXTW + " (" + src1 + ");",
+				"} else " + dst + " = (addr_t)(int32_t)-1;");
 				break;
 			case 0x15: // DIVUW
 				add_code(
 				"if (LIKELY(" + src2 + " != 0))",
-				dst + " = " + SIGNEXTW + " (" + src1 + " / " + src2 + ");");
+				dst + " = " + SIGNEXTW + " (" + src1 + " / " + src2 + ");",
+				"else " + dst + " = (addr_t)(int32_t)-1;");
 				break;
 			case 0x16: // REMW
+				// Division by zero is not an exception: rd = the dividend
+				// Signed overflow is not an exception either: rd = 0
 				add_code(
-				"if (LIKELY(" + src2 + " != 0))",
-				"if (LIKELY(!((int32_t)" + src1 + " == -2147483648 && (int32_t)" + src2 + " == -1)))",
-				dst + " = " + SIGNEXTW + " ((int32_t)" + src1 + " % (int32_t)" + src2 + ");");
+				"if (LIKELY(" + src2 + " != 0)) {",
+				"	if (LIKELY(!((int32_t)" + src1 + " == -2147483648 && (int32_t)" + src2 + " == -1)))",
+				"		" + dst + " = " + SIGNEXTW + " ((int32_t)" + src1 + " % (int32_t)" + src2 + ");",
+				"	else " + dst + " = 0;",
+				"} else " + dst + " = " + SIGNEXTW + " (" + src1 + ");");
 				break;
 			case 0x17: // REMUW
 				add_code(
 				"if (LIKELY(" + src2 + " != 0))",
-				dst + " = " + SIGNEXTW + " (" + src1 + " % " + src2 + ");");
+				dst + " = " + SIGNEXTW + " (" + src1 + " % " + src2 + ");",
+				"else " + dst + " = " + SIGNEXTW + " (" + src1 + ");");
 				break;
 			case 0x40: // ADD.UW
 				add_code(dst + " = " + from_reg(instr.Rtype.rs2) + " + " + src1 + ";");
 				break;
-			case 0x44: // ZEXT.H (imm=0x40):
-				add_code(dst + " = (uint16_t)(" + src1 + ");");
+			case 0x44: // ZEXT.H / PACKW
+				if (instr.Rtype.rs2 == 0) {
+					add_code(dst + " = (uint16_t)(" + src1 + ");");
+				} else {
+					add_code(dst + " = (int32_t)((uint16_t)(" + src1 + ") | ((uint32_t)(uint16_t)(" + src2 + ") << 16));");
+				}
 				break;
 			case 0x102: // SH1ADD.UW
 				add_code(dst + " = " + from_reg(instr.Rtype.rs2) + " + ((addr_t)" + src1 + " << 1);");
@@ -1718,13 +2929,15 @@ void Emitter<W>::emit()
 			case 0x301: // ROLW: Rotate left 32-bit
 				add_code(
 				"{const unsigned shift = " + from_reg(instr.Rtype.rs2) + " & 31;\n",
-					dst + " = (int32_t)(" + from_reg(instr.Rtype.rs1) + " << shift) | (" + from_reg(instr.Rtype.rs1) + " >> (32 - shift)); }"
+					"const uint32_t word = (uint32_t)" + from_reg(instr.Rtype.rs1) + ";\n",
+					dst + " = (int32_t)((word << shift) | (word >> ((32 - shift) & 31))); }"
 				);
 				break;
 			case 0x305: // RORW: Rotate right (32-bit)
 				add_code(
 				"{const unsigned shift = " + from_reg(instr.Rtype.rs2) + " & 31;\n",
-					dst + " = (int32_t)(" + from_reg(instr.Rtype.rs1) + " >> shift) | (" + from_reg(instr.Rtype.rs1) + " << (32 - shift)); }"
+					"const uint32_t word = (uint32_t)" + from_reg(instr.Rtype.rs1) + ";\n",
+					dst + " = (int32_t)((word >> shift) | (word << ((32 - shift) & 31))); }"
 				);
 				break;
 			default:
@@ -1735,31 +2948,26 @@ void Emitter<W>::emit()
 		case RV32F_LOAD: {
 			const rv32f_instruction fi{instr};
 			switch (fi.Itype.funct3) {
+			case 0x1: // FLH (Zfhmin), boxed at sixteen bits
+				this->memory_load<uint16_t>(from_fpreg(fi.Itype.rd) + ".i32[0]", "uint16_t", fi.Itype.rs1, fi.Itype.signed_imm());
+				if constexpr (nanboxing) {
+					code += from_fpreg(fi.Itype.rd) + ".i64 |= (int64_t)0xFFFFFFFFFFFF0000ULL;\n";
+				}
+				break;
 			case 0x2: // FLW
 				this->memory_load<uint32_t>(from_fpreg(fi.Itype.rd) + ".i32[0]", "uint32_t", fi.Itype.rs1, fi.Itype.signed_imm());
 				if constexpr (nanboxing) {
-					code += from_fpreg(fi.Itype.rd) + ".i32[1] = 0;\n";
+					code += from_fpreg(fi.Itype.rd) + ".i32[1] = ~0;\n";
 				}
 				break;
 			case 0x3: // FLD
 				this->memory_load<uint64_t>(from_fpreg(fi.Itype.rd) + ".i64", "uint64_t", fi.Itype.rs1, fi.Itype.signed_imm());
 				break;
 #ifdef RISCV_EXT_VECTOR
-			case 0x6: { // VLE32
-				if (tinfo.is_libtcc) {
-					// Vector load is not supported in libtcc
-					const rv32v_instruction vi { instr };
-					load_register(vi.VLS.rs1);
-					this->potentially_realize_register(vi.VLS.rs1);
-					WELL_KNOWN_INSTRUCTION();
-					this->potentially_reload_register(vi.VLS.rs1);
-				} else {
-					// VLE32: Load vector lane from memory
-					const rv32v_instruction vi { instr };
-					this->memory_load<VectorLane>(from_rvvreg(vi.VLS.vd), "VectorLane", vi.VLS.rs1, 0);
-				}
-				break;
-			}
+		// RVV loads: funct3 encodes EEW, non-overlapping with scalar FP widths.
+		case 0x0: case 0x5: case 0x6: case 0x7:
+			this->emit_vector_instruction();
+			break;
 #endif
 			default:
 				UNKNOWN_INSTRUCTION();
@@ -1769,27 +2977,20 @@ void Emitter<W>::emit()
 		case RV32F_STORE: {
 			const rv32f_instruction fi{instr};
 			switch (fi.Itype.funct3) {
+			case 0x1: // FSH (Zfhmin)
+				this->memory_store("int16_t", sizeof(int16_t), fi.Stype.rs1, fi.Stype.signed_imm(), from_fpreg(fi.Stype.rs2) + ".i32[0]");
+				break;
 			case 0x2: // FSW
-				this->memory_store("int32_t", fi.Stype.rs1, fi.Stype.signed_imm(), from_fpreg(fi.Stype.rs2) + ".i32[0]");
+				this->memory_store("int32_t", sizeof(int32_t), fi.Stype.rs1, fi.Stype.signed_imm(), from_fpreg(fi.Stype.rs2) + ".i32[0]");
 				break;
 			case 0x3: // FSD
-				this->memory_store("int64_t", fi.Stype.rs1, fi.Stype.signed_imm(), from_fpreg(fi.Stype.rs2) + ".i64");
+				this->memory_store("int64_t", sizeof(int64_t), fi.Stype.rs1, fi.Stype.signed_imm(), from_fpreg(fi.Stype.rs2) + ".i64");
 				break;
 #ifdef RISCV_EXT_VECTOR
-			case 0x6: { // VSE32
-				if (tinfo.is_libtcc) {
-					// Vector store is not supported in libtcc
-					const rv32v_instruction vi { instr };
-					load_register(vi.VLS.rs1);
-					this->potentially_realize_register(vi.VLS.rs1);
-					WELL_KNOWN_INSTRUCTION();
-					this->potentially_reload_register(vi.VLS.rs1);
-				} else {
-					const rv32v_instruction vi { instr };
-					this->memory_store("VectorLane", vi.VLS.rs1, 0, from_rvvreg(vi.VLS.vd));
-				}
-				break;
-			}
+		// RVV stores
+		case 0x0: case 0x5: case 0x6: case 0x7:
+			this->emit_vector_instruction();
+			break;
 #endif
 			default:
 				UNKNOWN_INSTRUCTION();
@@ -1800,9 +3001,7 @@ void Emitter<W>::emit()
 		case RV32F_FMSUB:
 		case RV32F_FNMADD:
 		case RV32F_FNMSUB: {
-			// RISC-V spec §11.6: FMA must round only once. Route through
-			// api.fmaf{32,64} (std::fma) so the generated C is correctly
-			// fused — TCC would otherwise compile `a*b+c` as two roundings.
+			// FMA: single rounding via std::fma; TCC would otherwise split into two roundings.
 			//   FMADD  =  rs1*rs2 + rs3 →  fma(rs1, rs2,  rs3)
 			//   FMSUB  =  rs1*rs2 - rs3 →  fma(rs1, rs2, -rs3)
 			//   FNMADD = -rs1*rs2 - rs3 → -fma(rs1, rs2,  rs3)
@@ -1817,6 +3016,11 @@ void Emitter<W>::emit()
 			const std::string resultSign = negateResult ? "-" : "";
 			const std::string cSign      = subtractC    ? "-" : "";
 			if (fi.R4type.funct2 == 0x0) { // float32
+				if constexpr (nanboxing && W == 8) {
+					code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu"
+						" || (uint32_t)" + rs3 + ".i32[1] != 0xFFFFFFFFu) ";
+					code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+				}
 				code += "set_fl(&" + dst + ", " + resultSign + "api.fmaf32("
 				      + rs1 + ".f32[0], " + rs2 + ".f32[0], " + cSign + rs3 + ".f32[0]));\n";
 			} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -1831,12 +3035,72 @@ void Emitter<W>::emit()
 			const auto dst = from_fpreg(fi.R4type.rd);
 			const auto rs1 = from_fpreg(fi.R4type.rs1);
 			const auto rs2 = from_fpreg(fi.R4type.rs2);
+			const bool f32 = (fi.R4type.funct2 == 0x0);
+			// NaN/sNaN predicates for FCSR flag computation. Only emitted under fcsr_emulation.
+			auto is_nan = [] (const std::string& r, bool is_f32) -> std::string {
+				if (is_f32)
+					return "((" + r + ".i32[0] & 0x7f800000u) == 0x7f800000u && (" + r + ".i32[0] & 0x007fffffu) != 0)";
+				return "((" + r + ".i64 & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (" + r + ".i64 & 0x000fffffffffffffull) != 0)";
+			};
+			auto is_snan = [] (const std::string& r, bool is_f32) -> std::string {
+				if (is_f32)
+					return "((" + r + ".i32[0] & 0x7fc00000u) == 0x7f800000u && (" + r + ".i32[0] & 0x003fffffu) != 0)";
+				return "((" + r + ".i64 & 0x7ff8000000000000ull) == 0x7ff0000000000000ull && (" + r + ".i64 & 0x0007ffffffffffffull) != 0)";
+			};
+			auto raise_nv = [] (const std::string& cond) -> std::string {
+				return "if (" + cond + ") cpu->fcsr |= 0x10;\n";
+			};
+			// Canonical qNaN substitution on NaN results (spec §11.3). Only under fcsr_emulation.
+			auto emit_arith = [&] (const std::string& expr, bool is_f32) -> std::string {
+				if constexpr (fcsr_emulation) {
+					if (is_f32)
+						return "{ const float fr = " + expr + "; if (fr != fr) load_fl(&" + dst + ", 0x7fc00000u); else set_fl(&" + dst + ", fr); }\n";
+					return "{ const double dr = " + expr + "; if (dr != dr) load_dbl(&" + dst + ", 0x7ff8000000000000ull); else set_dbl(&" + dst + ", dr); }\n";
+				} else {
+					if (is_f32)
+						return "set_fl(&" + dst + ", " + expr + ");\n";
+					return "set_dbl(&" + dst + ", " + expr + ");\n";
+				}
+			};
 			if (fi.R4type.funct2 < 0x2) { // fp32 / fp64
 			switch (instr.fpfunc()) {
 			case RV32F__FEQ_LT_LE:
 				if (UNLIKELY(fi.R4type.rd == 0)) {
 					UNKNOWN_INSTRUCTION();
 					break;
+				}
+				// FLE/FLT are signaling compares: any NaN operand raises NV. FEQ is
+				// a quiet compare and only raises NV for a signaling NaN. All of
+				// them already yield 0 for unordered operands in plain C.
+				// A non-NaN-boxed single-precision operand is read as the
+				// canonical quiet NaN. FLE/FLT are signaling compares, so a
+				// NaN operand (quiet or signaling) raises NV and the compare
+				// is false; FEQ is quiet and raises NV only for sNaN. The
+				// FLE/FLT NV is added in the fcsr_emulation block below via
+				// the is_nan() test (a non-boxed operand is a NaN), so here
+				// only the false result is forced.
+				if constexpr (nanboxing && W == 8) {
+					if (f32) {
+						// A non-NaN-boxed operand is read as the canonical
+						// quiet NaN: the compare is false and FLE/FLT raise
+						// NV (signaling compare). The comparison and the
+						// normal NV logic run in the else branch.
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) { ";
+						code += to_reg(fi.R4type.rd) + " = 0;";
+						if constexpr (fcsr_emulation) {
+							const unsigned op = fi.R4type.funct3 | (fi.R4type.funct2 << 4);
+							if (op != 0x2 && op != 0x12) // FLE/FLT only
+								code += " cpu->fcsr |= 0x10;";
+						}
+						code += " }\nelse { ";
+					}
+				}
+				if constexpr (fcsr_emulation) {
+					const unsigned op = fi.R4type.funct3 | (fi.R4type.funct2 << 4);
+					if (op == 0x2 || op == 0x12) // FEQ.S / FEQ.D
+						code += raise_nv(is_snan(rs1, f32) + " || " + is_snan(rs2, f32));
+					else if (op <= 0x1 || (op >= 0x10 && op <= 0x11))
+						code += raise_nv(is_nan(rs1, f32) + " || " + is_nan(rs2, f32));
 				}
 				switch (fi.R4type.funct3 | (fi.R4type.funct2 << 4)) {
 				case 0x0: // FLE.S
@@ -1860,14 +3124,31 @@ void Emitter<W>::emit()
 				default:
 					UNKNOWN_INSTRUCTION();
 				}
+				if constexpr (nanboxing && W == 8) {
+					if (f32) code += " }\n";
+				}
 				this->reset_tracked_register(fi.R4type.rd);
 				break;
 			case RV32F__FMIN_MAX:
-				// Route through api.{fmin,fmax}{32,64}_rv so the emitted
-				// C honors RISC-V's -0.0 < +0.0 convention for FMIN/FMAX
-				// (std::fmin/fmax leave the ±0 case implementation-
-				// defined; the host's fminf/fmaxf would otherwise return
-				// a sign that disagrees with the spec).
+				// RISC-V FMIN/FMAX: -0.0 < +0.0, unlike std::fmin/fmax.
+				// Non-NaN-boxed operand → canonical qNaN.
+				if constexpr (nanboxing && W == 8) {
+					if (f32) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+						// Spelled as int: the JIT compiles this text as C99,
+						// where <stdbool.h> is not in scope.
+						code += "{ const int nb1 = (uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu;"
+							" const int nb2 = (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu;"
+							" if (nb1 && nb2) load_fl(&" + dst + ", 0x7fc00000u);"
+							" else if (nb1) set_fl(&" + dst + ", " + rs2 + ".f32[0]);"
+							" else set_fl(&" + dst + ", " + rs1 + ".f32[0]); }\nelse ";
+					}
+				}
+				if constexpr (fcsr_emulation) {
+					const unsigned op = fi.R4type.funct3 | (fi.R4type.funct2 << 4);
+					if (op <= 0x1 || (op >= 0x10 && op <= 0x11))
+						code += raise_nv(is_snan(rs1, f32) + " || " + is_snan(rs2, f32));
+				}
 				switch (fi.R4type.funct3 | (fi.R4type.funct2 << 4)) {
 				case 0x0: // FMIN.S
 					code += "set_fl(&" + dst + ", api.fmin32_rv(" + rs1 + ".f32[0], " + rs2 + ".f32[0]));\n";
@@ -1885,36 +3166,158 @@ void Emitter<W>::emit()
 					UNKNOWN_INSTRUCTION();
 				} break;
 			case RV32F__FADD:
-			case RV32F__FSUB:
-			case RV32F__FMUL: {
-				std::string fop = " + ";
-				if (instr.fpfunc() == RV32F__FSUB) fop = " - ";
-				else if (instr.fpfunc() == RV32F__FMUL) fop = " * ";
-				if (fi.R4type.funct2 == 0x0) { // fp32
-					code += "set_fl(&" + dst + ", " + rs1 + ".f32[0]" + fop + rs2 + ".f32[0]);\n";
-				} else { // fp64
-					code += "set_dbl(&" + dst + ", " + rs1 + ".f64" + fop + rs2 + ".f64);\n";
+			case RV32F__FSUB: {
+				const std::string fop = (instr.fpfunc() == RV32F__FSUB) ? " - " : " + ";
+				if (f32) {
+					if constexpr (nanboxing && W == 8) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+						code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+					}
+					if constexpr (fcsr_emulation) {
+						// NX when the exact (double-precision) result does not
+						// round-trip to the single-precision result. The
+						// operands are widened *before* the operation, which is
+						// what makes the comparison meaningful; the double sum
+						// is exact unless the operand exponents are more than
+						// ~29 apart, so a handful of extreme cases under-report.
+						code += "{ const float fa = " + rs1 + ".f32[0], fb = " + rs2 + ".f32[0];"
+							" const double exact = (double)fa" + fop + "(double)fb;"
+							" const float fr = fa" + fop + "fb;"
+							" if (fr != fr) load_fl(&" + dst + ", 0x7fc00000u);"
+							" else { set_fl(&" + dst + ", fr); if ((double)fr != exact) cpu->fcsr |= 1; } }\n";
+					} else {
+						code += emit_arith(rs1 + ".f32[0]" + fop + rs2 + ".f32[0]", true);
+					}
 				}
+				else
+					code += emit_arith(rs1 + ".f64" + fop + rs2 + ".f64", false);
 				} break;
-			case RV32F__FDIV:
-				if (fi.R4type.funct2 == 0x0) { // fp32
-					code += "set_fl(&" + dst + ", " + rs1 + ".f32[0] / " + rs2 + ".f32[0]);\n";
-					this->penalty(10); // divf is a slow operation
-				} else { // fp64
-					code += "set_dbl(&" + dst + ", " + rs1 + ".f64 / " + rs2 + ".f64);\n";
-					this->penalty(15); // divd is a slow operation
+			case RV32F__FMUL:
+				// Finite operands that produce an infinity overflowed; finite
+				// operands that produce an inexact subnormal underflowed. Both
+				// imply NX. The operands are read into locals first, because rd
+				// is allowed to alias rs1/rs2.
+				if constexpr (fcsr_emulation) {
+					if (f32) {
+						if constexpr (nanboxing && W == 8) {
+							code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+							code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+						}
+						code += "{ const uint32_t ia = " + rs1 + ".i32[0], ib = " + rs2 + ".i32[0];"
+							" const float fa = " + rs1 + ".f32[0], fb = " + rs2 + ".f32[0];"
+							" const float fr = fa * fb;"
+							" if (fr != fr) load_fl(&" + dst + ", 0x7fc00000u); else set_fl(&" + dst + ", fr);"
+							" if ((ia & 0x7f800000u) != 0x7f800000u && (ib & 0x7f800000u) != 0x7f800000u) {"
+							" const uint32_t ir = " + dst + ".i32[0] & 0x7fffffffu;"
+							" if (ir == 0x7f800000u) { cpu->fcsr |= 5;"
+							" const unsigned rm = (cpu->fcsr >> 5) & 7;"
+							" const int neg = (" + dst + ".i32[0] & 0x80000000u) != 0;"
+							" if (rm == 1 || (rm == 2 && !neg) || (rm == 3 && neg))"
+							" " + dst + ".i32[0] = (" + dst + ".i32[0] & 0x80000000u) | 0x7F7FFFFFu; }"
+							" else if (ir < 0x00800000u && (double)fa * (double)fb != fr) cpu->fcsr |= 3; } }\n";
+						break;
+					}
 				}
+				if constexpr (nanboxing && W == 8) {
+					if (f32) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+						code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+					}
+				}
+				code += emit_arith(f32 ? (rs1 + ".f32[0] * " + rs2 + ".f32[0]")
+									   : (rs1 + ".f64 * " + rs2 + ".f64"), f32);
+				break;
+			case RV32F__FDIV:
+				// DZ is only for a finite non-zero numerator over zero: 0/0 is
+				// NV and inf/0 is exact. NV/NX/OF/UF are also required.
+				if constexpr (fcsr_emulation) {
+					if (f32) {
+						if constexpr (nanboxing && W == 8) {
+							code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+							code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+						}
+						code += "{ const uint32_t ia = " + rs1 + ".i32[0], ib = " + rs2 + ".i32[0];"
+							" const float fa = " + rs1 + ".f32[0], fb = " + rs2 + ".f32[0];"
+							" const float fr = fa / fb;"
+							" if (fr != fr) { load_fl(&" + dst + ", 0x7fc00000u);"
+							" if ((ia & 0x7fffffffu) == 0 && (ib & 0x7fffffffu) == 0) cpu->fcsr |= 0x10;"
+							" else if ((ia & 0x7f800000u) == 0x7f800000u && (ib & 0x7f800000u) == 0x7f800000u) cpu->fcsr |= 0x10; }"
+							" else { set_fl(&" + dst + ", fr);"
+							" if ((ia & 0x7fffffffu) != 0 && (ia & 0x7f800000u) != 0x7f800000u"
+							" && (ib & 0x7fffffffu) == 0) cpu->fcsr |= 8;"
+							" if ((double)fr != (double)fa / (double)fb) cpu->fcsr |= 1;"
+							" const uint32_t ir = " + dst + ".i32[0] & 0x7fffffffu;"
+							" if ((ib & 0x7fffffffu) != 0 && (ia & 0x7f800000u) != 0x7f800000u && ir == 0x7f800000u) cpu->fcsr |= 5;"
+							" else if (ir < 0x00800000u && (double)fr != (double)fa / (double)fb) cpu->fcsr |= 3; } }\n";
+					} else {
+						code += "{ const uint64_t ia = " + rs1 + ".i64, ib = " + rs2 + ".i64;"
+							" const double fa = " + rs1 + ".f64, fb = " + rs2 + ".f64;"
+							" const double dr = fa / fb;"
+							" if (dr != dr) { load_dbl(&" + dst + ", 0x7ff8000000000000ull);"
+							" if ((ia & 0x7fffffffffffffffull) == 0 && (ib & 0x7fffffffffffffffull) == 0) cpu->fcsr |= 0x10;"
+							" else if ((ia & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (ib & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) cpu->fcsr |= 0x10; }"
+							" else { set_dbl(&" + dst + ", dr);"
+							" if ((ia & 0x7fffffffffffffffull) != 0 && (ia & 0x7ff0000000000000ull) != 0x7ff0000000000000ull"
+							" && (ib & 0x7fffffffffffffffull) == 0) cpu->fcsr |= 8;"
+							" if ((long double)dr != (long double)fa / (long double)fb) cpu->fcsr |= 1;"
+							" const uint64_t ir = " + dst + ".i64 & 0x7fffffffffffffffull;"
+							" if ((ib & 0x7fffffffffffffffull) != 0 && (ia & 0x7ff0000000000000ull) != 0x7ff0000000000000ull && ir == 0x7ff0000000000000ull) cpu->fcsr |= 5;"
+							" else if (ir < 0x0010000000000000ull && (long double)dr != (long double)fa / (long double)fb) cpu->fcsr |= 3; } }\n";
+					}
+				} else {
+					if constexpr (nanboxing && W == 8) {
+						if (f32) {
+							code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+							code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+						}
+					}
+					code += emit_arith(f32 ? (rs1 + ".f32[0] / " + rs2 + ".f32[0]")
+										   : (rs1 + ".f64 / " + rs2 + ".f64"), f32);
+				}
+				this->penalty(f32 ? 10 : 15); // division is a slow operation
 				break;
 			case RV32F__FSQRT:
-				if (fi.R4type.funct2 == 0x0) { // fp32
+				// sqrt of a NaN or of a negative number is the canonical qNaN.
+				// It is an invalid operation for a negative input or a signaling
+				// NaN, but *not* for a quiet NaN. The invalid-flag condition is
+				// evaluated before the store, since rd may alias rs1.
+				if constexpr (fcsr_emulation) {
+					if (f32) {
+						if constexpr (nanboxing && W == 8) {
+							code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu) ";
+							code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+						}
+						code += "{ const int inv = " + is_snan(rs1, true) + " || " + rs1 + ".f32[0] < 0.0f;"
+							" if (" + is_nan(rs1, true) + " || " + rs1 + ".f32[0] < 0.0f)"
+							" { load_fl(&" + dst + ", 0x7fc00000u); if (inv) cpu->fcsr |= 0x10; }"
+							" else { const float sq = api.sqrtf32(" + rs1 + ".f32[0]); set_fl(&" + dst + ", sq);"
+							" if ((double)sq * (double)sq != (double)" + rs1 + ".f32[0]) cpu->fcsr |= 1; } }\n";
+					} else {
+						code += "{ const int inv = " + is_snan(rs1, false) + " || " + rs1 + ".f64 < 0.0;"
+							" if (" + is_nan(rs1, false) + " || " + rs1 + ".f64 < 0.0)"
+							" { load_dbl(&" + dst + ", 0x7ff8000000000000ull); if (inv) cpu->fcsr |= 0x10; }"
+							" else { const double sq = api.sqrtf64(" + rs1 + ".f64); set_dbl(&" + dst + ", sq);"
+							" if (sq * sq != " + rs1 + ".f64) cpu->fcsr |= 1; } }\n";
+					}
+				} else if (f32) {
+					if constexpr (nanboxing && W == 8) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu) ";
+						code += "load_fl(&" + dst + ", 0x7FC00000u);\nelse ";
+					}
 					code += "set_fl(&" + dst + ", api.sqrtf32(" + rs1 + ".f32[0]));\n";
-					this->penalty(10); // sqrtf is a slow operation
-				} else { // fp64
+				} else {
 					code += "set_dbl(&" + dst + ", api.sqrtf64(" + rs1 + ".f64));\n";
-					this->penalty(15); // sqrtd is a slow operation
 				}
+				this->penalty(f32 ? 10 : 15); // sqrt is a slow operation
 				break;
 			case RV32F__FSGNJ_NX:
+				// Non-boxed → canonical qNaN. FSGNJN inverts the qNaN sign (§11.6).
+				if constexpr (nanboxing && W == 8) {
+					if (fi.R4type.funct2 == 0x0) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu || (uint32_t)" + rs2 + ".i32[1] != 0xFFFFFFFFu) ";
+						code += "load_fl(&" + dst + ", " + (fi.R4type.funct3 == 0x1 ? "0xFFC00000u" : "0x7FC00000u") + ");\nelse ";
+					}
+				}
 				switch (fi.R4type.funct3) {
 				case 0x0: // FSGNJ
 					// FMV rd, rs1
@@ -1942,35 +3345,59 @@ void Emitter<W>::emit()
 					UNKNOWN_INSTRUCTION();
 				} break;
 			case RV32F__FCVT_SD_DS:
-				if (fi.R4type.funct2 == 0x0) {
-					code += "set_fl(&" + dst + ", " + rs1 + ".f64);\n";
+				// Only S↔D inlined; Zfhmin/quad go to handler.
+				if (fi.R4type.rs2 != (fi.R4type.funct2 ^ 1)) {
+					UNKNOWN_INSTRUCTION();
+				} else if (fi.R4type.funct2 == 0x0) {
+					code += "if (" + rs1 + ".f64 != " + rs1 + ".f64) load_fl(&" + dst + ", 0x7fc00000u); else set_fl(&" + dst + ", " + rs1 + ".f64);\n";
 				} else if (fi.R4type.funct2 == 0x1) {
-					code += "set_dbl(&" + dst + ", " + rs1 + ".f32[0]);\n";
+					if constexpr (nanboxing && W == 8) {
+						code += "if ((uint32_t)" + rs1 + ".i32[1] != 0xFFFFFFFFu) ";
+						code += "load_dbl(&" + dst + ", 0x7ff8000000000000ull);\nelse ";
+					}
+					code += "if (" + rs1 + ".f32[0] != " + rs1 + ".f32[0]) load_dbl(&" + dst + ", 0x7ff8000000000000ull); else set_dbl(&" + dst + ", " + rs1 + ".f32[0]);\n";
 				} else {
 					UNKNOWN_INSTRUCTION();
 				} break;
 			case RV32F__FCVT_SD_W: {
-				if (fi.R4type.funct2 == 0x0) {
-					// FCVT.S.W && FCVT.S.WU
-					const std::string sign((fi.R4type.rs2 == 0x0) ? "(int32_t)" : "(uint32_t)");
-					code += "set_fl(&" + dst + ", " + sign + from_reg(fi.R4type.rs1) + ");\n";
-				} else if (fi.R4type.funct2 == 0x1) {
-					// FCVT.D.[LWU]
-					switch (fi.R4type.rs2) {
-					case 0x0: // FCVT.D.W
-						code += "set_dbl(&" + dst + ", (int32_t)" + from_reg(fi.R4type.rs1) + ");\n";
-						break;
-					case 0x1: // FCVT.D.WU
-						code += "set_dbl(&" + dst + ", (uint32_t)" + from_reg(fi.R4type.rs1) + ");\n";
-						break;
-					case 0x2: // FCVT.D.L
-						code += "set_dbl(&" + dst + ", (int64_t)" + from_reg(fi.R4type.rs1) + ");\n";
-						break;
-					case 0x3: // FCVT.D.LU
-						code += "set_dbl(&" + dst + ", (uint64_t)" + from_reg(fi.R4type.rs1) + ");\n";
-						break;
-					default:
-						UNKNOWN_INSTRUCTION();
+				if (fi.R4type.funct2 < 0x2 && fi.R4type.rs2 < 0x4) {
+					// FCVT.{S,D}.[LWU]
+					static const std::array<const char*, 4> int_type {
+						"int32_t", "uint32_t", "int64_t", "uint64_t"
+					};
+					const std::string itype = int_type[fi.R4type.rs2];
+					const std::string value =
+						"(" + itype + ")" + from_reg(fi.R4type.rs1);
+					const std::string setter = f32 ? "set_fl" : "set_dbl";
+					if constexpr (fcsr_emulation) {
+						// NX when the destination mantissa was too narrow for the
+						// integer. long double is exact for any 64-bit integer
+						// where it is an 80- or 128-bit format; where it is only
+						// double, the 64-bit sources just never report NX.
+						// The host cast is round-to-nearest-even; the other
+						// RISC-V rounding modes need a nextafter adjustment on
+						// the float grid (see the interpreter counterpart).
+						const std::string nafn  = f32 ? "nextafterf" : "nextafter";
+						const std::string ftype = f32 ? "float" : "double";
+						const std::string inf   = f32 ? "__builtin_inff()" : "__builtin_inf()";
+						code += "{ const " + itype + " iv = " + value + ";"
+							" const long double iex = (long double)iv;"
+							" const " + ftype + " fv = (" + ftype + ")iv;"
+							" const long double cld = (long double)fv;"
+							" " + ftype + " out = fv;"
+							" if (cld != iex) { cpu->fcsr |= 1;"
+							" const unsigned rm = (" + std::to_string((int)fi.R4type.funct3) + " == 0x7) ? ((cpu->fcsr >> 5) & 7) : " + std::to_string((int)fi.R4type.funct3) + ";"
+							" if (rm == 1) { if ((iex > 0.0L && cld > iex) || (iex < 0.0L && cld < iex)) out = " + nafn + "(out, (" + ftype + ")0); }"
+							" else if (rm == 2) { if (cld > iex) out = " + nafn + "(out, -" + inf + "); }"
+							" else if (rm == 3) { if (cld < iex) out = " + nafn + "(out, " + inf + "); }"
+							// RMM differs from RNE only at an exact halfway
+							// point, where it takes the larger magnitude.
+							" else if (rm == 4) { if (__builtin_fabsl(cld) < __builtin_fabsl(iex)) {"
+							" const " + ftype + " away = " + nafn + "(out, out < (" + ftype + ")0 ? -" + inf + " : " + inf + ");"
+							" if (__builtin_fabsl((long double)away - iex) == __builtin_fabsl(iex - cld)) out = away; } } }"
+							" " + setter + "(&" + dst + ", out); }\n";
+					} else {
+						code += setter + "(&" + dst + ", " + value + ");\n";
 					}
 				} else {
 					UNKNOWN_INSTRUCTION();
@@ -1978,74 +3405,105 @@ void Emitter<W>::emit()
 				} break;
 			case RV32F__FCVT_W_SD: {
 				const auto rmm = fi.R4type.funct3; // rounding mode in funct3
-				if (fi.R4type.rd != 0 && fi.R4type.funct2 == 0x0) {
-					// from float32
-					const std::string src = rs1 + ".f32[0]";
-					std::string expr;
-					if (fi.R4type.rs2 == 0x0) { // FCVT.W.S (signed)
-						if (rmm == 0x1) // RTZ
-							expr = "(int32_t)truncf(" + src + ")";
-						else if (rmm == 0x2) // RDN
-							expr = "(int32_t)floorf(" + src + ")";
-						else
-							expr = "(int32_t)" + src;
-					} else { // FCVT.WU.S (unsigned)
-						if (rmm == 0x1) // RTZ
-							expr = "(uint32_t)truncf(" + src + ")";
-						else if (rmm == 0x2) // RDN
-							expr = "(uint32_t)floorf(" + src + ")";
-						else
-							expr = "(uint32_t)" + src;
+				if (fi.R4type.rd != 0 &&
+					(fi.R4type.funct2 == 0x0 || fi.R4type.funct2 == 0x1)) {
+					const bool from_float = (fi.R4type.funct2 == 0x0);
+					// A non-NaN-boxed single-precision source is read as the
+					// canonical quiet NaN, which converts to the maximum value
+					// with NV below. FCVT must not write rs1, so the
+					// substitution goes into a local copy of the register.
+					const bool boxcheck = nanboxing && W == 8 && from_float;
+					std::string srcdecl;
+					if (boxcheck) {
+						srcdecl = " fp64reg fcvt_s = " + rs1 + ";"
+							" if ((uint32_t)fcvt_s.i32[1] != 0xFFFFFFFFu)"
+							" fcvt_s.i32[0] = 0x7fc00000;";
 					}
-					code += to_reg(fi.R4type.rd) + " = " + expr + ";\n";
-				} else if (fi.R4type.rd != 0 && fi.R4type.funct2 == 0x1) {
-					// from float64
-					const std::string src = rs1 + ".f64";
-					std::string expr;
+					const std::string src = boxcheck ? "fcvt_s.f32[0]"
+						: (from_float ? (rs1 + ".f32[0]") : (rs1 + ".f64"));
+					// Round per the RISC-V rounding mode (funct3), matching the
+					// interpreter's fcvt_to_integer(). A bare cast is RTZ only,
+					// which is wrong for e.g. RMM (std::lround) and RDN (floor).
+					const char* trunc_fn = from_float ? "truncf" : "trunc"; // RTZ
+					const char* floor_fn = from_float ? "floorf" : "floor"; // RDN
+					const char* ceil_fn  = from_float ? "ceilf"  : "ceil";  // RUP
+					const char* round_fn = from_float ? "roundf" : "round"; // RMM
+					const char* near_fn  = from_float ? "nearbyintf" : "nearbyint"; // RNE
+					std::string rounded;
+					if (rmm == 0x7) {
+						// DYN: resolve the rounding mode from the fcsr CSR (frm
+						// field, bits [7:5]) at runtime. src has no side effects,
+						// so it is safe to repeat across the branches.
+						const std::string frm = "((cpu->fcsr >> 5) & 7)";
+						rounded =
+							"(" + frm + "==1?" + trunc_fn + "(" + src + "):"
+								+ frm + "==2?" + floor_fn + "(" + src + "):"
+								+ frm + "==3?" + ceil_fn  + "(" + src + "):"
+								+ frm + "==4?" + round_fn + "(" + src + "):"
+								+ near_fn + "(" + src + "))";
+					} else {
+						const char* rfn;
+						switch (rmm) {
+						case 0x1: rfn = trunc_fn; break; // RTZ
+						case 0x2: rfn = floor_fn; break; // RDN
+						case 0x3: rfn = ceil_fn;  break; // RUP
+						case 0x4: rfn = round_fn; break; // RMM
+						default:  rfn = near_fn;         // RNE
+						}
+						rounded = std::string(rfn) + "(" + src + ")";
+					}
+					// Range check required: out-of-range float→int is UB in C. RISC-V pins the result to
+					// the destination's extreme (NaN and positive overflow give
+					// the maximum, negative overflow the minimum) and raises NV.
+					// The bounds are powers of two, hence exactly representable.
+					const char *lower = "0.0", *upper = "0.0";
+					const char *maxval = "0", *minval = "0", *cast = "";
 					switch (fi.R4type.rs2) {
-					case 0: // FCVT.W.D (int32)
-						if (rmm == 0x1)
-							expr = "(int32_t)trunc(" + src + ")";
-						else if (rmm == 0x2)
-							expr = "(int32_t)floor(" + src + ")";
-						else
-							expr = "(int32_t)" + src;
+					case 0x0: // FCVT.W (int32, sign-extended)
+						lower = "-2147483648.0"; upper = "2147483648.0";
+						maxval = "(int32_t)2147483647"; minval = "(int32_t)(-2147483647 - 1)";
+						cast = "(int32_t)";
 						break;
-					case 1: // FCVT.WU.D (uint32)
-						if (rmm == 0x1)
-							expr = "(uint32_t)trunc(" + src + ")";
-						else if (rmm == 0x2)
-							expr = "(uint32_t)floor(" + src + ")";
-						else
-							expr = "(uint32_t)" + src;
+					case 0x1: // FCVT.WU (uint32 result, sign-extended to XLEN)
+						lower = "0.0"; upper = "4294967296.0";
+						maxval = "(int32_t)0xffffffffu"; minval = "(int32_t)0";
+						cast = "(int32_t)(uint32_t)";
 						break;
-					case 2: // FCVT.L.D (int64)
-						if (rmm == 0x1)
-							expr = "(int64_t)trunc(" + src + ")";
-						else if (rmm == 0x2)
-							expr = "(int64_t)floor(" + src + ")";
-						else
-							expr = "(int64_t)" + src;
+					case 0x2: // FCVT.L (int64)
+						lower = "-9223372036854775808.0"; upper = "9223372036854775808.0";
+						maxval = "(int64_t)9223372036854775807ll";
+						minval = "(int64_t)(-9223372036854775807ll - 1)";
+						cast = "(int64_t)";
 						break;
-					case 3: // FCVT.LU.D (uint64)
-						if (rmm == 0x1)
-							expr = "(uint64_t)trunc(" + src + ")";
-						else if (rmm == 0x2)
-							expr = "(uint64_t)floor(" + src + ")";
-						else
-							expr = "(uint64_t)" + src;
+					case 0x3: // FCVT.LU (uint64)
+						lower = "0.0"; upper = "18446744073709551616.0";
+						maxval = "(uint64_t)18446744073709551615ull"; minval = "(uint64_t)0";
+						cast = "(uint64_t)";
 						break;
-					default:
+					default: // Reserved rs2 encoding
 						UNKNOWN_INSTRUCTION();
+						break;
 					}
-					code += to_reg(fi.R4type.rd) + " = " + expr + ";\n";
+					if (fi.R4type.rs2 < 0x4) {
+						const std::string reg = to_reg(fi.R4type.rd);
+						code += "{" + srcdecl + " const double fcvt_r = " + rounded + ";"
+							" if (!(fcvt_r >= " + lower + " && fcvt_r < " + upper + ")) {"
+							" " + reg + " = (fcvt_r != fcvt_r || fcvt_r >= " + upper + ") ? "
+							+ maxval + " : " + minval + ";"
+							+ (fcsr_emulation ? " cpu->fcsr |= 16;" : "")
+							+ " } else { " + reg + " = " + cast + "fcvt_r;"
+							+ (fcsr_emulation ? " if (fcvt_r != (double)(" + src + ")) cpu->fcsr |= 1;" : "")
+							+ " } }\n";
+					}
 				} else {
 					UNKNOWN_INSTRUCTION();
 				}
 				this->reset_tracked_register(fi.R4type.rd);
 				} break;
 			case RV32F__FMV_W_X:
-				if (fi.R4type.funct2 == 0x0) {
+				if (fi.R4type.rs2 != 0x0) {
+					UNKNOWN_INSTRUCTION();
+				} else if (fi.R4type.funct2 == 0x0) {
 					code += "load_fl(&" + dst + ", " + from_reg(fi.R4type.rs1) + ");\n";
 				} else if (W == 8 && fi.R4type.funct2 == 0x1) {
 					code += "load_dbl(&" + dst + ", " + from_reg(fi.R4type.rs1) + ");\n";
@@ -2053,7 +3511,7 @@ void Emitter<W>::emit()
 					UNKNOWN_INSTRUCTION();
 				} break;
 			case RV32F__FMV_X_W:
-				if (fi.R4type.funct3 == 0x0) {
+				if (fi.R4type.funct3 == 0x0 && fi.R4type.rs2 == 0x0) {
 					if (fi.R4type.rd != 0 && fi.R4type.funct2 == 0x0) {
 						code += to_reg(fi.R4type.rd) + " = " + rs1 + ".i32[0];\n";
 					} else if (W == 8 && fi.R4type.rd != 0 && fi.R4type.funct2 == 0x1) { // 64-bit only
@@ -2066,8 +3524,15 @@ void Emitter<W>::emit()
 				}
 				this->reset_tracked_register(fi.R4type.rd);
 				break;
+			default:
+				UNKNOWN_INSTRUCTION();
+				break;
 			} // fpfunc
-			} else UNKNOWN_INSTRUCTION();
+			} else {
+				// Unhandled format (Zfhmin/quad): use handler, reset tracked rd.
+				UNKNOWN_INSTRUCTION();
+				this->reset_tracked_register(fi.R4type.rd);
+			}
 			} break; // RV32F_FPFUNC
 		case RV32A_ATOMIC: // General handler for atomics
 			this->penalty(20); // Atomic operations are slow
@@ -2083,86 +3548,56 @@ void Emitter<W>::emit()
 			this->potentially_reload_register(instr.Atype.rs1);
 			this->potentially_reload_register(instr.Atype.rs2);
 			break;
-		case RV32V_OP: {   // General handler for vector instructions
+		case RV32V_OP:
+			// RVV: element-wise float inlined; all else to interpreter.
 #ifdef RISCV_EXT_VECTOR
-			const rv32v_instruction vi{instr};
-			const unsigned vlen = RISCV_EXT_VECTOR / 4;
-			switch (instr.vwidth()) {
-			case 0x1: // OPF.VV
-				switch (vi.OPVV.funct6)
-				{
-				case 0b000000: // VFADD.VV
-					for (unsigned i = 0; i < vlen; i++) {
-						const std::string f32 = ".f32[" + std::to_string(i) + "]";
-						code += from_rvvreg(vi.OPVV.vd) + f32 + " = " + from_rvvreg(vi.OPVV.vs1) + f32 + " + " + from_rvvreg(vi.OPVV.vs2) + f32 + ";\n";
-					}
-					break;
-				case 0b100100: // VFMUL.VV
-					for (unsigned i = 0; i < vlen; i++) {
-						const std::string f32 = ".f32[" + std::to_string(i) + "]";
-						code += from_rvvreg(vi.OPVV.vd) + f32 + " = " + from_rvvreg(vi.OPVV.vs1) + f32 + " * " + from_rvvreg(vi.OPVV.vs2) + f32 + ";\n";
-					}
-					break;
-				default:
-					UNKNOWN_INSTRUCTION();
-				}
-				break;
-			case 0x5: { // OPF.VF
-				const std::string scalar = "scalar" + PCRELS(0);
-				switch (vi.OPVV.funct6)
-				{
-				case 0b000000: // VFADD.VF
-					code += "{ const float " + scalar + " = " + from_fpreg(vi.OPVV.vs1) + ".f32[0];\n";
-					for (unsigned i = 0; i < vlen; i++) {
-						const std::string f32 = ".f32[" + std::to_string(i) + "]";
-						code += from_rvvreg(vi.OPVV.vd) + f32 + " = " + from_rvvreg(vi.OPVV.vs2) + f32 + " + " + scalar + ";\n";
-					}
-					code += "}\n";
-					break;
-				case 0b100100: // VFMUL.VF
-					code += "{ const float " + scalar + " = " + from_fpreg(vi.OPVV.vs1) + ".f32[0];\n";
-					for (unsigned i = 0; i < vlen; i++) {
-						const std::string f32 = ".f32[" + std::to_string(i) + "]";
-						code += from_rvvreg(vi.OPVV.vd) + f32 + " = " + from_rvvreg(vi.OPVV.vs2) + f32 + " * " + scalar + ";\n";
-					}
-					code += "}\n";
-					break;
-				default:
-					UNKNOWN_INSTRUCTION();
-				}
-				break;
-			}
-			default:
-				UNKNOWN_INSTRUCTION();
-			}
-			break;
+			this->emit_vector_instruction();
 #else
 			UNKNOWN_INSTRUCTION();
-			break;
 #endif
-		}
-		case 0b1011011: // Dynamic call custom-2 instruction
-			// Assumption: Dynamic calls are like regular function calls
-			// Note: This behavior can be turned off by disabling register_caching
-			// Load and realize registers A0-A7
-			for (unsigned i = 10; i < 18; i++) {
-				this->load_register(i);
-			}
-			store_syscall_registers();
-			WELL_KNOWN_INSTRUCTION();
-			// Reload registers A0-A1
-			reload_syscall_registers();
-			this->reset_tracked_register(10);
-			this->reset_tracked_register(11);
 			break;
+		case Dyncall::opcode: {
+			if (!Dyncall::valid(instr.whole)) {
+				UNKNOWN_INSTRUCTION();
+				this->reset_all_tracked_registers();
+				break;
+			}
+			const unsigned inputs = Dyncall::inputs(instr.whole);
+			const unsigned outputs = Dyncall::outputs(instr.whole);
+			for (unsigned i = 10; i < 10 + inputs; i++)
+				this->load_register(i);
+			this->store_registers(this->dirty_registers() & Dyncall::arg_mask(inputs));
+			// Publish PC even without a budget: diagnostics attribute host calls
+			// to this instruction. Counters are synchronized only when enabled.
+			code += "cpu->pc = " + PCRELS(0) + ";\n";
+			if (!tinfo.ignore_instruction_limit) {
+				this->increment_counter_so_far();
+				code += "INS_COUNTER(cpu) = ic; MAX_COUNTER(cpu) = max_ic;\n";
+			}
+			WELL_KNOWN_INSTRUCTION();
+			for (unsigned i = 10; i < 10 + outputs; i++) {
+				this->load_register(i);
+				this->potentially_reload_register(i);
+				this->reset_tracked_register(i);
+			}
+			if (!tinfo.ignore_instruction_limit) {
+				code += "ic = INS_COUNTER(cpu); max_ic = MAX_COUNTER(cpu);\n";
+				code += "if (UNLIKELY(ic >= max_ic)) {\n";
+				this->exit_function(PCRELS(4), true);
+			}
+			break;
+		}
 		default:
 			UNKNOWN_INSTRUCTION();
 		}
 	}
-	// If the function ends with an unimplemented instruction,
-	// we must gracefully finish, setting new PC and incrementing IC
+	// Fall-through exit at block end.
 	this->increment_counter_so_far();
 	exit_function(STRADDR(this->end_pc()));
+#ifdef RISCV_EXT_VECTOR
+	// Unreachable by fall-through: exit_function() above always returns.
+	this->emit_vector_trap_epilogue();
+#endif
 }
 
 template <int W>
@@ -2174,43 +3609,25 @@ CPU<W>::emit(std::string& code, const TransInfo<W>& tinfo)
 
 	// Create register push and pop macros
 	if (tinfo.use_register_caching) {
-		code += "#define STORE_REGS_" + e.get_func() + "() \\\n";
-		for (size_t reg = 1; reg < e.CACHED_REGISTERS; reg++) {
-			if (e.gpr_exists_at(reg)) {
-				code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + "; \\\n";
+		for (const uint32_t mask : e.get_store_masks()) {
+			code += "#define STORE_REGS_" + e.get_func() + "_" + hex_address(mask) + "() \\\n";
+			for (int reg = 1; reg < e.CACHED_REGISTERS; reg++) {
+				if (e.gpr_needs_store(reg) && (mask & (1u << reg))) {
+					code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + "; \\\n";
+				}
 			}
+			code += "  ;\n";
 		}
-		code += "  ;\n";
 		code += "#define LOAD_REGS_" + e.get_func() + "() \\\n";
-		for (size_t reg = 1; reg < e.CACHED_REGISTERS; reg++) {
+		for (int reg = 1; reg < e.CACHED_REGISTERS; reg++) {
 			if (e.gpr_exists_at(reg)) {
 				code += "  " + e.loaded_regname(reg) + " = cpu->r[" + std::to_string(reg) + "]; \\\n";
 			}
 		}
 		code += "  ;\n";
-		if (e.used_store_syscalls()) {
-			code += "#define STORE_SYS_REGS_" + e.get_func() + "() \\\n";
-			for (size_t reg = 10; reg < 18; reg++) {
-				if (e.gpr_exists_at(reg)) {
-					code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + "; \\\n";
-				}
-			}
-			code += "  ;\n";
-			code += "#define STORE_NON_SYS_REGS_" + e.get_func() + "() \\\n";
-			for (size_t reg = 0; reg < 10; reg++) {
-				if (e.gpr_exists_at(reg)) {
-					code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + "; \\\n";
-				}
-			}
-			for (size_t reg = 18; reg < e.CACHED_REGISTERS; reg++) {
-				if (e.gpr_exists_at(reg)) {
-					code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + "; \\\n";
-				}
-			}
-			code += "  ;\n";
-		}
+		// A system call returns its values in A0 and A1
 		code += "#define LOAD_SYS_REGS_" + e.get_func() + "() \\\n";
-		for (size_t reg = 10; reg < 12; reg++) {
+		for (int reg = 10; reg < 12; reg++) {
 			if (e.gpr_exists_at(reg)) {
 				code += "  " + e.loaded_regname(reg) + " = cpu->r[" + std::to_string(reg) + "]; \\\n";
 			}
@@ -2224,11 +3641,15 @@ CPU<W>::emit(std::string& code, const TransInfo<W>& tinfo)
 	}
 
 	// Function header
-	code += "static ReturnValues " + e.get_func() + "(CPU* cpu, uint64_t ic, uint64_t max_ic, addr_t pc) {\n";
+	code += "static ReturnValues " + e.get_func() + "(CPU* RESTRICT cpu, uint64_t ic, uint64_t max_ic, addr_t pc) {\n";
+	// NOTE: Scratch shared by every exit point, see RETURN_VALUES
+	code += "ReturnValues retvals;\n";
+	if (e.used_fixed_store())
+		code += "char* mstore;\n";
 
 	// Function GPRs
 	if (tinfo.use_register_caching) {
-		for (size_t reg = 1; reg < 24; reg++) {
+		for (int reg = 1; reg < e.CACHED_REGISTERS; reg++) {
 			if (e.gpr_exists_at(reg)) {
 				code += "addr_t " + e.loaded_regname(reg) + " = cpu->r[" + std::to_string(reg) + "];\n";
 			}
@@ -2236,52 +3657,38 @@ CPU<W>::emit(std::string& code, const TransInfo<W>& tinfo)
 	}
 
 	code += e.get_func() + "_jumptbl:;\n";
+	{
+		// Indirect dispatch over the entry points of this block. Switching on
+		// the halfword index rather than the address doubles the case density,
+		// which is what decides whether the compiler emits a single jump
+		// table or a binary search of sub-tables: several data-dependent
+		// branches on every return and indirect call. Only entry points are
+		// cases: every case constrains register allocation at its label, and
+		// making all branch targets reachable from here measured 25% slower.
+		// Indirect jump targets found in data (switch and function pointer
+		// tables) are entry points, so those stay inside the function too.
+		// Computed gotos would be denser still, but their targets become
+		// abnormal edges that block optimization around every label.
+		std::vector<address_type<W>> cases;
+		for (const auto& entry : e.get_mappings())
+			cases.push_back(entry.addr);
+		std::sort(cases.begin(), cases.end());
+		cases.erase(std::unique(cases.begin(), cases.end()), cases.end());
 
-#if 0 // A failed attempt at a faster dispatch
-	// This code exists here purely as a "no, I've tried it and it's not faster"
-	// Feel free to try to optimize it further
-	const auto str_begin_pc = std::to_string(e.begin_pc()) + "UL";
-	code += "if (pc < " + str_begin_pc + " || pc >= " + std::to_string(e.end_pc()) + ") goto dispatch;\n";
-	code += "static void* jumptbl[] = {\n";
-	size_t idx = 0;
-	const size_t max_idx = e.get_mappings().size();
-	for (address_type<W> pc = e.begin_pc(); pc < e.end_pc(); pc += 2) {
-
-		if (idx < max_idx) {
-			const auto& entry = e.get_mappings().at(idx);
-			// Default to dispatch if no mapping
-			if (entry.addr != pc) {
-				code += "&&dispatch,\n";
-				continue;
-			}
-			// Label for this jumpable address
-			const auto label = funclabel<W>(e.get_func(), pc);
-			code += "&&" + label + ",\n";
-			idx++;
-		} else {
-			code += "&&dispatch,\n";
+		code += "switch ((pc - " + hex_address(e.begin_pc()) + "LL) >> 1) {\n";
+		for (const auto addr : cases) {
+			code += "case " + std::to_string(uint64_t(addr - e.begin_pc()) >> 1) + ": goto "
+				+ funclabel<W>(e.get_func(), addr) + ";\n";
 		}
+		code += "default:;\n}\n";
 	}
-	code += "};\n";
-	code += "goto *jumptbl[(pc - " + str_begin_pc + ") >> 1];\n";
-	code += "dispatch: {\n";
-#else
-	code += "switch (pc) {\n";
-	for (size_t idx = 0; idx < e.get_mappings().size(); idx++) {
-		auto& entry = e.get_mappings().at(idx);
-		const auto label = funclabel<W>(e.get_func(), entry.addr);
-		code += "case " + hex_address(entry.addr) + ": goto " + label + ";\n";
-	}
-	code += "default:\n";
-#endif
 	code += "exception_is_handled:\n"; // Re-using exit point for exceptions
-	for (size_t reg = 1; reg < e.CACHED_REGISTERS; reg++) {
-		if (e.gpr_exists_at(reg)) {
+	for (int reg = 1; reg < e.CACHED_REGISTERS; reg++) {
+		if (e.gpr_needs_store(reg)) {
 			code += "  cpu->r[" + std::to_string(reg) + "] = " + e.loaded_regname(reg) + ";\n";
 		}
 	}
-	code += "  cpu->pc = pc; return (ReturnValues){ic, max_ic};\n";
-	code += "}\n";
+	code += "  cpu->pc = pc; RETURN_VALUES(ic, max_ic);\n";
 
 	// Function code
 	code += e.get_code();

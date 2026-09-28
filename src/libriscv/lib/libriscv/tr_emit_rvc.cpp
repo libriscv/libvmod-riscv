@@ -8,7 +8,9 @@ rv32i_instruction Emitter<W>::emit_rvc()
 	switch (ci.opcode())
 	{
 		case CI_CODE(0b000, 0b00): // C.ADDI4SPN
-			if (ci.whole != 0) {
+			// C.ADDI4SPN is valid only when nzuimm != 0 (insn:c-addi4spn_rsv);
+			// leave the instruction unexpanded so it raises ILLEGAL_OPCODE.
+			if (ci.whole != 0 && ci.CIW.offset() != 0) {
 				instr.Itype.opcode = RV32I_OP_IMM;
 				instr.Itype.funct3 = 0b000; // ADDI
 				instr.Itype.rd = ci.CIW.srd + 8;
@@ -58,6 +60,43 @@ rv32i_instruction Emitter<W>::emit_rvc()
 			// C.UNIMP
 			break;
 		}
+		case CI_CODE(0b100, 0b00): // Zcb byte and halfword memory ops
+			switch (ci.CZB.subf3) {
+			case 0b000: // C.LBU
+				instr.Itype.opcode = RV32I_LOAD;
+				instr.Itype.funct3 = 0b100; // LBU
+				instr.Itype.rd  = ci.CZB.srd  + 8;
+				instr.Itype.rs1 = ci.CZB.srs1 + 8;
+				instr.Itype.imm = ci.CZB.byte_offset();
+				break;
+			case 0b001: // C.LH / C.LHU
+				instr.Itype.opcode = RV32I_LOAD;
+				instr.Itype.funct3 = ci.CZB.half_signed() ? 0b001 : 0b101;
+				instr.Itype.rd  = ci.CZB.srd  + 8;
+				instr.Itype.rs1 = ci.CZB.srs1 + 8;
+				instr.Itype.imm = ci.CZB.half_offset();
+				break;
+			case 0b010: // C.SB
+				instr.Stype.opcode = RV32I_STORE;
+				instr.Stype.funct3 = 0b000; // SB
+				instr.Stype.rs1 = ci.CZB.srs1 + 8;
+				instr.Stype.rs2 = ci.CZB.srd  + 8;
+				instr.Stype.imm1 = ci.CZB.byte_offset();
+				instr.Stype.imm2 = 0;
+				break;
+			case 0b011: // C.SH, when the reserved selector bit is clear
+				if (ci.CZB.half_signed())
+					break;
+				instr.Stype.opcode = RV32I_STORE;
+				instr.Stype.funct3 = 0b001; // SH
+				instr.Stype.rs1 = ci.CZB.srs1 + 8;
+				instr.Stype.rs2 = ci.CZB.srd  + 8;
+				instr.Stype.imm1 = ci.CZB.half_offset();
+				instr.Stype.imm2 = 0;
+				break;
+			}
+			// Anything else stays unexpanded and raises ILLEGAL_OPCODE.
+			break;
 		case CI_CODE(0b101, 0b00):
 		case CI_CODE(0b110, 0b00):
 		case CI_CODE(0b111, 0b00):
@@ -130,17 +169,27 @@ rv32i_instruction Emitter<W>::emit_rvc()
 			}
 			break;
 		case CI_CODE(0b011, 0b01): // C.ADDI16SP & C.LUI
-			if (ci.CI.rd == 2) { // C.ADDI16SP
+			if (ci.CI.rd == 2 && ci.CI16.signed_imm() != 0) { // C.ADDI16SP
+				// nzimm = 0 is reserved (insn:c-addi16sp_rsv).
 				instr.Itype.opcode = RV32I_OP_IMM;
 				instr.Itype.funct3 = 0b000; // ADDI
 				instr.Itype.rd = 2; // sp
 				instr.Itype.rs1 = 2; // sp
 				instr.Itype.imm = ci.CI16.signed_imm();
 			}
-			else if (ci.CI.rd != 0) { // C.LUI
+			else if (ci.CI.rd != 0 && ci.CI.upper_imm() != 0) { // C.LUI
+				// imm = 0 is reserved (insn:c-lui_rsv).
 				instr.Utype.opcode = RV32I_LUI;
 				instr.Utype.rd = ci.CI.rd;
 				instr.Utype.imm = ci.CI.signed_imm();
+			}
+			else if (ci.CI.rd == 0 && ci.CI.upper_imm() != 0) { // C.LUI hint
+				instr.whole = 0x00000013; // ADDI x0, x0, 0
+			}
+			else if (ci.CI.upper_imm() == 0 && (ci.CI.rd & 1) != 0 && ci.CI.rd < 16) {
+				// Zcmop's C.MOP.n, which lives in the reserved imm = 0
+				// points and writes nothing at all -- not even rd.
+				instr.whole = 0x00000013; // ADDI x0, x0, 0
 			}
 			break; // C.ILLEGAL?
 		case CI_CODE(0b001, 0b01):
@@ -156,11 +205,15 @@ rv32i_instruction Emitter<W>::emit_rvc()
 				if (instr.Jtype.jump_offset() != imm)
 					throw MachineException(INVALID_PROGRAM, "Failed to sign-extend C.JAL immediate");
 			} else { // C.ADDIW
-				instr.Itype.opcode = RV64I_OP_IMM32;
-				instr.Itype.funct3 = 0b000; // ADDIW
-				instr.Itype.rd = ci.CI.rd;
-				instr.Itype.rs1 = ci.CI.rd;
-				instr.Itype.imm = ci.CI.signed_imm();
+				// C.ADDIW is valid only when rd != x0 (insn:c-addiw_rsv);
+				// rd = x0 is reserved. Leave unexpanded -> ILLEGAL_OPCODE.
+				if (ci.CI.rd != 0) {
+					instr.Itype.opcode = RV64I_OP_IMM32;
+					instr.Itype.funct3 = 0b000; // ADDIW
+					instr.Itype.rd = ci.CI.rd;
+					instr.Itype.rs1 = ci.CI.rd;
+					instr.Itype.imm = ci.CI.signed_imm();
+				}
 			}
 			break;
 		case CI_CODE(0b100, 0b01): { // Compressed ALU OPS
@@ -250,8 +303,65 @@ rv32i_instruction Emitter<W>::emit_rvc()
 						instr.Rtype.rs2 = ci.CA.srs2 + 8;
 						break;
 					}
-					case 0x6: // RESERVED
-					case 0x7: // RESERVED
+					case 0x6: // Zcb: C.MUL
+						instr.Rtype.opcode = RV32I_OP;
+						instr.Rtype.funct3 = 0b000; // MUL
+						instr.Rtype.funct7 = 0b0000001;
+						instr.Rtype.rd  = ci.CA.srd + 8;
+						instr.Rtype.rs1 = ci.CA.srd + 8;
+						instr.Rtype.rs2 = ci.CA.srs2 + 8;
+						break;
+					case 0x7: // Zcb: the unary ops, in terms of Zbb and Zba
+						switch (ci.CA.srs2) {
+						case 0: // C.ZEXT.B -> ANDI rd,rd,255
+							instr.Itype.opcode = RV32I_OP_IMM;
+							instr.Itype.funct3 = 0b111; // ANDI
+							instr.Itype.rd  = ci.CA.srd + 8;
+							instr.Itype.rs1 = ci.CA.srd + 8;
+							instr.Itype.imm = 0xFF;
+							break;
+						case 1: // C.SEXT.B
+							instr.Itype.opcode = RV32I_OP_IMM;
+							instr.Itype.funct3 = 0b001;
+							instr.Itype.rd  = ci.CA.srd + 8;
+							instr.Itype.rs1 = ci.CA.srd + 8;
+							instr.Itype.imm = 0b011000000100; // SEXT.B
+							break;
+						case 2: // C.ZEXT.H, which is PACK/PACKW with rs2 = x0
+							instr.Rtype.opcode = (W >= 8) ? RV64I_OP32 : RV32I_OP;
+							instr.Rtype.funct3 = 0b100;
+							instr.Rtype.funct7 = 0b0000100;
+							instr.Rtype.rd  = ci.CA.srd + 8;
+							instr.Rtype.rs1 = ci.CA.srd + 8;
+							instr.Rtype.rs2 = 0;
+							break;
+						case 3: // C.SEXT.H
+							instr.Itype.opcode = RV32I_OP_IMM;
+							instr.Itype.funct3 = 0b001;
+							instr.Itype.rd  = ci.CA.srd + 8;
+							instr.Itype.rs1 = ci.CA.srd + 8;
+							instr.Itype.imm = 0b011000000101; // SEXT.H
+							break;
+						case 4: // C.ZEXT.W, which is ADD.UW with rs2 = x0
+						if constexpr (W >= 8) {
+							instr.Rtype.opcode = RV64I_OP32;
+							instr.Rtype.funct3 = 0b000;
+							instr.Rtype.funct7 = 0b0000100;
+							instr.Rtype.rd  = ci.CA.srd + 8;
+							instr.Rtype.rs1 = ci.CA.srd + 8;
+							instr.Rtype.rs2 = 0;
+						}
+							break;
+						case 5: // C.NOT -> XORI rd,rd,-1
+							instr.Itype.opcode = RV32I_OP_IMM;
+							instr.Itype.funct3 = 0b100; // XORI
+							instr.Itype.rd  = ci.CA.srd + 8;
+							instr.Itype.rs1 = ci.CA.srd + 8;
+							instr.Itype.imm = 0xFFF;
+							break;
+						default: // 6 and 7 are reserved
+							break;
+						}
 						break;
 				}
 			}
@@ -404,6 +514,15 @@ rv32i_instruction Emitter<W>::emit_rvc()
 				instr.Itype.rd = 0;
 				instr.Itype.rs1 = 0;
 				instr.Itype.imm = 0x001; // EBREAK
+			}
+			else if (ci.CR.rs2 != 0)
+			{	// C.MV and C.ADD with rd = x0 are HINT encodings
+				// (insn:c-mv_hint, insn:c-add_hint), which the spec requires
+				// to execute as a no-op rather than trap. Zihintntl spells
+				// its non-temporal locality hints exactly this way --
+				// c.ntl.p1 is c.add x0, x2 -- so a compiler targeting the
+				// profile emits them into ordinary code.
+				instr.whole = 0x00000013; // ADDI x0, x0, 0
 			}
 		} break;
 		case CI_CODE(0b101, 0b10):

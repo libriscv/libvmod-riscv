@@ -48,6 +48,14 @@ namespace riscv
 		// any instruction. Can be used for debugging.
 		void simulate_precise();
 
+		/// @brief Execute directly (and slowly) on instructions in memory
+		/// @param pc The starting address, inside the current execute segment
+		/// @return The address decoded execution can resume at
+		address_t simulate_undecoded(address_t pc);
+
+		/// @brief True when the execute segment was written to (by the guest)
+		bool guest_rewrote_code(const DecodedExecuteSegment<W>& exec, address_t pc);
+
 		/// @brief  Get the current PC
 		/// @return The current PC address
 		address_t pc() const noexcept { return registers().pc; }
@@ -99,6 +107,11 @@ namespace riscv
 		std::string to_string(format_t format) const;
 		std::string to_string(format_t format, const instruction_t &instr) const;
 
+		/// @brief Disassemble one instruction (identical to binutils)
+		/// @param format The instruction bits to disassemble
+		/// @return Canonical mnemonic and operands, separated by a tab
+		std::string disassemble(format_t format) const;
+
 		/// @brief Pretty-print the current instruction
 		/// @return Returns a formatted string of the current instruction
 		std::string current_instruction_to_string() const;
@@ -121,11 +134,16 @@ namespace riscv
 		int  load_translation(const MachineOptions<W>&, std::string* filename, DecodedExecuteSegment<W>&) const;
 		void try_translate(const MachineOptions<W>&, const std::string&, std::shared_ptr<DecodedExecuteSegment<W>>&) const;
 
+#ifdef RISCV_ASMJIT
+		// asmjit native code generation (independent of binary translation)
+		void asmjit_translate(const MachineOptions<W>&, std::shared_ptr<DecodedExecuteSegment<W>>&) const;
+#endif
+
 		void reset();
 		void reset_stack_pointer() noexcept;
 
 		CPU(Machine<W>&);
-		CPU(Machine<W>&, const Machine<W>& other); // Fork
+		CPU(Machine<W>&, const Machine<W>& other, const MachineOptions<W>& options); // Fork
 
 		DecodedExecuteSegment<W>& init_execute_area(const void* data, address_t begin, address_t length, bool is_likely_jit = false);
 		void set_execute_segment(DecodedExecuteSegment<W>& seg) noexcept { m_exec = &seg; }
@@ -189,6 +207,9 @@ namespace riscv
 
 		// ELF programs linear .text segment (initialized as empty segment)
 		DecodedExecuteSegment<W>* m_exec;
+
+		// Guard against no-progress execute-segment rebuild loops
+		address_t m_stale_restart_pc = ~address_t(0);
 
 		// The current exception (used by eg. TCC which doesn't create unwinding tables)
 		std::exception_ptr m_current_exception = nullptr;

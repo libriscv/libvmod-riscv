@@ -15,13 +15,14 @@
 static inline std::vector<uint8_t> load_file(const std::string &);
 static constexpr uint64_t MAX_MEMORY = (riscv::encompassing_Nbit_arena == 0) ? uint64_t(4000) << 20 : uint64_t(1) << riscv::encompassing_Nbit_arena;
 static const std::string DYNAMIC_LINKER = "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1";
-//#define NODEJS_WORKAROUND
 
 struct Arguments {
 	bool verbose = false;
 	bool quit = false;
 	bool accurate = false;
 	bool debug = false;
+	bool non_interactive = false; // Debugger runs without reading stdin
+	bool verbose_syscalls = false;
 	bool singlestep = false;
 	bool gdb = false;
 	bool silent = false;
@@ -29,6 +30,7 @@ struct Arguments {
 	bool trace = false;
 	bool no_translate = false;
 	bool translate_regcache = riscv::libtcc_enabled; // Default: Register caching w/libtcc
+	unsigned block_split = 1250; // Minimum instructions per translated function
 	bool translate_future = true;
 	bool full_virtual = true; // Use virtual paging in binary translator
 	bool mingw = false;
@@ -36,11 +38,14 @@ struct Arguments {
 	bool sandbox = false;
 	bool execute_only = false;
 	bool ignore_text = false;
-	bool background = riscv::libtcc_enabled; // Run binary translation in background thread
+	bool background = riscv::libtcc_enabled || riscv::asmjit_enabled; // Run translation in background thread
 	bool proxy_mode = false;  // Proxy mode for system calls
+	bool libc_fastpath = false; // Hot-patch known libc functions
+	bool automatic_nbit = false;
 	uint64_t fuel = 30'000'000'000ULL; // Default: Timeout after ~30bn instructions
 	uint64_t max_memory = 0;
 	std::vector<std::string> allowed_files;
+	std::vector<std::string> ebreak_locations;
 	std::string output_file;
 	std::string call_function;
 	std::string jump_hints_file;
@@ -79,6 +84,12 @@ static const struct option long_options[] = {
 	{"ignore-text", no_argument, 0, 'I'},
 	{"call", required_argument, 0, 'c'},
 	{"no-virtual", no_argument, 0, 1002},
+	{"non-interactive", no_argument, 0, 1003},
+	{"verbose-syscalls", no_argument, 0, 1004},
+	{"ebreak", required_argument, 0, 1005},
+	{"libc-fastpath", no_argument, 0, 1006},
+	{"nbit-address-space", no_argument, 0, 1007},
+	{"block-split", required_argument, 0, 1008},
 	{0, 0, 0, 0}
 };
 
@@ -91,6 +102,9 @@ static void print_help(const char* name)
 		"  -Q, --quit         Quit after loading the program (to produce eg. binary translations)\n"
 		"  -a, --accurate     Accurate instruction counting\n"
 		"  -d, --debug        Enable CLI debugger\n"
+		"      --non-interactive  Never read stdin in the debugger, auto-continue instead\n"
+		"      --verbose-syscalls Log every system call, futex and thread operation\n"
+		"      --ebreak sym|addr  Trap at a symbol or 0x-address (repeatable)\n"
 		"  -1, --single-step  One instruction at a time, enabling exact exceptions\n"
 		"  -f, --fuel amt     Set max instructions until program halts\n"
 		"  -m, --memory amt   Set max memory size in MiB (default: 4096 MiB)\n"
@@ -115,6 +129,8 @@ static void print_help(const char* name)
 		"  -X, --execute-only Enforce execute-only segments (no read/write)\n"
 		"  -I, --ignore-text  Ignore .text section, and use segments only\n"
 		"  -c, --call func    Call a function after loading the program\n"
+		"      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations\n"
+		"      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them\n"
 		"\n"
 	);
 	printf("libriscv v%d.%d is compiled with:\n"
@@ -136,7 +152,9 @@ static void print_help(const char* name)
 #ifdef RISCV_EXT_V
 		"-  V: Vector extension is enabled\n"
 #endif
-#if defined(RISCV_BINARY_TRANSLATION) && defined(RISCV_LIBTCC)
+#if defined(RISCV_ASMJIT)
+		"-  asmjit JIT is enabled\n"
+#elif defined(RISCV_BINARY_TRANSLATION) && defined(RISCV_LIBTCC)
 		"-  Binary translation is enabled (libtcc)\n"
 #elif defined(RISCV_BINARY_TRANSLATION)
 		"-  Binary translation is enabled\n"
@@ -195,6 +213,12 @@ static int parse_arguments(int argc, const char** argv, Arguments& args)
 			case 1000: args.translate_regcache = false; break;
 			case 1001: args.background = false; break;
 			case 1002: args.full_virtual = false; break;
+			case 1003: args.non_interactive = true; break;
+			case 1004: args.verbose_syscalls = true; break;
+			case 1005: args.ebreak_locations.push_back(optarg); break;
+			case 1006: args.libc_fastpath = true; break;
+			case 1007: args.automatic_nbit = true; break;
+			case 1008: args.block_split = atoi(optarg); break;
 			case 'm': // --memory
 				if (optarg) {
 					char* endptr;
@@ -260,7 +284,8 @@ static int parse_arguments(int argc, const char** argv, Arguments& args)
 #endif
 
 template <int W>
-static void run_sighandler(riscv::Machine<W>&);
+static void run_sighandler(riscv::Machine<W>&, int signal);
+static int signal_for_exception(int type);
 
 template <int W>
 static void run_program(
@@ -272,6 +297,17 @@ static void run_program(
 	if (cli_args.mingw && (!riscv::binary_translation_enabled || riscv::libtcc_enabled)) {
 		fprintf(stderr, "Error: Full binary translation must be enabled for MinGW cross-compilation\n");
 		exit(1);
+	}
+
+	// Turn --ebreak arguments into either an address or a symbol name to resolve
+	std::vector<std::variant<riscv::address_type<W>, std::string>> ebreaks;
+	for (const auto& loc : cli_args.ebreak_locations) {
+		char* endptr = nullptr;
+		const auto addr = strtoull(loc.c_str(), &endptr, 0);
+		if (endptr != loc.c_str() && *endptr == '\0')
+			ebreaks.push_back(riscv::address_type<W>(addr));
+		else
+			ebreaks.push_back(loc);
 	}
 
 	std::vector<riscv::MachineTranslationOptions> cc;
@@ -288,26 +324,31 @@ static void run_program(
 		.ignore_text_section = cli_args.ignore_text,
 		.verbose_loader = cli_args.verbose,
 		.use_shared_execute_segments = false, // We are only creating one machine, disabling this can enable some optimizations
-#ifdef NODEJS_WORKAROUND
-		.ebreak_locations = {
-			"pthread_rwlock_rdlock", "pthread_rwlock_wrlock" // Live-patch locations
-		},
-#endif
+		.ebreak_locations = std::move(ebreaks),
+		.libc_fastpath = cli_args.libc_fastpath,
 #ifdef RISCV_BINARY_TRANSLATION
 		.translate_enabled = !cli_args.no_translate,
-		.translate_future_segments = cli_args.translate_future,
+		.translate_future_segments = cli_args.proxy_mode && cli_args.translate_future,
 		.translate_trace = cli_args.trace,
 		.translate_timing = cli_args.timing,
-		.translate_ignore_instruction_limit = !cli_args.accurate, // Press Ctrl+C to stop
+#endif
+		.translate_ignore_instruction_limit = !cli_args.accurate,
+#ifdef RISCV_BINARY_TRANSLATION
 		.translate_use_register_caching = cli_args.translate_regcache,
-		.translate_automatic_nbit_address_space = false,
+#endif
+		.translate_automatic_nbit_address_space = cli_args.automatic_nbit,
+#ifdef RISCV_BINARY_TRANSLATION
 		.translate_use_virtual_paging_fallback = cli_args.full_virtual,
+#endif
 		.translate_unsafe_remove_checks = cli_args.proxy_mode, // Proxy mode disables sandboxing
+#ifdef RISCV_BINARY_TRANSLATION
 		.record_slowpaths_to_jump_hints = !cli_args.jump_hints_file.empty(),
 #ifdef _WIN32
 		.translation_prefix = "translations/rvbintr-",
 		.translation_suffix = ".dll",
+		.translate_block_split = cli_args.block_split,
 #else
+		.translate_block_split = cli_args.block_split,
 		.translator_jump_hints = load_jump_hints<W>(cli_args.jump_hints_file, cli_args.verbose),
 		.translate_background_callback = cli_args.background ?
 			[] (auto& compilation_step) {
@@ -317,6 +358,18 @@ static void run_program(
 			} : std::function<void(std::function<void()>&)>(nullptr),
 		.cross_compile = std::move(cc),
 #endif
+#endif
+#ifdef RISCV_ASMJIT
+		.asmjit_enabled = !cli_args.no_translate,
+		.asmjit_override_bintr = false,
+		.asmjit_verbose = cli_args.trace,
+		.asmjit_timing = cli_args.timing,
+		.asmjit_background_callback = cli_args.background ?
+			[] (auto& translation_step) {
+				std::thread([translation_step = std::move(translation_step)] {
+					translation_step();
+				}).detach();
+			} : std::function<void(std::function<void()>&)>(nullptr),
 #endif
 	});
 
@@ -504,6 +557,7 @@ static void run_program(
 
 	// A CLI debugger used with --debug or DEBUG=1
 	riscv::DebugMachine debug { machine };
+	debug.non_interactive = cli_args.non_interactive;
 
 	if (cli_args.debug)
 	{
@@ -559,31 +613,6 @@ static void run_program(
 			machine.set_max_instructions(~0ULL);
 			machine.cpu.simulate_precise();
 		} else {
-#ifdef NODEJS_WORKAROUND
-			// In order to get NodeJS to work we need to live-patch deadlocked rwlocks
-			// This is a temporary workaround until the issue is found and fixed.
-			static const auto rw_rdlock = machine.address_of("pthread_rwlock_rdlock");
-			static const auto rw_wrlock = machine.address_of("pthread_rwlock_wrlock");
-			machine.install_syscall_handler(riscv::SYSCALL_EBREAK,
-			[] (auto& machine)
-			{
-				auto& cpu = machine.cpu;
-				if (cpu.pc() == rw_rdlock || cpu.pc() == rw_wrlock) {
-					// Execute 2 instruction and step over them
-					cpu.step_one(false);
-					cpu.step_one(false);
-					// Check for deadlock
-					if (cpu.reg(14) == cpu.reg(15)) {
-						// Deadlock detected, avoid branch (beq a4, a5) and reset the lock
-						cpu.reg(14) = 0xFF;
-						machine.memory.template write<uint32_t>(cpu.reg(10), 0);
-					}
-				} else {
-					throw riscv::MachineException(riscv::UNHANDLED_SYSCALL, "EBREAK instruction", cpu.pc());
-				}
-			});
-#endif // NODEJS_WORKAROUND
-
 			// Normal RISC-V simulation
 			if (cli_args.accurate)
 				machine.simulate(cli_args.fuel);
@@ -609,7 +638,7 @@ static void run_program(
 		if (cli_args.debug)
 			debug.print_and_pause();
 		else
-			run_sighandler(machine);
+			run_sighandler(machine, signal_for_exception(me.type()));
 	} catch (std::exception& e) {
 		printf(">>> Exception: %s\n", e.what());
 		machine.memory.print_backtrace(
@@ -619,7 +648,7 @@ static void run_program(
 		if (cli_args.debug)
 			debug.print_and_pause();
 		else
-			run_sighandler(machine);
+			run_sighandler(machine, 11);
 	}
 
 	auto t1 = std::chrono::high_resolution_clock::now();
@@ -701,6 +730,14 @@ int main(int argc, const char** argv)
 	cli_args.mingw = getenv("MINGW") != nullptr;
 	cli_args.from_start = getenv("FROM_START") != nullptr;
 
+#endif
+
+	// Syscall logging is compiled in with -DRISCV_VERBOSE_SYSCALLS=ON,
+	// but stays quiet until asked for.
+	riscv::verbose_syscalls_enabled = cli_args.verbose_syscalls;
+#ifndef SYSCALL_VERBOSE
+	if (cli_args.verbose_syscalls)
+		fprintf(stderr, "Warning: --verbose-syscalls needs a build with -DRISCV_VERBOSE_SYSCALLS=ON\n");
 #endif
 
 	std::vector<std::string> args;
@@ -792,25 +829,52 @@ int main(int argc, const char** argv)
 }
 
 template <int W>
-void run_sighandler(riscv::Machine<W>& machine)
+void run_sighandler(riscv::Machine<W>& machine, int signal)
 {
 	constexpr int SIG_SEGV = 11;
-	auto& action = machine.sigaction(SIG_SEGV);
-	if (action.is_unset())
-		return;
+	constexpr int SIG_ILL = 4;
+	auto& action = machine.sigaction(signal);
+	if (action.is_unset()) {
+		// The guest did not install a handler for the architectural signal;
+		// fall back to the previous behavior (SIGSEGV) only if the guest
+		// handles that one instead.
+		if (signal != SIG_SEGV) {
+			auto& segv = machine.sigaction(SIG_SEGV);
+			if (segv.is_unset()) return;
+			action = segv;
+			signal = SIG_SEGV;
+		} else {
+			return;
+		}
+	}
 
 	auto handler = action.handler;
 	action.handler = 0x0; // Avoid re-triggering(?)
 
 	machine.stack_push(machine.cpu.reg(riscv::REG_RA));
 	machine.cpu.reg(riscv::REG_RA) = machine.cpu.pc();
-	machine.cpu.reg(riscv::REG_ARG0) = 11; /* SIGSEGV */
+	machine.cpu.reg(riscv::REG_ARG0) = signal;
 	try {
 		machine.cpu.jump(handler);
 		machine.simulate(60'000);
 	} catch (...) {}
 
 	action.handler = handler;
+}
+
+static int signal_for_exception(int type)
+{
+	switch (type) {
+	case riscv::ILLEGAL_OPCODE:
+	case riscv::ILLEGAL_OPERATION:
+	case riscv::UNIMPLEMENTED_INSTRUCTION:
+	case riscv::UNIMPLEMENTED_INSTRUCTION_LENGTH:
+	case riscv::MISALIGNED_INSTRUCTION:
+	case riscv::INVALID_ALIGNMENT:
+		return 4; // SIGILL
+	default:
+		return 11; // SIGSEGV
+	}
 }
 
 #include <stdexcept>

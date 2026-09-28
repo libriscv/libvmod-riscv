@@ -1,4 +1,6 @@
 #include "instr_helpers.hpp"
+#include "instruction_list.hpp"
+#include "internal_common.hpp"
 #include "rvc.hpp"
 #include <atomic>
 #if __has_include(<bit>)
@@ -14,54 +16,67 @@
 
 namespace riscv
 {
+// MULH/MULHU/MULHSU helpers in internal_common.hpp, shared with RVV.
 #ifdef _MSC_VER
 #define bswap32(x)   _byteswap_ulong(x)
 #define bswap64(x)   _byteswap_uint64(x)
-#define mulhi64(a, b)  __mulh(a, b)
-#define mulhu64(a, b)  __umulh(a, b)
-#define mulhsu64(a, b) __umulh(a, b)
 #else
 #ifndef bswap32
 #define bswap32(x)   __builtin_bswap32(x)
 #define bswap64(x)   __builtin_bswap64(x)
 #endif
-# if defined(__SIZEOF_INT128__) // GCC/Clang 64-bit
-#  define mulhi64(a, b)  (__int128_t(int64_t(a)) * __int128_t(int64_t(b))) >> 64u;
-#  define mulhu64(a, b)  (__int128_t(a) * __int128_t(b)) >> 64u;
-#  define mulhsu64(a, b) (__int128_t(int64_t(a)) * __int128_t(b)) >> 64u;
-# else
-// https://stackoverflow.com/questions/28868367/getting-the-high-part-of-64-bit-integer-multiplication
-// As written by catid
-static inline uint64_t MUL128(
-	uint64_t* r_hi,
-	const uint64_t x,
-	const uint64_t y)
-{
-	const uint64_t x0 = (uint32_t)x, x1 = x >> 32;
-	const uint64_t y0 = (uint32_t)y, y1 = y >> 32;
-	const uint64_t p11 = x1 * y1, p01 = x0 * y1;
-	const uint64_t p10 = x1 * y0, p00 = x0 * y0;
-
-	// 64-bit product + two 32-bit values
-	const uint64_t middle = p10 + (p00 >> 32) + (uint32_t)p01;
-
-	// 64-bit product + two 32-bit values
-	*r_hi = p11 + (middle >> 32) + (p01 >> 32);
-
-	// Add LOW PART and lower half of MIDDLE PART
-	return (middle << 32) | (uint32_t)p00;
-}
-#  define mulhi64(a, b)  ([](uint64_t a, uint64_t b) { uint64_t hi; MUL128(&hi, a, b); return hi; })(a, b)
-#  define mulhu64(a, b)  mulhi64(a, b)
-#  define mulhsu64(a, b) mulhi64(a, b)
-# endif // sizeof long == 8
 #endif // _MSC_VER
+
+	template <typename T>
+	static inline T rv_brev8(T value) noexcept
+	{
+		T result = 0;
+		for (size_t i = 0; i < sizeof(T); i++) {
+			uint8_t b = uint8_t(value >> (i * 8));
+			b = uint8_t(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+			b = uint8_t(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+			b = uint8_t(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+			result |= T(b) << (i * 8);
+		}
+		return result;
+	}
+
+	static inline uint32_t rv_zip32(uint32_t value) noexcept
+	{
+		uint32_t lo = value & 0xFFFF;
+		uint32_t hi = value >> 16;
+		lo = (lo | (lo << 8)) & 0x00FF00FF;
+		lo = (lo | (lo << 4)) & 0x0F0F0F0F;
+		lo = (lo | (lo << 2)) & 0x33333333;
+		lo = (lo | (lo << 1)) & 0x55555555;
+		hi = (hi | (hi << 8)) & 0x00FF00FF;
+		hi = (hi | (hi << 4)) & 0x0F0F0F0F;
+		hi = (hi | (hi << 2)) & 0x33333333;
+		hi = (hi | (hi << 1)) & 0x55555555;
+		return lo | (hi << 1);
+	}
+
+	static inline uint32_t rv_unzip32(uint32_t value) noexcept
+	{
+		uint32_t lo = value & 0x55555555;
+		uint32_t hi = (value >> 1) & 0x55555555;
+		lo = (lo | (lo >> 1)) & 0x33333333;
+		lo = (lo | (lo >> 2)) & 0x0F0F0F0F;
+		lo = (lo | (lo >> 4)) & 0x00FF00FF;
+		lo = (lo | (lo >> 8)) & 0x0000FFFF;
+		hi = (hi | (hi >> 1)) & 0x33333333;
+		hi = (hi | (hi >> 2)) & 0x0F0F0F0F;
+		hi = (hi | (hi >> 4)) & 0x00FF00FF;
+		hi = (hi | (hi >> 8)) & 0x0000FFFF;
+		return lo | (hi << 16);
+	}
 
 	INSTRUCTION(NOP,
 	[] (auto& /* cpu */, rv32i_instruction /* instr */) RVINSTR_COLDATTR {
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction) RVPRINTR_ATTR {
-		return snprintf(buffer, len, "NOP");
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_print_hint(buffer, len, instr,
+			RVISGE64BIT(cpu), RVIS128BIT(cpu), cpu.pc());
 	});
 
 	INSTRUCTION(UNIMPLEMENTED,
@@ -72,15 +87,7 @@ static inline uint64_t MUL128(
 			cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.half[0]);
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		if (instr.length() == 4) {
-			return snprintf(buffer, len, "UNIMPLEMENTED: 4-byte 0x%X (0x%X)",
-							instr.opcode(), instr.whole);
-		} else {
-			return snprintf(buffer, len, "UNIMPLEMENTED: 2-byte %#hx F%#hx (%#hx)",
-							rv32c_instruction { instr }.opcode(),
-							rv32c_instruction { instr }.funct3(),
-							instr.half[0]);
-		}
+		return RVPRINT::illegal(buffer, len, instr.whole, instr.length());
 	});
 
 	INSTRUCTION(ILLEGAL,
@@ -96,11 +103,7 @@ static inline uint64_t MUL128(
 		reg = (int8_t) cpu.machine().memory.template read<uint8_t>(addr);
 	},
 	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		static std::array<const char*, 8> f3 = {"LD.B", "LD.H", "LD.W", "LD.D", "LD.BU", "LD.HU", "LD.WU", "LD.Q"};
-		return snprintf(buffer, len, "%s %s, [%s%+" PRId32 " = 0x%" PRIX64 "]",
-						f3[instr.Itype.funct3], RISCV::regname(instr.Itype.rd),
-						RISCV::regname(instr.Itype.rs1), instr.Itype.signed_imm(),
-						uint64_t(cpu.reg(instr.Itype.rs1) + instr.Itype.signed_imm()));
+		return RVDISASM::op_load(buffer, len, instr, RVIS128BIT(cpu));
 	});
 
 	INSTRUCTION(LOAD_I16,
@@ -197,11 +200,7 @@ static inline uint64_t MUL128(
 		cpu.machine().memory.template write<uint8_t>(addr, value);
 	},
 	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		static std::array<const char*, 8> f3 = {"ST.B", "ST.H", "ST.W", "ST.D", "ST.Q", "???", "???", "???"};
-		return snprintf(buffer, len, "%s %s, [%s%+d] (0x%" PRIX64 ")",
-						f3[instr.Stype.funct3], RISCV::regname(instr.Stype.rs2),
-						RISCV::regname(instr.Stype.rs1), instr.Stype.signed_imm(),
-						uint64_t(cpu.reg(instr.Stype.rs1) + instr.Stype.signed_imm()));
+		return RVDISASM::op_store(buffer, len, instr, RVIS128BIT(cpu));
 	});
 
 	INSTRUCTION(STORE_I8,
@@ -260,26 +259,7 @@ static inline uint64_t MUL128(
 		}
 	},
 	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		// BRANCH compares two registers, BQE = equal taken, BNE = notequal taken
-		static std::array<const char*, 8> f3 = {"BEQ", "BNE", "???", "???", "BLT", "BGE", "BLTU", "BGEU"};
-		static std::array<const char*, 8> f1z = {"BEQ", "BNE", "???", "???", "BGTZ", "BLEZ", "BLTU", "BGEU"};
-		static std::array<const char*, 8> f2z = {"BEQZ", "BNEZ", "???", "???", "BLTZ", "BGEZ", "BLTU", "BGEU"};
-		if (instr.Btype.rs1 != 0 && instr.Btype.rs2) {
-			return snprintf(buffer, len, "%s %s (0x%" PRIX64 "), %s (0x%" PRIX64 ") => PC%+d (0x%" PRIX64 ")",
-							f3[instr.Btype.funct3],
-							RISCV::regname(instr.Btype.rs1), uint64_t(cpu.reg(instr.Btype.rs1)),
-							RISCV::regname(instr.Btype.rs2), uint64_t(cpu.reg(instr.Btype.rs2)),
-							instr.Btype.signed_imm(),
-							uint64_t(cpu.pc() + instr.Btype.signed_imm()));
-		} else {
-			auto& array = (instr.Btype.rs1) ? f2z : f1z;
-			auto  reg   = (instr.Btype.rs1) ? instr.Btype.rs1 : instr.Btype.rs2;
-			return snprintf(buffer, len, "%s %s (0x%" PRIX64 ") => PC%+d (0x%" PRIX64 ")",
-							array[instr.Btype.funct3],
-							RISCV::regname(reg), uint64_t(cpu.reg(reg)),
-							instr.Btype.signed_imm(),
-							uint64_t(cpu.pc() + instr.Btype.signed_imm()));
-		}
+		return RVDISASM::op_branch(buffer, len, instr, cpu.pc(), RVISGE64BIT(cpu));
 	});
 
 	INSTRUCTION(BRANCH_NE,
@@ -350,13 +330,8 @@ static inline uint64_t MUL128(
 				instr.Itype.signed_imm());
 		}
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		// RISC-V's RET instruction: return to register + immediate
-		const char* variant = (instr.Itype.rs1 == REG_RA) ? "RET" : "JMP";
-		const auto address = cpu.reg(instr.Itype.rs1) + RVIMM(cpu, instr.Itype);
-		return snprintf(buffer, len, "%s %s%+d (0x%" PRIX64 ")", variant,
-						RISCV::regname(instr.Itype.rs1),
-						instr.Itype.signed_imm(), uint64_t(address));
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_jalr(buffer, len, instr);
 	});
 
 	INSTRUCTION(JAL,
@@ -373,14 +348,7 @@ static inline uint64_t MUL128(
 		}
 	},
 	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		if (instr.Jtype.rd != 0) {
-		return snprintf(buffer, len, "JAL %s, PC%+d (0x%" PRIX64 ")",
-						RISCV::regname(instr.Jtype.rd), instr.Jtype.jump_offset(),
-						uint64_t(cpu.pc() + instr.Jtype.jump_offset()));
-		}
-		return snprintf(buffer, len, "JMP PC%+d (0x%" PRIX64 ")",
-						instr.Jtype.jump_offset(),
-						uint64_t(cpu.pc() + instr.Jtype.jump_offset()));
+		return RVDISASM::op_jal(buffer, len, instr, cpu.pc(), RVISGE64BIT(cpu));
 	});
 
 	INSTRUCTION(JMPI,
@@ -400,6 +368,7 @@ static inline uint64_t MUL128(
 	{
 		auto& dst = cpu.reg(instr.Itype.rd);
 		const auto src = cpu.reg(instr.Itype.rs1);
+		const bool rv32_shamt_legal = !RVIS32BIT(cpu) || (instr.Itype.imm & 0x20) == 0;
 		switch (instr.Itype.funct3) {
 		case 0x1: // *NOT* SLLI, SEXT.B, SEXT.H, CTZ, CLZ, CPOP
 			switch (instr.Itype.imm) {
@@ -439,18 +408,24 @@ static inline uint64_t MUL128(
 					dst = __builtin_popcountl(src);
 #endif
 				return;
+			case 0b000010001111:
+				if constexpr (RVIS32BIT(cpu)) {
+					dst = rv_zip32(uint32_t(src));
+					return;
+				}
+				break;
 			default:
-				if (instr.Itype.high_bits() == 0x280) {
+				if (instr.Itype.high_bits() == 0x280 && rv32_shamt_legal) {
 					// BSETI: Bit-set immediate
 					dst = src | (RVREGTYPE(cpu)(1) << (instr.Itype.imm & (RVXLEN(cpu)-1)));
 					return;
 				}
-				else if (instr.Itype.high_bits() == 0x480) {
+				else if (instr.Itype.high_bits() == 0x480 && rv32_shamt_legal) {
 					// BCLRI: Bit-clear immediate
 					dst = src & ~(RVREGTYPE(cpu)(1) << (instr.Itype.imm & (RVXLEN(cpu)-1)));
 					return;
 				}
-				else if (instr.Itype.high_bits() == 0x680) {
+				else if (instr.Itype.high_bits() == 0x680 && rv32_shamt_legal) {
 					// BINVI: Bit-invert immediate
 					dst = src ^ (RVREGTYPE(cpu)(1) << (instr.Itype.imm & (RVXLEN(cpu)-1)));
 					return;
@@ -467,18 +442,19 @@ static inline uint64_t MUL128(
 			dst = src ^ RVIMM(cpu, instr.Itype);
 			return;
 		case 0x5: // SRLI / SRAI / RORI / ORC.B
-			if (instr.Itype.is_srai()) {
+			if (instr.Itype.is_srai() && rv32_shamt_legal) {
 				// SRAI: Preserve the sign bit
 				dst = (RVSIGNTYPE(cpu))src >> (instr.Itype.imm & (RVXLEN(cpu)-1));
 				return;
 			}
-			else if (instr.Itype.is_rori()) {
-				// RORI: Rotate right
+			else if (instr.Itype.is_rori() && rv32_shamt_legal) {
+				// RORI: Rotate right. Mask the complementary count, as a
+				// zero rotate would otherwise shift by the full width
 				const auto shift = instr.Itype.imm & (RVXLEN(cpu) - 1);
-				dst = (src >> shift) | (src << (RVXLEN(cpu) - shift));
+				dst = (src >> shift) | (src << ((RVXLEN(cpu) - shift) & (RVXLEN(cpu) - 1)));
 				return;
 			}
-			else if (instr.Itype.high_bits() == 0x480) {
+			else if (instr.Itype.high_bits() == 0x480 && rv32_shamt_legal) {
 				// BEXTI: Single-bit Extract
 				dst = (src >> (instr.Itype.imm & (RVXLEN(cpu)-1))) & 1;
 				return;
@@ -499,6 +475,16 @@ static inline uint64_t MUL128(
 					dst = bswap64(src);
 				return;
 			}
+			else if (instr.Itype.imm == 0b011010000111) {
+				dst = rv_brev8(RVREGTYPE(cpu)(src));
+				return;
+			}
+			else if (instr.Itype.imm == 0b000010001111) {
+				if constexpr (RVIS32BIT(cpu)) {
+					dst = rv_unzip32(uint32_t(src));
+					return;
+				}
+			}
 			break;
 		case 0x6: // ORI: Or sign-extended 12-bit immediate
 			dst = src | RVIMM(cpu, instr.Itype);
@@ -506,56 +492,8 @@ static inline uint64_t MUL128(
 		}
 		cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.whole);
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR
-	{
-		if (instr.Itype.imm == 0)
-		{
-			// this is the official NOP instruction (ADDI x0, x0, 0)
-			if (instr.Itype.rd == 0 && instr.Itype.rs1 == 0) {
-				return snprintf(buffer, len, "NOP");
-			}
-			static std::array<const char*, 8> func3 = {"MV", "SLL", "SLT", "SLT", "XOR", "SRL", "OR", "AND"};
-			return snprintf(buffer, len, "%s %s, %s (= 0x%" PRIx64 ")",
-							func3[instr.Itype.funct3],
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							uint64_t(cpu.reg(instr.Itype.rs1)));
-		}
-		else if (instr.Itype.rs1 != 0 && instr.Itype.funct3 == 1) {
-			const auto shift = (RVIS64BIT(cpu)) ? instr.Itype.shift64_imm() : instr.Itype.shift_imm();
-			return snprintf(buffer, len, "SLLI %s, %s << %u (0x%" PRIX64 ")",
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							shift,
-							uint64_t(cpu.reg(instr.Itype.rs1) << shift));
-		} else if (instr.Itype.rs1 != 0 && instr.Itype.funct3 == 5) {
-			const auto shift = (RVIS64BIT(cpu)) ? instr.Itype.shift64_imm() : instr.Itype.shift_imm();
-			return snprintf(buffer, len, "%s %s, %s >> %u (0x%" PRIX64 ")",
-							(instr.Itype.is_srai() ? "SRAI" : "SRLI"),
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							shift,
-							uint64_t(cpu.reg(instr.Itype.rs1) >> shift));
-		} else if (instr.Itype.rs1 != 0) {
-			static std::array<const char*, 8> func3 = {"ADDI", "SLLI", "SLTI", "SLTU", "XORI", "SRLI", "ORI", "ANDI"};
-			if (!(instr.Itype.funct3 == 4 && instr.Itype.signed_imm() == -1)) {
-				return snprintf(buffer, len, "%s %s, %s%+d (0x%" PRIX64 ")",
-								func3[instr.Itype.funct3],
-								RISCV::regname(instr.Itype.rd),
-								RISCV::regname(instr.Itype.rs1),
-								instr.Itype.signed_imm(),
-								uint64_t(cpu.reg(instr.Itype.rs1)));
-			} else {
-				return snprintf(buffer, len, "NOT %s, %s",
-								RISCV::regname(instr.Itype.rd),
-								RISCV::regname(instr.Itype.rs1));
-			}
-		}
-		static std::array<const char*, 8> func3 = {"LINT", "SLLI", "SLTI", "SLTU", "XORI", "SRLI", "ORI", "ANDI"};
-		return snprintf(buffer, len, "%s %s, %d (0x%X)",
-						func3[instr.Itype.funct3],
-						RISCV::regname(instr.Itype.rd),
-						instr.Itype.signed_imm(), instr.Itype.signed_imm());
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_imm(buffer, len, instr, RVISGE64BIT(cpu));
 	});
 
 	INSTRUCTION(OP_IMM_ADDI,
@@ -563,41 +501,65 @@ static inline uint64_t MUL128(
 		// ADDI: Add sign-extended 12-bit immediate
 		cpu.reg(instr.Itype.rd) =
 			cpu.reg(instr.Itype.rs1) + RVIMM(cpu, instr.Itype);
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rri(buffer, len, "addi", instr);
+	});
 
 	INSTRUCTION(OP_IMM_LI,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		// LI: Load sign-extended 12-bit immediate
 		cpu.reg(instr.Itype.rd) = (RVSIGNTYPE(cpu)) RVIMM(cpu, instr.Itype);
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rri(buffer, len, "addi", instr);
+	});
 
 	INSTRUCTION(OP_MV,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		cpu.reg(instr.Itype.rd) = cpu.reg(instr.Itype.rs1);
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rri(buffer, len, "addi", instr);
+	});
 
+	// The reserved RV32 imm[5]=1 encodings never reach here: the decoder
+	// (instr_decoding.inc) routes them to the generic OP_IMM handler, which
+	// rejects them. Keep this handler free of the extra branch.
 	INSTRUCTION(OP_IMM_SLLI,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		auto& dst = cpu.reg(instr.Itype.rd);
 		const auto src = cpu.reg(instr.Itype.rs1);
 		// SLLI: Logical left-shift 5/6/7-bit immediate
 		dst = src << (instr.Itype.imm & (RVXLEN(cpu)-1));
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "slli", instr,
+			instr.Itype.imm & (RVISGE64BIT(cpu) ? 0x3F : 0x1F));
+	});
 
+	// See OP_IMM_SLLI above: reserved RV32 encodings are filtered at decode.
 	INSTRUCTION(OP_IMM_SRLI,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		auto& dst = cpu.reg(instr.Itype.rd);
 		const auto src = cpu.reg(instr.Itype.rs1);
 		// SRLI: Shift-right logical 5/6/7-bit immediate
 		dst = src >> (instr.Itype.imm & (RVXLEN(cpu)-1));
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "srli", instr,
+			instr.Itype.imm & (RVISGE64BIT(cpu) ? 0x3F : 0x1F));
+	});
 
 	INSTRUCTION(OP_IMM_ANDI,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		auto& dst = cpu.reg(instr.Itype.rd);
 		// ANDI: And sign-extended 12-bit immediate
 		dst = cpu.reg(instr.Itype.rs1) & RVIMM(cpu, instr.Itype);
-	}, DECODED_INSTR(OP_IMM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rri(buffer, len, "andi", instr);
+	});
 
 	INSTRUCTION(OP,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
@@ -630,7 +592,9 @@ static inline uint64_t MUL128(
 			return;
 		// extension RV32M / RV64M
 		case 0x10: // MUL
-			dst = RVTOSIGNED(src1) * RVTOSIGNED(src2);
+			// MUL keeps the low XLEN bits, which is the same product either
+			// way, but only the unsigned multiplication is defined on overflow
+			dst = RVREGTYPE(cpu)(src1) * RVREGTYPE(cpu)(src2);
 			return;
 		case 0x11: // MULH (signed x signed)
 			if constexpr (RVIS32BIT(cpu)) {
@@ -660,22 +624,7 @@ static inline uint64_t MUL128(
 			}
 			return;
 		case 0x14: // DIV
-			// division by zero is not an exception
-			if (LIKELY(RVTOSIGNED(src2) != 0)) {
-				if constexpr (RVIS64BIT(cpu)) {
-					// vi_instr.cpp:444:2: runtime error:
-					// division of -9223372036854775808 by -1 cannot be represented in type 'long'
-					if (LIKELY(!((int64_t)src1 == INT64_MIN && (int64_t)src2 == -1ll)))
-						dst = RVTOSIGNED(src1) / RVTOSIGNED(src2);
-				} else {
-					// rv32i_instr.cpp:301:2: runtime error:
-					// division of -2147483648 by -1 cannot be represented in type 'int'
-					if (LIKELY(!(src1 == 2147483648 && src2 == 4294967295)))
-						dst = RVTOSIGNED(src1) / RVTOSIGNED(src2);
-				}
-			} else {
-				dst = (RVREGTYPE(cpu)) -1;
-			}
+			dst = rv_div<RVREGTYPE(cpu)>(src1, src2);
 			return;
 		case 0x15: // DIVU
 			if (LIKELY(src2 != 0)) {
@@ -685,21 +634,7 @@ static inline uint64_t MUL128(
 			}
 			return;
 		case 0x16: // REM
-			if (LIKELY(src2 != 0)) {
-				if constexpr(RVIS32BIT(cpu)) {
-					if (LIKELY(!(src1 == 2147483648 && src2 == 4294967295)))
-						dst = RVTOSIGNED(src1) % RVTOSIGNED(src2);
-				} else if constexpr (RVIS64BIT(cpu)) {
-					if (LIKELY(!((int64_t)src1 == INT64_MIN && (int64_t)src2 == -1ll)))
-						dst = RVTOSIGNED(src1) % RVTOSIGNED(src2);
-					else
-						dst = 0;
-				} else {
-					dst = RVTOSIGNED(src1) % RVTOSIGNED(src2);
-				}
-			} else {
-				dst = src1;
-			}
+			dst = rv_rem<RVREGTYPE(cpu)>(src1, src2);
 			return;
 		case 0x17: // REMU
 			if (LIKELY(src2 != 0)) {
@@ -708,25 +643,31 @@ static inline uint64_t MUL128(
 				dst = src1;
 			}
 			return;
-		case 0x44: // ZEXT.H
-			dst = uint16_t(src1);
+		case 0x44: { // PACK (ZEXT.H on RV32 when rs2 == 0)
+			constexpr auto half = RVXLEN(cpu) / 2;
+			const RVREGTYPE(cpu) mask = (RVREGTYPE(cpu)(1) << half) - 1;
+			dst = (src1 & mask) | ((src2 & mask) << half);
+			} return;
+		case 0x47: // PACKH
+			dst = RVREGTYPE(cpu)(uint8_t(src1))
+				| (RVREGTYPE(cpu)(uint8_t(src2)) << 8);
 			return;
 		case 0x51: { // CLMUL
-			auto result = 0;
+			RVREGTYPE(cpu) result = 0;
 			for (unsigned i = 0; i < RVXLEN(cpu); i++)
 				if ((src2 >> i) & 1)
 					result ^= (src1 << i);
 			dst = result;
 			} return;
 		case 0x52: { // CLMULR
-			auto result = 0;
-			for (unsigned i = 0; i < RVXLEN(cpu)-1; i++)
+			RVREGTYPE(cpu) result = 0;
+			for (unsigned i = 0; i < RVXLEN(cpu); i++)
 				if ((src2 >> i) & 1)
 					result ^= (src1 >> (RVXLEN(cpu) - i - 1));
 			dst = result;
 			} return;
 		case 0x53: { // CLMULH
-			auto result = 0;
+			RVREGTYPE(cpu) result = 0;
 			for (unsigned i = 1; i < RVXLEN(cpu); i++)
 				if ((src2 >> i) & 1)
 					result ^= (src1 >> (RVXLEN(cpu) - i));
@@ -780,13 +721,15 @@ static inline uint64_t MUL128(
 		case 0x245: // BEXT
 			dst = (src1 >> (src2 & (RVXLEN(cpu)-1))) & 1;
 			return;
+		// The complementary shift count is masked, as a zero rotate would
+		// otherwise shift by the full register width
 		case 0x301: { // ROL: Rotate left
 			const auto shift = src2 & (RVXLEN(cpu) - 1);
-			dst = (src1 << shift) | (src1 >> (RVXLEN(cpu) - shift));
+			dst = (src1 << shift) | (src1 >> ((RVXLEN(cpu) - shift) & (RVXLEN(cpu) - 1)));
 			} return;
 		case 0x305: { // ROR: Rotate right
 			const auto shift = src2 & (RVXLEN(cpu) - 1);
-			dst = (src1 >> shift) | (src1 << (RVXLEN(cpu) - shift));
+			dst = (src1 >> shift) | (src1 << ((RVXLEN(cpu) - shift) & (RVXLEN(cpu) - 1)));
 			} return;
 		case 0x341: // BINV
 			dst = src1 ^ (RVREGTYPE(cpu)(1) << (src2 & (RVXLEN(cpu)-1)));
@@ -794,55 +737,8 @@ static inline uint64_t MUL128(
 		}
 		cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.whole);
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR
-	{
-		const char* strop = "";
-		switch (instr.Rtype.jumptable_friendly_op()) {
-			case 0x0: strop = "ADD"; break;
-			case 0x1: strop = "SLL"; break;
-			case 0x2: strop = "SLT"; break;
-			case 0x3: strop = "SLTU"; break;
-			case 0x4: strop = "XOR"; break;
-			case 0x5: strop = "SRL"; break;
-			case 0x6: strop = "OR"; break;
-			case 0x7: strop = "AND"; break;
-			case 0x10: strop = "MUL"; break;
-			case 0x11: strop = "MULH"; break;
-			case 0x12: strop = "MULHSU"; break;
-			case 0x13: strop = "MULHU"; break;
-			case 0x14: strop = "DIV"; break;
-			case 0x15: strop = "DIVU"; break;
-			case 0x16: strop = "REM"; break;
-			case 0x17: strop = "REMU"; break;
-			case 0x44: strop = "ZEXT.H"; break;
-			case 0x54: strop = "MIN"; break;
-			case 0x55: strop = "MINU"; break;
-			case 0x56: strop = "MAX"; break;
-			case 0x57: strop = "MAXU"; break;
-			case 0x75: strop = "CZERO.EQZ"; break;
-			case 0x77: strop = "CZERO.NEZ"; break;
-			case 0x102: strop = "SH1ADD"; break;
-			case 0x104: strop = "SH2ADD"; break;
-			case 0x106: strop = "SH3ADD"; break;
-			case 0x141: strop = "BSET"; break;
-			case 0x142: strop = "BCLR"; break;
-			case 0x143: strop = "BINV"; break;
-			case 0x200: strop = "SUB"; break;
-			case 0x204: strop = "XNOR"; break;
-			case 0x205: strop = "SRA"; break;
-			case 0x206: strop = "ORN"; break;
-			case 0x207: strop = "ANDN"; break;
-			case 0x245: strop = "BEXT"; break;
-			case 0x301: strop = "ROL"; break;
-			case 0x305: strop = "ROR"; break;
-			default: strop = "OP.UNKNOWN"; break;
-		}
-		return snprintf(buffer, len, "%s %s <- %s, %s (= 0x%" PRIX64 ")",
-						strop,
-						RISCV::regname(instr.Rtype.rd),
-						RISCV::regname(instr.Rtype.rs1),
-						RISCV::regname(instr.Rtype.rs2),
-						uint64_t(cpu.reg(instr.Rtype.rd)));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_reg(buffer, len, instr, RVISGE64BIT(cpu));
 	});
 
 	INSTRUCTION(SYSTEM,
@@ -850,84 +746,57 @@ static inline uint64_t MUL128(
 		cpu.machine().system(instr);
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		// system functions
-		static std::array<const char*, 2> etype = {"ECALL", "EBREAK"};
-		if (instr.Itype.imm < 2 && instr.Itype.funct3 == 0) {
-			return snprintf(buffer, len, "SYS %s", etype.at(instr.Itype.imm));
-		} else if (instr.Itype.imm == 0x102 && instr.Itype.funct3 == 0) {
-			return snprintf(buffer, len, "SYS SRET");
-		} else if (instr.Itype.imm == 0x105 && instr.Itype.funct3 == 0) {
-			return snprintf(buffer, len, "SYS WFI");
-		} else if (instr.Itype.imm == 0x7FF && instr.Itype.funct3 == 0) {
-			return snprintf(buffer, len, "SYS STOP");
-		} else if (instr.Itype.funct3 == 0x1 || instr.Itype.funct3 == 0x2) {
-			// CSRRW / CSRRS
-			switch (instr.Itype.imm) {
-				case 0x001:
-					return snprintf(buffer, len, "RDCSR FFLAGS %s", RISCV::regname(instr.Itype.rd));
-				case 0x002:
-					return snprintf(buffer, len, "RDCSR FRM %s", RISCV::regname(instr.Itype.rd));
-				case 0x003:
-					return snprintf(buffer, len, "RDCSR FCSR %s", RISCV::regname(instr.Itype.rd));
-				case 0xC00:
-					if (instr.Itype.rd == 0 && instr.Itype.rs1 == 0)
-						return snprintf(buffer, len, "UNIMP");
-					else
-						return snprintf(buffer, len, "RDCYCLE.L %s", RISCV::regname(instr.Itype.rd));
-				case 0xC01:
-					return snprintf(buffer, len, "RDINSTRET.L %s", RISCV::regname(instr.Itype.rd));
-				case 0xC80:
-					return snprintf(buffer, len, "RDCYCLE.U %s", RISCV::regname(instr.Itype.rd));
-				case 0xC81:
-					return snprintf(buffer, len, "RDINSTRET.U %s", RISCV::regname(instr.Itype.rd));
-			}
-			return snprintf(buffer, len, "CSRRS (unknown), %s", RISCV::regname(instr.Itype.rd));
-		} else {
-			return snprintf(buffer, len, "SYS ???");
-		}
+		return RVDISASM::op_system(buffer, len, instr);
 	});
 
 	INSTRUCTION(OP_ADD,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		auto& dst = cpu.reg(instr.Rtype.rd);
 		dst = cpu.reg(instr.Rtype.rs1) + cpu.reg(instr.Rtype.rs2);
-	}, DECODED_INSTR(OP).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrr(buffer, len, "add", instr);
+	});
 
 	INSTRUCTION(OP_SUB,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		auto& dst = cpu.reg(instr.Rtype.rd);
 		dst = cpu.reg(instr.Rtype.rs1) - cpu.reg(instr.Rtype.rs2);
-	}, DECODED_INSTR(OP).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrr(buffer, len, "sub", instr);
+	});
 
 	INSTRUCTION(SYSCALL,
 	[] (auto& cpu, rv32i_instruction) RVINSTR_ATTR {
 		cpu.machine().system_call(cpu.reg(REG_ECALL));
-	}, DECODED_INSTR(SYSTEM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_system(buffer, len, instr);
+	});
 
 	INSTRUCTION(WFI,
 	[] (auto& cpu, rv32i_instruction) RVINSTR_ATTR {
 		cpu.machine().stop();
-	}, DECODED_INSTR(SYSTEM).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_system(buffer, len, instr);
+	});
 
 	INSTRUCTION(LUI,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		cpu.reg(instr.Utype.rd) = instr.Utype.upper_imm();
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		return snprintf(buffer, len, "LUI %s, 0x%X",
-						RISCV::regname(instr.Utype.rd),
-						instr.Utype.upper_imm());
+		return RVDISASM::op_lui(buffer, len, instr);
 	});
 
 	INSTRUCTION(AUIPC,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
 		cpu.reg(instr.Utype.rd) = cpu.pc() + instr.Utype.upper_imm();
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		return snprintf(buffer, len, "AUIPC %s, PC+0x%X (0x%" PRIX64 ")",
-						RISCV::regname(instr.Utype.rd),
-						instr.Utype.upper_imm(),
-						uint64_t(cpu.pc() + instr.Utype.upper_imm()));
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_auipc(buffer, len, instr);
 	});
 
 	INSTRUCTION(OP_IMM32_ADDIW,
@@ -937,53 +806,8 @@ static inline uint64_t MUL128(
 		// ADDIW: Add 32-bit sign-extended 12-bit immediate
 		dst = (int32_t) (src + RVIMM(cpu, instr.Itype));
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		if (instr.Itype.imm == 0)
-		{
-			// this is the official NOP instruction (ADDI x0, x0, 0)
-			if (instr.Itype.rd == 0 && instr.Itype.rs1 == 0) {
-				return snprintf(buffer, len, "NOP");
-			}
-			static std::array<const char*, 8> func3 = {"MV", "SLL", "SLT", "SLT", "XOR", "SRL", "OR", "AND"};
-			return snprintf(buffer, len, "%sW %s, %s (0x%X)",
-							func3[instr.Itype.funct3],
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							int32_t(cpu.reg(instr.Itype.rs1)));
-		}
-		else if (instr.Itype.rs1 != 0 && instr.Itype.funct3 == 1) {
-			return snprintf(buffer, len, "SLLIW %s, %s << %u (0x%" PRIX64 ")",
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							instr.Itype.shift_imm(),
-							uint64_t(cpu.reg(instr.Itype.rs1) << instr.Itype.shift_imm()));
-		} else if (instr.Itype.rs1 != 0 && instr.Itype.funct3 == 5) {
-			return snprintf(buffer, len, "%sW %s, %s >> %u (0x%" PRIX64 ")",
-							(instr.Itype.is_srai() ? "SRAI" : "SRLI"),
-							RISCV::regname(instr.Itype.rd),
-							RISCV::regname(instr.Itype.rs1),
-							instr.Itype.shift_imm(),
-							uint64_t(cpu.reg(instr.Itype.rs1) >> instr.Itype.shift_imm()));
-		} else if (instr.Itype.rs1 != 0) {
-			static std::array<const char*, 8> func3 = {"ADDI", "SLLI", "SLTI", "SLTU", "XORI", "SRLI", "ORI", "ANDI"};
-			if (!(instr.Itype.funct3 == 4 && instr.Itype.signed_imm() == -1)) {
-				return snprintf(buffer, len, "%sW %s, %s%+d (0x%" PRIX64 ")",
-								func3[instr.Itype.funct3],
-								RISCV::regname(instr.Itype.rd),
-								RISCV::regname(instr.Itype.rs1),
-								instr.Itype.signed_imm(),
-								uint64_t(cpu.reg(instr.Itype.rs1) + instr.Itype.signed_imm()));
-			} else {
-				return snprintf(buffer, len, "NOTW %s, %s",
-								RISCV::regname(instr.Itype.rd),
-								RISCV::regname(instr.Itype.rs1));
-			}
-		}
-		static std::array<const char*, 8> func3 = {"LINT", "SLLI", "SLTI", "SLTU", "XORI", "SRLI", "ORI", "ANDI"};
-		return snprintf(buffer, len, "%sW %s, %d (0x%X)",
-						func3[instr.Itype.funct3],
-						RISCV::regname(instr.Itype.rd),
-						instr.Itype.signed_imm(), instr.Itype.signed_imm());
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rri(buffer, len, "addiw", instr);
 	});
 
 	INSTRUCTION(OP_IMM32_SLLIW,
@@ -992,7 +816,10 @@ static inline uint64_t MUL128(
 		const uint32_t src = cpu.reg(instr.Itype.rs1);
 		// SLLIW: Shift-Left Logical 0-31 immediate
 		dst = (int32_t) (src << instr.Itype.shift_imm());
-	}, DECODED_INSTR(OP_IMM32_ADDIW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "slliw", instr, instr.Itype.imm & 0x1F);
+	});
 
 	INSTRUCTION(OP_IMM32_SRLIW,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
@@ -1000,7 +827,10 @@ static inline uint64_t MUL128(
 		const uint32_t src = cpu.reg(instr.Itype.rs1);
 		// SRLIW: Shift-Right Logical 0-31 immediate
 		dst = (int32_t) (src >> instr.Itype.shift_imm());
-	}, DECODED_INSTR(OP_IMM32_ADDIW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "srliw", instr, instr.Itype.imm & 0x1F);
+	});
 
 	INSTRUCTION(OP_IMM32_SRAIW,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
@@ -1008,7 +838,10 @@ static inline uint64_t MUL128(
 		const uint32_t src = cpu.reg(instr.Itype.rs1);
 		// SRAIW: Arithmetic right shift, preserve the sign bit
 		dst = (int32_t)src >> instr.Itype.shift_imm();
-	}, DECODED_INSTR(OP_IMM32_ADDIW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "sraiw", instr, instr.Itype.imm & 0x1F);
+	});
 
 
 	INSTRUCTION(OP_IMM32_SLLI_UW,
@@ -1016,8 +849,12 @@ static inline uint64_t MUL128(
 		auto& dst = cpu.reg(instr.Itype.rd);
 		const uint32_t src = cpu.reg(instr.Itype.rs1);
 		// SLLI.UW: Shift-left Unsigned Word (Immediate)
-		dst = RVREGTYPE(cpu)(src) << instr.Itype.shift_imm();
-	}, DECODED_INSTR(OP_IMM32_ADDIW).printer);
+		// The shift amount is a full 6-bit RV64 shamt, not the 5-bit *W shamt
+		dst = RVREGTYPE(cpu)(src) << instr.Itype.shift64_imm();
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrs(buffer, len, "slli.uw", instr, instr.Itype.imm & 0x3F);
+	});
 
 	INSTRUCTION(OP_IMM32,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
@@ -1051,16 +888,19 @@ static inline uint64_t MUL128(
 			}
 			break;
 		case 0x5:
-			if (instr.Itype.high_bits() == 0x600) // RORIW
+			if (instr.Itype.high_bits() == 0x600 && (instr.Itype.imm & 0x20) == 0) // RORIW
 			{
 				const auto shift = instr.Itype.imm & 31;
-				dst = (int32_t) ((src >> shift) | (src << (32 - shift)));
+				dst = (int32_t) ((src >> shift) | (src << ((32 - shift) & 31)));
 				return;
 			}
 			break;
 		}
 		cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.whole);
-	}, DECODED_INSTR(OP_IMM32_ADDIW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_imm32(buffer, len, instr);
+	});
 
 	INSTRUCTION(OP32,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR {
@@ -1077,18 +917,10 @@ static inline uint64_t MUL128(
 			return;
 		// M-extension
 		case 0x10: // MULW (signed 32-bit multiply, sign-extended)
-			dst = (int32_t) ((int32_t)src1 * (int32_t)src2);
+			dst = (int32_t) (src1 * src2);
 			return;
 		case 0x14: // DIVW
-			// division by zero is not an exception
-			if (LIKELY(src2 != 0)) {
-				// division of -2147483648 by -1 cannot be represented in type 'int'
-				if (LIKELY(!((int32_t)src1 == -2147483648 && (int32_t)src2 == -1))) {
-					dst = (int32_t) ((int32_t)src1 / (int32_t)src2);
-				}
-			} else {
-				dst = (RVREGTYPE(cpu)) -1;
-			}
+			dst = (int32_t) rv_div<uint32_t>(src1, src2);
 			return;
 		case 0x15: // DIVUW
 			if (LIKELY(src2 != 0)) {
@@ -1098,13 +930,7 @@ static inline uint64_t MUL128(
 			}
 			return;
 		case 0x16: // REMW
-			if (LIKELY(src2 != 0)) {
-				if (LIKELY(!((int32_t)src1 == -2147483648 && (int32_t)src2 == -1))) {
-					dst = (int32_t) ((int32_t)src1 % (int32_t)src2);
-				}
-			} else {
-				dst = int32_t(src1);
-			}
+			dst = (int32_t) rv_rem<uint32_t>(src1, src2);
 			return;
 		case 0x17: // REMUW
 			if (LIKELY(src2 != 0)) {
@@ -1116,8 +942,12 @@ static inline uint64_t MUL128(
 		case 0x40: // ADD.UW
 			dst = cpu.reg(instr.Rtype.rs2) + RVREGTYPE(cpu)(src1);
 			return;
-		case 0x44: // ZEXT.H (imm=0x40):
-			dst = uint16_t(src1);
+		case 0x44: // ZEXT.H / PACKW
+			if (instr.Rtype.rs2 == 0) {
+				dst = uint16_t(src1);
+			} else {
+				dst = int32_t(uint16_t(src1) | (uint32_t(uint16_t(src2)) << 16));
+			}
 			return;
 		case 0x102: // SH1ADD.UW
 			dst = cpu.reg(instr.Rtype.rs2) + (RVREGTYPE(cpu)(src1) << 1);
@@ -1137,47 +967,18 @@ static inline uint64_t MUL128(
 		case 0x301: {
 			// ROLW: Rotate left 32-bit
 			const auto shift = src2 & 31;
-			dst = (int32_t) ((src1 << shift) | (src1 >> (32 - shift)));
+			dst = (int32_t) ((src1 << shift) | (src1 >> ((32 - shift) & 31)));
 			} return;
 		case 0x305: {
 			// RORW: Rotate right 32-bit
 			const auto shift = src2 & 31;
-			dst = (int32_t) ((src1 >> shift) | (src1 << (32 - shift)));
+			dst = (int32_t) ((src1 >> shift) | (src1 << ((32 - shift) & 31)));
 			} return;
 		}
 		cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.whole);
 	},
-	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
-		const char* strop = "";
-		switch (instr.Rtype.jumptable_friendly_op()) {
-			case 0x0: strop = "ADD.W"; break;
-			case 0x1: strop = "SLL.W"; break;
-			case 0x5: strop = "SRL.W"; break;
-			case 0x10: strop = "MUL.W"; break;
-			case 0x14: strop = "DIV.W"; break;
-			case 0x15: strop = "DIVU.W"; break;
-			case 0x16: strop = "REM.W"; break;
-			case 0x17: strop = "REMU.W"; break;
-			case 0x40:
-				if (instr.Rtype.rs2 == 0) strop = "ZEXT.W";
-				else                      strop = "ADD.UW";
-				break;
-			case 0x44: strop = "ZEXT.H"; break;
-			case 0x102: strop = "SH1ADD.UW"; break;
-			case 0x104: strop = "SH2ADD.UW"; break;
-			case 0x106: strop = "SH3ADD.UW"; break;
-			case 0x200: strop = "SUB.W"; break;
-			case 0x205: strop = "SRA.W"; break;
-			case 0x301: strop = "ROL.W"; break;
-			case 0x305: strop = "ROR.W"; break;
-			default: strop = "OP.UNKNOWN.W"; break;
-		}
-		return snprintf(buffer, len, "%s %s <- %s, %s (= 0x%" PRIX64 ")",
-						strop,
-						RISCV::regname(instr.Rtype.rd),
-						RISCV::regname(instr.Rtype.rs1),
-						RISCV::regname(instr.Rtype.rs2),
-						uint64_t(cpu.reg(instr.Rtype.rd)));
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_reg32(buffer, len, instr);
 	});
 
 	INSTRUCTION(OP32_ADDW,
@@ -1186,15 +987,42 @@ static inline uint64_t MUL128(
 		const uint32_t src1 = cpu.reg(instr.Rtype.rs1);
 		const uint32_t src2 = cpu.reg(instr.Rtype.rs2);
 		dst = (int32_t) (src1 + src2);
-	}, DECODED_INSTR(OP32).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::rrr(buffer, len, "addw", instr);
+	});
 
 	INSTRUCTION(FENCE,
-	[] (auto&, rv32i_instruction /* instr */) RVINSTR_COLDATTR {
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR {
+		if (instr.Itype.funct3 == 0x1)
+			cpu.machine().memory.mark_execute_segments_stale();
 		// Do a full barrier, for now
 		std::atomic_thread_fence(std::memory_order_seq_cst);
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction) RVPRINTR_ATTR {
-		// printer
-		return snprintf(buffer, len, "FENCE");
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_misc_mem(buffer, len, instr);
+	});
+
+	INSTRUCTION(CBO,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR {
+		switch (instr.Itype.imm) {
+		case RV32I_CBO_INVAL:
+		case RV32I_CBO_CLEAN:
+		case RV32I_CBO_FLUSH:
+			return;
+		case RV32I_CBO_ZERO: {
+			const auto addr = cpu.reg(instr.Itype.rs1)
+				& ~RVREGTYPE(cpu)(RV32I_CBO_BLOCK - 1);
+			auto& memory = cpu.machine().memory;
+			for (unsigned i = 0; i < RV32I_CBO_BLOCK; i += 8)
+				memory.template write<uint64_t> (addr + i, 0);
+			return;
+		}
+		default:
+			cpu.trigger_exception(ILLEGAL_OPCODE, instr.whole);
+		}
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVDISASM::op_misc_mem(buffer, len, instr);
 	});
 }

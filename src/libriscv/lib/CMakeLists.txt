@@ -8,13 +8,15 @@ option(RISCV_DEBUG  "Enable extra checks in the RISC-V machine" OFF)
 # set extensions. Not recommended to disable any.
 option(RISCV_EXT_A  "Enable RISC-V atomic instructions" ON)
 option(RISCV_EXT_C  "Enable RISC-V compressed instructions" ON)
-option(RISCV_EXT_V  "Enable RISC-V vector instructions" OFF)
+option(RISCV_EXT_V  "Enable RISC-V vector instructions" ON)
 # Enable 32-, 64- and 128-bit architecture emulation
 option(RISCV_32I    "Enable 32-bit RISC-V" ON)
 option(RISCV_64I    "Enable 64-bit RISC-V" ON)
 option(RISCV_128I   "Enable 128-bit RISC-V" OFF)
 # Enable Floating-point Control and Status Register emulation
 option(RISCV_FCSR   "Enable FCSR emulation" OFF)
+# Enable logging of system calls, multi-threading and sockets
+option(RISCV_VERBOSE_SYSCALLS "Enable verbose system call logging" OFF)
 # EXPERIMENTAL enables some high-performance interpreter
 # features that may be unstable.
 option(RISCV_EXPERIMENTAL  "Enable experimental features" OFF)
@@ -24,6 +26,10 @@ option(RISCV_MEMORY_TRAPS  "Enable memory page traps" ON)
 # BINARY_TRANSLATION will make libriscv generate portable C-code,
 # and invoke a system compiler to execute a program much faster.
 option(RISCV_BINARY_TRANSLATION  "Enable exp. binary translation" ON)
+# ASMJIT enables an experimental native code generator using asmjit.
+# It is completely independent of RISCV_BINARY_TRANSLATION and can be
+# enabled alongside it for runtime A/B comparison.
+option(RISCV_ASMJIT "Enable exp. native code generation with asmjit" OFF)
 # FLAT_RW_ARENA simplifies the program arena, making the heap area always read-write.
 # Memory before the heap and outside of the arena behaves like before.
 option(RISCV_FLAT_RW_ARENA       "Enable performant flat read-write arena" ON)
@@ -95,6 +101,7 @@ set (SOURCES
 		libriscv/posix/threads.cpp
 		libriscv/posix/socket_calls.cpp
 		libriscv/serialize.cpp
+		libriscv/shared_rodata.cpp
 		libriscv/util/crc32c.cpp
 	)
 if (RISCV_32I)
@@ -175,6 +182,13 @@ if (RISCV_BINARY_TRANSLATION)
 		endif()
 	endif()
 endif()
+if (RISCV_ASMJIT)
+	list(APPEND SOURCES
+		libriscv/asmjit/aj_api.cpp
+		libriscv/asmjit/aj_translate.cpp
+		libriscv/asmjit/aj_emit.cpp
+	)
+endif()
 
 # Generate the settings header
 # RISCV_VERSION_MAJOR and RISCV_VERSION_MINOR are required by libriscv_settings.h.in
@@ -215,6 +229,14 @@ if (RISCV_EXPERIMENTAL AND RISCV_ASM_DISPATCH)
 		RISCV_ASM_DISPATCH=1
 	)
 endif()
+if (RISCV_VERBOSE_SYSCALLS)
+	message(STATUS "libriscv: Verbose system calls enabled")
+	target_compile_definitions(riscv PUBLIC
+		SYSCALL_VERBOSE=1
+		THREADS_DEBUG=1
+		SOCKETCALL_VERBOSE=1
+	)
+endif()
 
 if (RISCV_MULTIPROCESS)
 	find_package(Threads REQUIRED)
@@ -240,13 +262,13 @@ if (RISCV_BINARY_TRANSLATION AND RISCV_LIBTCC)
 	)
 	FetchContent_MakeAvailable(tinycc)
 
-	set(TINYCC_LOCATION    "${CMAKE_BINARY_DIR}/_deps/tinycc-src")
-	set(CONFIG_H_LOCATION "${TINYCC_LOCATION}/config.h")
-	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/config.h.in ${CONFIG_H_LOCATION})
-	set_source_files_properties(${CONFIG_H_LOCATION} PROPERTIES GENERATED TRUE)
-	file(COPY "${TINYCC_LOCATION}/libtcc.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-	file(COPY "${TINYCC_LOCATION}/libtcc1.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-	file(COPY "${TINYCC_LOCATION}/lib-arm64.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  set(TINYCC_LOCATION "${tinycc_SOURCE_DIR}")
+  set(CONFIG_H_LOCATION "${TINYCC_LOCATION}/config.h")
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/config.h.in ${CONFIG_H_LOCATION})
+  set_source_files_properties(${CONFIG_H_LOCATION} PROPERTIES GENERATED TRUE)
+  file(COPY "${TINYCC_LOCATION}/libtcc.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  file(COPY "${TINYCC_LOCATION}/libtcc1.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+  file(COPY "${TINYCC_LOCATION}/lib-arm64.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 
 	target_sources(riscv PRIVATE
 		${tinycc_SOURCE_DIR}/libtcc.c
@@ -299,6 +321,49 @@ if (RISCV_BINARY_TRANSLATION AND RISCV_LIBTCC)
 	)
 endif()
 
+if (RISCV_ASMJIT)
+	# The emitter needs ujit's emit_3i() to be aliasing-correct on x86, which
+	# upstream is not: AND/OR/XOR, the non-BMI2 shift fallback and SBound all
+	# destroy src2 when the destination is the same register. The fork carries
+	# the fix. Point RISCV_ASMJIT_SOURCE_DIR at a local checkout to build
+	# against working-tree asmjit instead of fetching.
+	set(RISCV_ASMJIT_REPOSITORY "https://github.com/fwsGonzo/asmjit.git"
+		CACHE STRING "Git repository to fetch asmjit from")
+	set(RISCV_ASMJIT_TAG "master"
+		CACHE STRING "Git tag/branch of asmjit to fetch")
+	set(RISCV_ASMJIT_SOURCE_DIR ""
+		CACHE PATH "Local asmjit checkout to build against (overrides the fetch)")
+
+	include(FetchContent)
+	set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+	set(ASMJIT_NO_DEPRECATED ON CACHE BOOL "" FORCE)
+	set(ASMJIT_TEST OFF CACHE BOOL "" FORCE)
+	if (RISCV_ASMJIT_SOURCE_DIR)
+		FetchContent_Declare(asmjit
+			SOURCE_DIR "${RISCV_ASMJIT_SOURCE_DIR}"
+		)
+	else()
+		FetchContent_Declare(asmjit
+			GIT_REPOSITORY "${RISCV_ASMJIT_REPOSITORY}"
+			GIT_TAG        "${RISCV_ASMJIT_TAG}"
+		)
+	endif()
+	FetchContent_MakeAvailable(asmjit)
+	# asmjit adds -fmerge-all-constants to its own sources in every non-Debug
+	# config, which does not work with AddressSanitizer on GCC: the constexpr
+	# lookup tables inside its always_inline helpers (RegUtils::signature_of()
+	# and friends) get merged into shared .rodata objects, but GCC still emits
+	# use-after-scope poisoning for the inlined scope. The first caller poisons
+	# the merged table on the way out and every later read of it aborts with a
+	# bogus "stack-use-after-scope" on a global.
+	#if (NOT MSVC)
+	#	target_compile_options(asmjit PRIVATE -fno-merge-all-constants)
+	#endif()
+	# NOTE: Do not set ASMJIT_NO_COMPILER: the Compiler API provides the
+	# register allocator and the ABI handling that the emitter relies on.
+	target_link_libraries(riscv PRIVATE asmjit::asmjit)
+endif()
+
 if (${CMAKE_PROJECT_NAME} STREQUAL "libriscv")
 	install(TARGETS riscv)
 	install(FILES
@@ -337,10 +402,29 @@ if (${CMAKE_PROJECT_NAME} STREQUAL "libriscv")
 		libriscv/rvc.hpp
 		libriscv/rvfd.hpp
 		libriscv/rsp_server.hpp
+		libriscv/shared_rodata.hpp
 		libriscv/threads.hpp
 		libriscv/types.hpp
 
 		DESTINATION include/${PROJECT_NAME}
+	)
+	install(FILES
+		libriscv/guest/guest_arena_object.hpp
+		libriscv/guest/guest_common.hpp
+		libriscv/guest/guest_cpp_common.hpp
+		libriscv/guest/guest_cpp_hash.hpp
+		libriscv/guest/guest_cpp_string.hpp
+		libriscv/guest/guest_cpp_unordered_map.hpp
+		libriscv/guest/guest_cpp_variant.hpp
+		libriscv/guest/guest_cpp_vector.hpp
+		libriscv/guest/guest_rust_attributes.hpp
+		libriscv/guest/guest_rust_box.hpp
+		libriscv/guest/guest_rust_common.hpp
+		libriscv/guest/guest_rust_enum.hpp
+		libriscv/guest/guest_rust_string.hpp
+		libriscv/guest/guest_rust_vec.hpp
+
+		DESTINATION include/${PROJECT_NAME}/guest
 	)
 	install(FILES
 		libriscv/linux/rsp_server.hpp

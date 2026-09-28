@@ -1,8 +1,10 @@
 #pragma once
 #include <memory>
 #include "types.hpp"
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
 #include <unordered_set>
 
 namespace riscv
@@ -73,24 +75,8 @@ namespace riscv
 		bintr_block_func<W> mapping_at(unsigned i) const { return m_translator_mappings.at(i); }
 		bintr_block_func<W> unchecked_mapping_at(unsigned i) const { return m_translator_mappings[i]; }
 		size_t translator_mappings() const noexcept { return m_translator_mappings.size(); }
-		auto* patched_decoder_cache() noexcept { return m_patched_exec_decoder; }
-		void set_patched_decoder_cache(std::unique_ptr<DecoderData<W>[]> cache, DecoderData<W>* dec)
-			{ m_patched_decoder_cache = std::move(cache); m_patched_exec_decoder = dec; }
-
 		void set_record_slowpaths(bool do_record) { m_do_record_slowpaths = do_record; }
 		bool is_recording_slowpaths() const noexcept { return m_do_record_slowpaths; }
-		void wait_for_compilation_complete() {
-			std::unique_lock<std::mutex> lock(m_background_compilation_mutex);
-			m_background_compilation_cv.wait(lock, [this]{ return !m_is_background_compiling; });
-		}
-		bool is_background_compiling() const noexcept { return m_is_background_compiling; }
-		void set_background_compiling(bool is_bg) {
-			std::lock_guard<std::mutex> lock(m_background_compilation_mutex);
-			if (m_is_background_compiling && !is_bg) {
-				m_background_compilation_cv.notify_all();
-			}
-			m_is_background_compiling = is_bg;
-		}
 #ifdef RISCV_DEBUG
 		void insert_slowpath_address(address_t addr) { m_slowpath_addresses.insert(addr); }
 		auto& slowpath_addresses() const noexcept { return m_slowpath_addresses; }
@@ -100,6 +86,65 @@ namespace riscv
 		bool is_libtcc() const noexcept { return false; }
 #endif
 
+#ifdef RISCV_ASMJIT
+		bool is_asmjit_translated() const noexcept { return !m_asmjit_mappings.empty(); }
+		auto& create_asmjit_mappings(size_t n) { m_asmjit_mappings.resize(n); return m_asmjit_mappings; }
+		void set_asmjit_mapping(unsigned i, aj_block_func<W> f) { m_asmjit_mappings.at(i) = f; }
+		aj_block_func<W> unchecked_asmjit_mapping_at(unsigned i) const { return m_asmjit_mappings[i]; }
+		size_t asmjit_mappings() const noexcept { return m_asmjit_mappings.size(); }
+		void set_asmjit_code(std::shared_ptr<AjCode> code) { m_asmjit_code = std::move(code); }
+#else
+		bool is_asmjit_translated() const noexcept { return false; }
+#endif
+
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		// Binary translation or asmjit executable code that was produced in the
+		// background cannot patch the live decoder cache. See livepatch.hpp.
+		auto* patched_decoder_cache() noexcept { return m_patched_exec_decoder; }
+		void set_patched_decoder_cache(std::unique_ptr<DecoderData<W>[]> cache, DecoderData<W>* dec)
+			{ m_patched_decoder_cache = std::move(cache); m_patched_exec_decoder = dec; }
+
+		void wait_for_compilation_complete() {
+			// Fast path: avoid taking the lock when nothing is compiling. The
+			// flag is atomic, so this is safe even while a background thread
+			// is finishing up.
+			if (!m_is_background_compiling)
+				return;
+			std::unique_lock<std::mutex> lock(m_background_compilation_mutex);
+			m_background_compilation_cv.wait(lock, [this]{ return !m_is_background_compiling.load(); });
+		}
+		bool is_background_compiling() const noexcept { return m_is_background_compiling; }
+		void set_background_compiling(bool is_bg) {
+			std::lock_guard<std::mutex> lock(m_background_compilation_mutex);
+			const bool was_compiling = m_is_background_compiling;
+			m_is_background_compiling = is_bg;
+			if (was_compiling && !is_bg) {
+				m_background_compilation_cv.notify_all();
+			}
+		}
+		// The decoder cache is only fully generated *after* binary translation
+		// has been kicked off, which means a background compilation must not
+		// touch the decoder cache until the owning thread says it is complete.
+		bool is_decoder_cache_ready() const noexcept { return m_decoder_cache_ready; }
+		void set_decoder_cache_generator(std::thread::id id) { m_decoder_cache_generator = id; }
+		void set_decoder_cache_ready() {
+			std::lock_guard<std::mutex> lock(m_background_compilation_mutex);
+			m_decoder_cache_ready = true;
+			m_background_compilation_cv.notify_all();
+		}
+		void wait_for_decoder_cache_ready() {
+			if (m_decoder_cache_ready)
+				return;
+			// A user-provided background callback is free to invoke the compilation
+			// step synchronously, in which case we *are* the thread generating the
+			// decoder cache, and waiting for ourselves would deadlock.
+			if (std::this_thread::get_id() == m_decoder_cache_generator.load())
+				return;
+			std::unique_lock<std::mutex> lock(m_background_compilation_mutex);
+			m_background_compilation_cv.wait(lock, [this]{ return m_decoder_cache_ready.load(); });
+		}
+#endif // RISCV_BINARY_TRANSLATION || RISCV_ASMJIT
+
 		bool is_execute_only() const noexcept { return m_is_execute_only; }
 		void set_execute_only(bool is_xo) { m_is_execute_only = is_xo; }
 
@@ -108,6 +153,10 @@ namespace riscv
 
 		bool is_stale() const noexcept { return m_is_stale; }
 		void set_stale(bool is_stale) { m_is_stale = is_stale; }
+
+		// Part of the shared-segment key: unchecked code must not be handed to a sandboxed Machine.
+		bool is_unchecked_memory() const noexcept { return m_unchecked_memory; }
+		void set_unchecked_memory(bool unchecked) { m_unchecked_memory = unchecked; }
 
 	private:
 		address_t m_vaddr_begin = 0;
@@ -126,20 +175,31 @@ namespace riscv
 
 #ifdef RISCV_BINARY_TRANSLATION
 		std::vector<bintr_block_func<W>> m_translator_mappings;
-		std::unique_ptr<DecoderData<W>[]> m_patched_decoder_cache = nullptr;
-		DecoderData<W>* m_patched_exec_decoder = nullptr;
 		mutable void* m_bintr_dl = nullptr;
 #ifdef RISCV_DEBUG
 		std::unordered_set<address_t> m_slowpath_addresses;
 #endif
 		uint32_t m_bintr_hash = 0x0; // CRC32-C of the execute segment + compiler options
 #endif
+#ifdef RISCV_ASMJIT
+		std::vector<aj_block_func<W>> m_asmjit_mappings;
+		// Releases the JitRuntime (and every function in it) when the last
+		// execute segment referencing it goes away.
+		std::shared_ptr<AjCode> m_asmjit_code;
+#endif
 		uint32_t m_crc32c_hash = 0x0; // CRC32-C of the execute segment
 		bool m_is_execute_only = false;
+		bool m_unchecked_memory = false;
 #ifdef RISCV_BINARY_TRANSLATION
 		bool m_do_record_slowpaths = false;
 		mutable bool m_is_libtcc = false;
-		bool m_is_background_compiling = false;
+#endif
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		std::unique_ptr<DecoderData<W>[]> m_patched_decoder_cache = nullptr;
+		DecoderData<W>* m_patched_exec_decoder = nullptr;
+		std::atomic<bool> m_is_background_compiling { false };
+		std::atomic<bool> m_decoder_cache_ready { false };
+		std::atomic<std::thread::id> m_decoder_cache_generator {};
 		mutable std::mutex m_background_compilation_mutex;
 		std::condition_variable m_background_compilation_cv;
 #endif
@@ -180,6 +240,12 @@ namespace riscv
 		other.m_bintr_dl = nullptr;
 		m_bintr_hash = other.m_bintr_hash;
 		m_is_libtcc = other.m_is_libtcc;
+#endif
+#ifdef RISCV_ASMJIT
+		m_asmjit_mappings = std::move(other.m_asmjit_mappings);
+		m_asmjit_code     = std::move(other.m_asmjit_code);
+#endif
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
 		m_patched_decoder_cache = std::move(other.m_patched_decoder_cache);
 		m_patched_exec_decoder = other.m_patched_exec_decoder;
 #endif
@@ -188,13 +254,14 @@ namespace riscv
 	template <int W>
 	inline DecodedExecuteSegment<W>::~DecodedExecuteSegment()
 	{
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		wait_for_compilation_complete();
+#endif
 #ifdef RISCV_BINARY_TRANSLATION
 		extern void  dylib_close(void* dylib, bool is_libtcc);
 		if (m_bintr_dl)
 			dylib_close(m_bintr_dl, m_is_libtcc);
 		m_bintr_dl = nullptr;
-		// Wait for any background compilation to finish
-		wait_for_compilation_complete();
 #endif
 	}
 

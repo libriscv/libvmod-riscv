@@ -2,6 +2,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <libriscv/machine.hpp>
+#include <cerrno>
+#include <chrono>
 extern std::vector<uint8_t> build_and_load(const std::string& code,
 	const std::string& args = "-O2 -static", bool cpp = false);
 using namespace riscv;
@@ -168,7 +170,7 @@ TEST_CASE("Writes to read-only segment", "[Memory]")
 	const auto read_addr = machine.address_of("read_from");
 	REQUIRE(read_addr != 0x0);
 
-	// Reads amd writes to invalid locations
+	// Reads and writes to invalid locations
 	REQUIRE_THROWS_WITH([&] {
 		machine.vmcall<MAX_INSTRUCTIONS>(read_addr, 0);
 	}(), Catch::Matchers::ContainsSubstring("Protection fault"));
@@ -180,4 +182,199 @@ TEST_CASE("Writes to read-only segment", "[Memory]")
 			machine.vmcall<MAX_INSTRUCTIONS>(write_addr, addr);
 		}(), Catch::Matchers::ContainsSubstring("Protection fault"));
 	}
+}
+
+TEST_CASE("Page attributes are bounded by memory_max", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr size_t PAGES_MAX =
+		(MEMORY_MAX / Page::size()) * Memory<RISCV64>::PAGE_TABLE_OVERCOMMIT;
+
+	Machine<RISCV64> machine { empty, {
+		.memory_max = MEMORY_MAX, .use_memory_arena = false
+	} };
+	REQUIRE(machine.memory.pages_max() == PAGES_MAX);
+
+	// Setting attributes on an enormous range must not be able to
+	// exhaust host memory by creating one page per page in the range.
+	REQUIRE_THROWS_WITH([&] {
+		machine.memory.set_page_attr(0x100000, 1ull << 40, {.read = true, .write = false});
+	}(), Catch::Matchers::ContainsSubstring("Out of memory"));
+
+	REQUIRE(machine.memory.pages_active() <= PAGES_MAX);
+}
+
+TEST_CASE("mprotect cannot exhaust host memory", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr size_t PAGES_MAX =
+		(MEMORY_MAX / Page::size()) * Memory<RISCV64>::PAGE_TABLE_OVERCOMMIT;
+	static constexpr unsigned SYSCALL_MPROTECT = 226;
+
+	Machine<RISCV64> machine { empty, {
+		.memory_max = MEMORY_MAX, .use_memory_arena = false
+	} };
+	machine.setup_linux_syscalls(false, false);
+	auto& cpu = machine.cpu;
+
+	// Unaligned address is rejected outright
+	cpu.reg(riscv::REG_ARG0) = 0x100001;
+	cpu.reg(riscv::REG_ARG1) = Page::size();
+	cpu.reg(riscv::REG_ARG2) = 0x3; // PROT_READ | PROT_WRITE
+	machine.system_call(SYSCALL_MPROTECT);
+	REQUIRE(machine.return_value<int>() == -EINVAL);
+
+	// A length that overflows the address space is rejected
+	cpu.reg(riscv::REG_ARG0) = 0x100000;
+	cpu.reg(riscv::REG_ARG1) = ~uint64_t(0) - 0x1000;
+	cpu.reg(riscv::REG_ARG2) = 0x3;
+	machine.system_call(SYSCALL_MPROTECT);
+	REQUIRE(machine.return_value<int>() == -ENOMEM);
+
+	// A huge, but non-overflowing length runs out of memory instead of
+	// allocating a page-table entry for every page in the range.
+	cpu.reg(riscv::REG_ARG0) = 0x100000;
+	cpu.reg(riscv::REG_ARG1) = 1ull << 40;
+	cpu.reg(riscv::REG_ARG2) = 0x1; // PROT_READ (non-default, creates pages)
+	REQUIRE_THROWS_WITH([&] {
+		machine.system_call(SYSCALL_MPROTECT);
+	}(), Catch::Matchers::ContainsSubstring("Out of memory"));
+
+	REQUIRE(machine.memory.pages_active() <= PAGES_MAX);
+}
+
+TEST_CASE("Freeing an enormous range only frees the range", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr uint64_t A = 0x100000;
+	static constexpr uint64_t B = 1ull << 42;
+
+	Machine<RISCV64> machine { empty, {
+		.memory_max = MEMORY_MAX, .use_memory_arena = false
+	} };
+	const size_t before = machine.memory.pages_active();
+
+	machine.memory.set_page_attr(A, 4 * Page::size(), {.read = true, .write = false});
+	machine.memory.set_page_attr(B, 2 * Page::size(), {.read = true, .write = false});
+	REQUIRE(machine.memory.pages_active() == before + 6);
+
+	// Freeing a range much larger than the page table must not visit every
+	// page in the range, and must leave pages outside the range alone.
+	machine.memory.free_pages(A, 1ull << 40);
+	REQUIRE(machine.memory.pages_active() == before + 2);
+	REQUIRE(machine.memory.get_page(B).attr.read == true);
+
+	machine.memory.free_pages(B, 2 * Page::size());
+	REQUIRE(machine.memory.pages_active() == before);
+}
+
+TEST_CASE("Discarding memory zeroes it everywhere", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr uint64_t INSIDE  = 0x500000;
+	static constexpr uint64_t OUTSIDE = 0x40000000;
+
+	Machine<RISCV64> machine { empty, { .memory_max = MEMORY_MAX } };
+	REQUIRE(INSIDE < machine.memory.memory_arena_size());
+	REQUIRE(OUTSIDE > machine.memory.memory_arena_size());
+
+	const std::vector<uint8_t> pattern(Page::size(), 0x41);
+	for (const auto addr : {INSIDE, OUTSIDE})
+	{
+		machine.copy_to_guest(addr, pattern.data(), pattern.size());
+		REQUIRE(machine.memory.read<uint8_t>(addr) == 0x41);
+		REQUIRE(machine.memory.read<uint8_t>(addr + Page::size() - 1) == 0x41);
+
+		// Pages outside the memory arena come from the heap, which has no
+		// host page alignment, so they cannot be discarded with madvise
+		machine.memory.memdiscard(addr, Page::size(), true);
+		REQUIRE(machine.memory.read<uint8_t>(addr) == 0x00);
+		REQUIRE(machine.memory.read<uint8_t>(addr + Page::size() - 1) == 0x00);
+	}
+}
+
+TEST_CASE("MAP_FIXED_NOREPLACE reserves an exact address", "[Memory]")
+{
+	const auto binary = build_and_load(R"M(
+	#include <errno.h>
+	#include <stdio.h>
+	#include <sys/mman.h>
+
+	#ifndef MAP_FIXED_NOREPLACE
+	#define MAP_FIXED_NOREPLACE 0x100000
+	#endif
+
+	int main() {
+		const unsigned long SIZE = 0x100000UL;
+		/* A hint the kernel is free to ignore, to find the arena */
+		char *probe = mmap(0, SIZE, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (probe == MAP_FAILED)
+			return -1;
+		char *ADDR = probe + 16 * SIZE;
+
+		void *first = mmap(ADDR, SIZE, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+		if (first != (void *)ADDR)
+			return -2;
+		*(volatile int *)first = 1234;
+		if (*(volatile int *)first != 1234)
+			return -3;
+
+		/* The region is taken now, so the same request must fail */
+		void *again = mmap(ADDR, SIZE, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+		if (again != MAP_FAILED || errno != EEXIST)
+			return -4;
+
+		/* A kernel-chosen mapping must not come out of the reservation */
+		char *anon = mmap(0, SIZE, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (anon == MAP_FAILED)
+			return -5;
+		if (anon + SIZE > ADDR && anon < ADDR + SIZE)
+			return -6;
+		if (*(volatile int *)first != 1234)
+			return -7;
+
+		return 666;
+	})M");
+
+	Machine<RISCV64> machine { binary, { .memory_max = 32ul << 20 } };
+	machine.setup_linux_syscalls(false, false);
+	machine.setup_linux({"noreplace"}, {});
+	machine.simulate(10'000'000ul);
+
+	REQUIRE(machine.return_value<int>() == 666);
+}
+
+TEST_CASE("Discarding an enormous range only visits existing pages", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr uint64_t A = 0x40000000;
+	static constexpr uint64_t B = 0x80000000;
+	static constexpr uint64_t HUGE = 4ull << 40; /* 4TB */
+
+	Machine<RISCV64> machine { empty, { .memory_max = MEMORY_MAX } };
+	const std::vector<uint8_t> pattern(Page::size(), 0x41);
+	machine.copy_to_guest(A, pattern.data(), pattern.size());
+	machine.copy_to_guest(B, pattern.data(), pattern.size());
+	const size_t before = machine.memory.pages_active();
+
+	// A range this large must not be walked page by page
+	const auto t0 = std::chrono::steady_clock::now();
+	machine.memory.memdiscard(A, HUGE, true);
+	const auto ms = std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::now() - t0).count();
+
+	REQUIRE(ms < 1000.0);
+	REQUIRE(machine.memory.pages_active() == before);
+	REQUIRE(machine.memory.read<uint8_t>(A) == 0x00);
+	REQUIRE(machine.memory.read<uint8_t>(B) == 0x00);
+
+	// Pages outside the range are left alone
+	machine.copy_to_guest(A, pattern.data(), pattern.size());
+	machine.memory.memdiscard(B, HUGE, true);
+	REQUIRE(machine.memory.read<uint8_t>(A) == 0x41);
+	REQUIRE(machine.memory.read<uint8_t>(B) == 0x00);
 }

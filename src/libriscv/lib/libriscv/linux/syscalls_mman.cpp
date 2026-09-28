@@ -3,6 +3,7 @@
 #define LINUX_MAP_ANONYMOUS        0x20
 #define LINUX_MAP_NORESERVE     0x04000
 #define LINUX_MAP_FIXED         0x10
+#define LINUX_MAP_FIXED_NOREPLACE 0x100000
 
 template <int W>
 static void add_mman_syscalls()
@@ -43,11 +44,17 @@ static void add_mman_syscalls()
 			SYSPRINT("<<< mmap(addr 0x%lX, len %zu, ...) = MAP_FAILED\n", (long)addr_g, (size_t)length); \
 			return; \
 		}
+		#define MMAP_IS_TAKEN() { \
+			machine.set_result(-EEXIST); \
+			SYSPRINT("<<< mmap(addr 0x%lX, len %zu, ...) = EEXIST\n", (long)addr_g, (size_t)length); \
+			return; \
+		}
 
 		if (addr_g % Page::size() != 0)
 			MMAP_HAS_FAILED();
 
 		auto& nextfree = machine.memory.mmap_address();
+		const auto prev_nextfree = nextfree;
 		length = (length + PageMask) & ~address_type<W>(PageMask);
 		if (length == 0)
 			MMAP_HAS_FAILED();
@@ -100,17 +107,53 @@ static void add_mman_syscalls()
 				machine.set_result(dst);
 				return;
 			}
-			else
-			{
-				throw MachineException(FEATURE_DISABLED, "mmap() with fd, but file descriptors disabled");
-			}
-		}
-		else if (addr_g == 0)
+		else
 		{
+			// File descriptors are disabled: report failure like the
+			// kernel would, instead of throwing a machine exception
+			MMAP_HAS_FAILED();
+		}
+		}
+		else if (addr_g != 0 && (flags & LINUX_MAP_FIXED_NOREPLACE) != 0)
+		{
+			// MAP_FIXED_NOREPLACE maps at exactly the given address or fails
+			// with EEXIST, and must never be relocated: guests use the error
+			// to probe for a free region.
+			if (addr_g + length < addr_g || addr_g < machine.memory.mmap_start())
+				MMAP_IS_TAKEN();
+			if constexpr (riscv::encompassing_Nbit_arena > 0) {
+				if (addr_g + length > riscv::encompassing_arena_mask)
+					MMAP_IS_TAKEN();
+			}
+			if (!riscv::virtual_paging_enabled
+				&& addr_g + length > machine.memory.memory_arena_size())
+				MMAP_IS_TAKEN();
+			if (addr_g >= nextfree) {
+				// Untouched territory: reserve it by moving the arena cursor
+				// above it, and donate the skipped-over gap to the free list
+				// so that later kernel-chosen mappings can still use it.
+				if (addr_g > nextfree)
+					machine.memory.mmap_cache().insert(nextfree, addr_g - nextfree);
+				nextfree = addr_g + length;
+			} else if (!machine.memory.mmap_cache().carve(addr_g, length)) {
+				// Below the cursor and not entirely free: occupied
+				MMAP_IS_TAKEN();
+			}
+			result = addr_g;
+		}
+		else if (addr_g == 0 || (flags & LINUX_MAP_FIXED) == 0)
+		{
+			// Without MAP_FIXED the address is only a hint that the kernel is
+			// free to ignore, so always allocate inside the mmap arena instead.
+			// Guest hints regularly point outside of it, eg. V8 hints at
+			// randomized addresses spread over the whole 64-bit address space.
 			auto range = machine.memory.mmap_cache().find(length);
 			// Not found in cache, increment MM base address
 			if (range.empty()) {
 				if (nextfree + length < nextfree)
+					MMAP_HAS_FAILED();
+				if (!riscv::virtual_paging_enabled
+					&& nextfree + length > machine.memory.memory_arena_size())
 					MMAP_HAS_FAILED();
 				result = nextfree;
 				nextfree += length;
@@ -119,40 +162,56 @@ static void add_mman_syscalls()
 			{
 				result = range.addr;
 			}
-		} else if ((flags & LINUX_MAP_FIXED) != 0 && addr_g < machine.memory.mmap_start()) {
+		} else if (!riscv::virtual_paging_enabled
+			&& addr_g + length > machine.memory.memory_arena_size()) {
+			MMAP_HAS_FAILED();
+		} else if (addr_g < machine.memory.mmap_start()) {
 			// A fixed range below the mmap arena start, we do nothing except return the address
 			result    = addr_g;
-		} else if (addr_g < machine.memory.mmap_start()) {
-			// Non-fixed range below mmap start is not allowed, ignore and force to next free
-			if (nextfree + length < nextfree)
-				MMAP_HAS_FAILED();
-			result    = nextfree;
-			nextfree += length;
-		} else if ((flags & LINUX_MAP_FIXED) != 0 && addr_g >= machine.memory.mmap_start() && addr_g + length > addr_g && addr_g + length <= nextfree) {
-			// Fixed mapping inside mmap arena
+		} else if (addr_g + length > addr_g && addr_g + length <= nextfree) {
+			// Fixed mapping inside mmap arena: it may land on top of a range
+			// that is sitting in the free list, which must not be handed out
+			// a second time.
+			if (!machine.memory.mmap_cache().carve(addr_g, length))
+				machine.memory.mmap_cache().invalidate(addr_g, length);
 			result = addr_g;
-		} else if ((flags & LINUX_MAP_FIXED) != 0 && addr_g > nextfree) {
-			// Fixed mapping after current end of mmap arena
+		} else if (addr_g + length > addr_g) {
+			// Fixed mapping ending after the current end of the mmap arena
 			// TODO: Evaluate if relaxation is counter-productive with the new cache
 			if constexpr (riscv::encompassing_Nbit_arena > 0) {
 				// We have to force the address to be within the arena
-				if (nextfree + length < nextfree || nextfree + length > riscv::encompassing_arena_mask)
-					MMAP_HAS_FAILED();
-				result = nextfree;
-				nextfree += length;
+				if (addr_g + length > riscv::encompassing_arena_mask) {
+					if (nextfree + length < nextfree || nextfree + length > riscv::encompassing_arena_mask)
+						MMAP_HAS_FAILED();
+					result = nextfree;
+					nextfree += length;
+				} else {
+					if (addr_g > nextfree)
+						machine.memory.mmap_cache().insert(nextfree, addr_g - nextfree);
+					else
+						machine.memory.mmap_cache().invalidate(addr_g, length);
+					result = addr_g;
+					nextfree = std::max(nextfree, address_type<W>(addr_g + length));
+				}
 			} else {
+				if (addr_g > nextfree)
+					machine.memory.mmap_cache().insert(nextfree, addr_g - nextfree);
+				else
+					machine.memory.mmap_cache().invalidate(addr_g, length);
 				result = addr_g;
+				nextfree = std::max(nextfree, address_type<W>(addr_g + length));
 			}
 		} else {
 			MMAP_HAS_FAILED();
 		}
 
+		const bool untouched = (result >= prev_nextfree);
 		// anon pages need to be zeroed
 		if (flags & LINUX_MAP_ANONYMOUS) {
 			machine.memory.memdiscard(result, length, true);
 		}
 		// avoid potentially creating pages when MAP_NORESERVE is set
-		if ((flags & LINUX_MAP_NORESERVE) == 0)
+		if ((flags & LINUX_MAP_NORESERVE) == 0 && !(prot == 0 && untouched))
 		{
 			machine.memory.set_page_attr(result, length, attr);
 		}
@@ -192,6 +251,18 @@ static void add_mman_syscalls()
 		const auto addr = machine.sysarg(0);
 		const auto len  = machine.sysarg(1);
 		const int  prot = machine.template sysarg<int> (2);
+		if (addr % Page::size() != 0) {
+			machine.set_result(-EINVAL);
+			SYSPRINT(">>> mprotect(0x%lX, len=%zu, prot=%x) => %d\n",
+				(long)addr, (size_t)len, prot, (int)machine.return_value());
+			return;
+		}
+		if (addr + len < addr) {
+			machine.set_result(-ENOMEM);
+			SYSPRINT(">>> mprotect(0x%lX, len=%zu, prot=%x) => %d\n",
+				(long)addr, (size_t)len, prot, (int)machine.return_value());
+			return;
+		}
 		machine.memory.set_page_attr(addr, len, {
 			.read  = (prot & 1) != 0,
 			.write = (prot & 2) != 0,

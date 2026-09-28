@@ -28,6 +28,22 @@ An example that builds a RISC-V programs with JIT-enabled LuaJIT inside, and the
 
 A complete production-style integration exercising every major feature: generated host functions, two-phase init, RPC between VMs, guest datatypes, and vmcall latency benchmarking. Built with paging disabled and binary translation off for ~8.6 MB RSS.
 
+## Rust expert example
+
+The expert example with the guest written in Rust, from the same `host_functions.json`. A Python generator translates the C signatures into a Rust library: `extern "C"` declarations, `global_asm!` stubs, the `dyncall_table`, and safe idiomatic wrappers grouped by namespace, so the program calls `io::print("hello")` and `data::fill_string(&mut text)`. The guest's `#[global_allocator]` forwards to the host arena, so a `String` or `Vec` built on either side is usable, growable and freeable on the other. Both generators hash the same signature strings, so a Rust guest and a C++ guest are interchangeable in front of one host.
+
+## Attribute marshalling benchmark
+
+Measures the cost of moving a tree of named attributes across the guest/host boundary two ways: serialized into a flat array of nodes, versus zero-copy, where the host walks the guest's own `std::unordered_map` in place (`GuestStdUnorderedMap`/`GuestStdVariant`/`GuestStdString`) and builds the guest's map directly when the traffic goes the other way. Both directions, three workload shapes, with a checksum and a guest-heap leak check on every path.
+
+Run `./build.sh`. Zero-copy is ~2x the wall-clock in both directions, but sending a tree out drops from thousands of emulated guest instructions to seven, and receiving one halves the guest heap traffic.
+
+## Attribute marshalling benchmark, Rust guest
+
+The same benchmark with the guest written in Rust: a `#[repr(C, u64)]` enum and a `#[repr(C)]` sorted `Vec` of entries, mirrored on the host by `GuestRustAttributes`/`GuestRustEnum`/`GuestRustString`. The guest's `#[global_allocator]` is the host arena, so the host builds the tree in its final shape and the guest takes it with one `Box::from_raw`; the host mirror's `free()` is the counterpart of Rust's drop glue, so neither side needs a hand-written teardown. A layout probe compares the guest's own view of the ABI against the host mirror before anything is measured.
+
+Run `./build.sh`. The numbers land within a few percent of the C++ guest's, which is the point: none of hashbrown's `#[repr(Rust)]` table layout or libstdc++'s hash-caching rule has to be mirrored to get there.
+
 ## WebAPI example
 
 An example that uses a WebServer and Varnish Cache to implement a RISC-V playground.

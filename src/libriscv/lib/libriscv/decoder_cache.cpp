@@ -9,34 +9,60 @@
 #include "util/crc32.hpp"
 #include <inttypes.h>
 #include <mutex>
+#include <tuple>
 #include <unordered_set>
 //#define ENABLE_TIMINGS
 struct SegmentKey {
 	uint64_t pc;
 	uint32_t crc;
 	uint64_t arena_size = 0;
+	// The JIT bakes the arena boundaries into the generated code, so a segment
+	// may only be shared between machines that agree on all of them.
+	uint64_t arena_rdbound = 0;
+	uint64_t arena_wrbound = 0;
+	uint64_t arena_roend = 0;
+	bool unchecked_memory = false;
 
 	template <int W>
-	static SegmentKey from(const riscv::DecodedExecuteSegment<W>& segment, uint64_t arena_size) {
+	static SegmentKey from(const riscv::Memory<W>& memory,
+		const riscv::DecodedExecuteSegment<W>& segment, uint32_t crc) {
 		SegmentKey key;
 		key.pc = uint64_t(segment.exec_begin());
-		key.crc = segment.crc32c_hash();
-		key.arena_size = arena_size;
+		key.crc = crc;
+		key.arena_size = memory.memory_arena_size();
+		key.arena_rdbound = memory.memory_arena_read_boundary();
+		key.arena_wrbound = memory.memory_arena_write_boundary();
+		key.arena_roend = memory.initial_rodata_end();
+		key.unchecked_memory = segment.is_unchecked_memory();
 		return key;
 	}
 
+	template <int W>
+	static SegmentKey from(const riscv::Memory<W>& memory,
+		const riscv::DecodedExecuteSegment<W>& segment) {
+		return from(memory, segment, segment.crc32c_hash());
+	}
+
+	auto as_tuple() const noexcept {
+		return std::tie(pc, crc, arena_size,
+			arena_rdbound, arena_wrbound, arena_roend, unchecked_memory);
+	}
 	bool operator==(const SegmentKey& other) const {
-		return pc == other.pc && crc == other.crc;
+		return as_tuple() == other.as_tuple();
 	}
 	bool operator<(const SegmentKey& other) const {
-		return pc < other.pc || (pc == other.pc && crc < other.crc);
+		return as_tuple() < other.as_tuple();
 	}
 };
 namespace std {
 	template <>
 	struct hash<SegmentKey> {
 		size_t operator()(const SegmentKey& key) const {
-			return key.pc ^ key.crc ^ key.arena_size;
+			size_t h = key.pc ^ key.crc ^ key.arena_size
+				^ (key.unchecked_memory ? 0x9E3779B97F4A7C15ull : 0ull);
+			for (const uint64_t v : {key.arena_rdbound, key.arena_wrbound, key.arena_roend})
+				h = (h * 0x100000001B3ull) ^ v;
+			return h;
 		}
 	};
 }
@@ -82,15 +108,22 @@ namespace riscv
 
 		// Remove a segment if it is the last reference
 		void remove_if_unique(key_t key) {
-			std::lock_guard<std::mutex> lock(mutex);
-			// We are not able to remove the Segment itself, as the mutex
-			// may be locked by another thread. We can, however, lock the
-			// Segments mutex and set the segment to nullptr.
-			auto it = m_segments.find(key);
-			if (it != m_segments.end()) {
-				std::scoped_lock lock(it->second.mutex);
-				if (it->second.segment.use_count() == 1)
-					it->second.segment = nullptr;
+			// The last reference is moved out here and released *after* both
+			// mutexes have been unlocked. Destroying an execute segment can
+			// block for a long time (waiting for a background compilation to
+			// finish) and must never happen while holding these locks.
+			std::shared_ptr<DecodedExecuteSegment<W>> doomed;
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				// We are not able to remove the Segment itself, as the mutex
+				// may be locked by another thread. We can, however, lock the
+				// Segments mutex and set the segment to nullptr.
+				auto it = m_segments.find(key);
+				if (it != m_segments.end()) {
+					std::scoped_lock lock(it->second.mutex);
+					if (it->second.segment.use_count() == 1)
+						doomed = std::move(it->second.segment);
+				}
 			}
 		}
 
@@ -175,6 +208,9 @@ namespace riscv
 #ifdef RISCV_BINARY_TRANSLATION
 		const auto translator_op = RV32I_BC_TRANSLATOR;
 #endif
+#ifdef RISCV_ASMJIT
+		const auto asmjit_op = RV32I_BC_ASMJIT;
+#endif
 
 		if constexpr (compressed_enabled)
 		{
@@ -235,6 +271,10 @@ namespace riscv
 					if (entry->get_bytecode() == translator_op)
 						break;
 				#endif
+				#ifdef RISCV_ASMJIT
+					if (entry->get_bytecode() == asmjit_op)
+						break;
+				#endif
 
 					// A last test for the last instruction, which should have been a block-ending
 					// instruction. Since it wasn't we must force-end the block here.
@@ -293,6 +333,10 @@ namespace riscv
 				if (entry.get_bytecode() == translator_op)
 					idxend = 0;
 			#endif
+			#ifdef RISCV_ASMJIT
+				if (entry.get_bytecode() == asmjit_op)
+					idxend = 0;
+			#endif
 				if (UNLIKELY(idxend == 65535)) {
 					// It's a long sequence of instructions, so end block here.
 					entry.set_bytecode(RV32I_BC_FUNCBLOCK);
@@ -325,78 +369,17 @@ namespace riscv
 	// with minimal bounds-checking, while also enabling accurate
 	// instruction counting.
 	template <int W> RISCV_INTERNAL
-	void Memory<W>::generate_decoder_cache(
-		[[maybe_unused]] const MachineOptions<W>& options,
-		std::shared_ptr<DecodedExecuteSegment<W>>& shared_segment, [[maybe_unused]] bool is_initial)
+	address_type<W> Memory<W>::decode_execute_range(
+		DecodedExecuteSegment<W>& exec, address_t from, address_t to)
 	{
-		TIME_POINT(t0);
-		auto& exec = *shared_segment;
-		if (exec.exec_end() < exec.exec_begin())
-			throw MachineException(INVALID_PROGRAM, "Execute segment was invalid");
-
-		const auto addr  = exec.exec_begin();
-		const auto len   = exec.exec_end() - exec.exec_begin();
-		// We need to allocate room for at least one more decoder cache entry.
-		// This is because jump and branch instructions don't check PC after
-		// not branching. The last entry is an invalid instruction.
-		const size_t plen  = len + sizeof(DecoderData<W>); // Extra entry
-
-		const size_t n_entries = plen / DecoderData<W>::DIVISOR;
-		if (n_entries == 0) {
-			throw MachineException(INVALID_PROGRAM,
-				"Program produced empty decoder cache");
-		}
-		// Allocate the flat decoder cache
-		auto* decoder_cache = exec.create_decoder_cache(
-			new DecoderData<W>[n_entries], n_entries);
-		// Clear the decoder cache! (technically only needed when binary translation is enabled)
-		std::memset(decoder_cache, 0, n_entries * sizeof(DecoderData<W>));
-		// Get a base address relative pointer to the decoder cache
-		// Eg. exec_decoder[addr >> SHIFT] is the first valid entry
-		// so that PC with a simple shift can be used as a direct index.
-		auto* exec_decoder = decoder_cache - addr / DecoderData<W>::DIVISOR;
-		exec.set_decoder(exec_decoder);
-
-		DecoderData<W> invalid_op;
-		invalid_op.set_handler(this->machine().cpu.decode({0}));
-		if (UNLIKELY(invalid_op.m_handler != 0)) {
-			throw MachineException(INVALID_PROGRAM,
-				"The invalid instruction did not have the index zero", invalid_op.m_handler);
-		}
-
-		// PC-relative pointer to instruction bits
+		auto* exec_decoder = exec.decoder_cache();
 		auto* exec_segment = exec.exec_data();
-		TIME_POINT(t1);
-
-#ifdef RISCV_BINARY_TRANSLATION
-		// We do not support binary translation for RV128I
-		// Also, avoid binary translation for execute segments that are likely JIT-compiled
-		const bool allow_translation = is_initial || options.translate_future_segments;
-		if (allow_translation && !exec.is_likely_jit()) {
-			// Attempt to load binary translation
-			// Also, fill out the binary translation SO filename for later
-			std::string bintr_filename;
-			int result = machine().cpu.load_translation(options, &bintr_filename, exec);
-			const bool must_translate = result > 0;
-			if (must_translate)
-			{
-				machine().cpu.try_translate(
-					options, bintr_filename, shared_segment);
-			}
-		}
-	#endif
-
+		const address_t end_addr = exec.exec_end();
 		// When compressed instructions are enabled, many decoder
 		// entries are illegal because they are between instructions.
 		bool was_full_instruction = true;
-
-		/* Generate all instruction pointers for executable code.
-		   Cannot step outside of this area when pregen is enabled,
-		   so it's fine to leave the boundries alone. */
-		TIME_POINT(t2);
-		address_t dst = addr;
-		const address_t end_addr = addr + len;
-		for (; dst < addr + len;)
+		address_t dst = from;
+		for (; dst < to;)
 		{
 			auto& entry = exec_decoder[dst / DecoderData<W>::DIVISOR];
 			entry.m_handler = 0;
@@ -407,10 +390,21 @@ namespace riscv
 				exec_segment, dst, end_addr);
 			rv32i_instruction rewritten = instruction;
 
-#ifdef RISCV_BINARY_TRANSLATION
-			// Translator activation uses a special bytecode
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+			// Native code activation uses a special bytecode
 			// but we must still validate the mapping index.
-			if (entry.get_bytecode() == RV32I_BC_TRANSLATOR && entry.is_invalid_handler() && entry.instr < exec.translator_mappings()) {
+			const auto claimed_bc = entry.get_bytecode();
+			const bool claimed =
+	#ifdef RISCV_BINARY_TRANSLATION
+				(claimed_bc == RV32I_BC_TRANSLATOR && entry.is_invalid_handler()
+				 && entry.instr < exec.translator_mappings()) ||
+	#endif
+	#ifdef RISCV_ASMJIT
+				(claimed_bc == RV32I_BC_ASMJIT && entry.is_invalid_handler()
+				 && entry.instr < exec.asmjit_mappings()) ||
+	#endif
+				false;
+			if (claimed) {
 				if constexpr (compressed_enabled) {
 					dst += 2;
 					if (was_full_instruction) {
@@ -463,6 +457,118 @@ namespace riscv
 			} else
 				dst += 4;
 		}
+		return dst;
+	}
+
+	template <int W> RISCV_INTERNAL
+	void Memory<W>::generate_decoder_cache(
+		[[maybe_unused]] const MachineOptions<W>& options,
+		std::shared_ptr<DecodedExecuteSegment<W>>& shared_segment, [[maybe_unused]] bool is_initial)
+	{
+		TIME_POINT(t0);
+		auto& exec = *shared_segment;
+		if (exec.exec_end() < exec.exec_begin())
+			throw MachineException(INVALID_PROGRAM, "Execute segment was invalid");
+
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		// Binary translation is started in the middle of this function, and when it
+		// runs in the background it must not touch the decoder cache before we are
+		// done generating it. Signal completion on every exit path, including the
+		// ones that throw, or a background compilation would wait forever.
+		struct DecoderCacheReadyGuard {
+			DecodedExecuteSegment<W>& exec;
+			DecoderCacheReadyGuard(DecodedExecuteSegment<W>& e) : exec(e) {
+				exec.set_decoder_cache_generator(std::this_thread::get_id());
+			}
+			~DecoderCacheReadyGuard() { exec.set_decoder_cache_ready(); }
+		} decoder_cache_ready_guard { exec };
+#endif
+
+		const auto addr  = exec.exec_begin();
+		const auto len   = exec.exec_end() - exec.exec_begin();
+		// We need to allocate room for at least one more decoder cache entry.
+		// This is because jump and branch instructions don't check PC after
+		// not branching. The last entry is an invalid instruction.
+		const size_t plen  = len + sizeof(DecoderData<W>); // Extra entry
+
+		const size_t n_entries = plen / DecoderData<W>::DIVISOR;
+		if (n_entries == 0) {
+			throw MachineException(INVALID_PROGRAM,
+				"Program produced empty decoder cache");
+		}
+		// Allocate the flat decoder cache
+		auto* decoder_cache = exec.create_decoder_cache(
+			new DecoderData<W>[n_entries], n_entries);
+		// Clear the decoder cache! (technically only needed when binary translation is enabled)
+		std::memset(decoder_cache, 0, n_entries * sizeof(DecoderData<W>));
+		// Get a base address relative pointer to the decoder cache
+		// Eg. exec_decoder[addr >> SHIFT] is the first valid entry
+		// so that PC with a simple shift can be used as a direct index.
+		auto* exec_decoder = decoder_cache - addr / DecoderData<W>::DIVISOR;
+		exec.set_decoder(exec_decoder);
+
+		DecoderData<W> invalid_op;
+		invalid_op.set_handler(this->machine().cpu.decode({0}));
+		if (UNLIKELY(invalid_op.m_handler != 0)) {
+			throw MachineException(INVALID_PROGRAM,
+				"The invalid instruction did not have the index zero", invalid_op.m_handler);
+		}
+
+		// PC-relative pointer to instruction bits
+		auto* exec_segment = exec.exec_data();
+		TIME_POINT(t1);
+
+#ifdef RISCV_ASMJIT
+		// asmjit is entirely independent of binary translation. The only place the
+		// two subsystems know about each other is this ordering decision: whichever
+		// runs first claims decoder entries, and the other one skips those.
+		bool allow_asmjit = options.asmjit_enabled && !exec.is_likely_jit();
+	#ifdef RISCV_BINARY_TRANSLATION
+		// Background binary translation live-patches by installing a *copy* of the
+		// decoder cache and pointing the segment at it, on another thread, while we
+		// are still filling this one in. All translation types will use entries
+		// in the segment's current cache.
+		if (options.translate_background_callback != nullptr)
+			allow_asmjit = false;
+	#endif
+		if (allow_asmjit && options.asmjit_override_bintr) {
+			machine().cpu.asmjit_translate(options, shared_segment);
+		}
+	#endif
+
+#ifdef RISCV_BINARY_TRANSLATION
+		// We do not support binary translation for RV128I
+		// Also, avoid binary translation for execute segments that are likely JIT-compiled
+		const bool allow_translation = is_initial || options.translate_future_segments;
+		if (allow_translation && !exec.is_likely_jit()) {
+			// Attempt to load binary translation
+			// Also, fill out the binary translation SO filename for later
+			std::string bintr_filename;
+			int result = machine().cpu.load_translation(options, &bintr_filename, exec);
+			const bool must_translate = result > 0;
+			if (must_translate)
+			{
+				machine().cpu.try_translate(
+					options, bintr_filename, shared_segment);
+			}
+		}
+	#endif
+
+#ifdef RISCV_ASMJIT
+		// A cache-loaded C99 translation owns this segment. Running asmjit after
+		// it would turn a Full/AOT load into a hybrid segment reported as JIT.
+		// A cache miss leaves is_binary_translated() false and still falls back
+		// to asmjit as before.
+		if (allow_asmjit && !options.asmjit_override_bintr && !exec.is_binary_translated()) {
+			machine().cpu.asmjit_translate(options, shared_segment);
+		}
+	#endif
+
+		/* Generate all instruction pointers for executable code.
+		   Cannot step outside of this area when pregen is enabled,
+		   so it's fine to leave the boundries alone. */
+		TIME_POINT(t2);
+		const address_t dst = this->decode_execute_range(exec, addr, addr + len);
 		// Make sure the last entry is an invalid instruction
 		// This simplifies many other sub-systems
 		auto& entry = exec_decoder[(addr + len) / DecoderData<W>::DIVISOR];
@@ -486,6 +592,12 @@ namespace riscv
 				if (options.verbose_loader) {
 					printf("libriscv: Added ebreak location at 0x%" PRIx64 "\n", uint64_t(addr));
 				}
+			}
+		}
+
+		if constexpr (W <= 8) {
+			if (options.libc_fastpath && is_initial) {
+				machine().install_libc_fastpath(exec, options.verbose_loader);
 			}
 		}
 
@@ -547,6 +659,8 @@ namespace riscv
 #endif
 		// Create the whole executable memory range
 		auto current_exec = std::make_shared<DecodedExecuteSegment<W>>(vaddr, exlen);
+		if (current_exec->empty())
+			throw MachineException(INVALID_PROGRAM, "Empty execute segment");
 
 		auto* exec_data = current_exec->exec_data(vaddr);
 		std::memset(exec_data - sizeof(rv32i_instruction), 0, sizeof(rv32i_instruction));
@@ -557,6 +671,8 @@ namespace riscv
 		// Create CRC32-C hash of the execute segment
 		const uint32_t hash = crc32c(exec_data, current_exec->exec_end() - current_exec->exec_begin());
 
+		current_exec->set_unchecked_memory(options.translate_unsafe_remove_checks);
+
 		// Get a free slot to reference the execute segment
 		auto& free_slot = this->next_execute_segment();
 
@@ -564,7 +680,7 @@ namespace riscv
 		if (options.use_shared_execute_segments)
 		{
 			// We have to key on the base address of the execute segment as well as the hash
-			const SegmentKey key{uint64_t(current_exec->exec_begin()), hash, memory_arena_size()};
+			const SegmentKey key = SegmentKey::from(*this, *current_exec, hash);
 
 			// In order to prevent others from creating the same execute segment
 			// we need to lock the shared execute segments mutex.
@@ -588,8 +704,10 @@ namespace riscv
 
 			this->generate_decoder_cache(options, free_slot, is_initial);
 
-			// Share the execute segment
-			shared_execute_segments<W>.get_segment(key).unlocked_set(free_slot);
+			// Share the execute segment. NOTE: We already hold segment.mutex,
+			// and we must not take the global mutex here (which get_segment()
+			// does), as that is the reverse lock order of remove_if_unique().
+			segment.unlocked_set(free_slot);
 		}
 		else
 		{
@@ -632,9 +750,24 @@ namespace riscv
 		// destructor could throw, so let's invalidate early
 		machine().cpu.set_execute_segment(*CPU<W>::empty_execute_segment());
 
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		// A background translation holds a reference to the execute segment, but
+		// only a raw pointer to this Machine, which it uses while translating and
+		// activating. It must therefore be finished before we go away, otherwise
+		// it will end up using a destroyed Machine. Waiting here (before any of
+		// the shared execute segment mutexes are taken) also guarantees that the
+		// segment destructor never blocks while holding those locks.
+		if (m_main_exec_segment)
+			m_main_exec_segment->wait_for_compilation_complete();
+		for (auto& segment : m_exec) {
+			if (segment)
+				segment->wait_for_compilation_complete();
+		}
+#endif
+
 		auto& main_segment = m_main_exec_segment;
 		if (main_segment) {
-			const SegmentKey key = SegmentKey::from(*main_segment, memory_arena_size());
+			const SegmentKey key = SegmentKey::from(*this, *main_segment);
 			main_segment = nullptr;
 			shared_execute_segments<W>.remove_if_unique(key);
 		}
@@ -643,7 +776,7 @@ namespace riscv
 			try {
 				auto& segment = m_exec.back();
 				if (segment) {
-					const SegmentKey key = SegmentKey::from(*segment, memory_arena_size());
+					const SegmentKey key = SegmentKey::from(*this, *segment);
 					segment = nullptr;
 					shared_execute_segments<W>.remove_if_unique(key);
 				}
@@ -655,9 +788,61 @@ namespace riscv
 	}
 
 	template <int W>
+	void Memory<W>::mark_execute_segments_stale() noexcept
+	{
+		// We intentionally ignore the main execute segment,
+		// as this is a sandbox, not a toy emulator.
+		for (auto& segment : m_exec) {
+			if (segment)
+				segment->set_stale(true);
+		}
+	}
+
+	template <int W>
+	static void flush_execute_segment(Memory<W>& memory,
+		DecodedExecuteSegment<W>& segment, address_type<W> begin, address_type<W> end) noexcept
+	{
+		using address_t = address_type<W>;
+		if (segment.exec_begin() >= end || begin >= segment.exec_end())
+			return;
+		const address_t lo = begin > segment.exec_begin()
+			? begin : segment.exec_begin();
+		const address_t hi = end < segment.exec_end()
+			? end : segment.exec_end();
+		memory.machine().penalize((hi - lo) / 4);
+		try {
+			if (memory.memcmp(segment.exec_data(lo), lo, hi - lo) != 0)
+				segment.set_stale(true);
+		} catch (...) {
+			segment.set_stale(true);
+		}
+	}
+
+	template <int W>
+	void Memory<W>::flush_execute_segments(address_t begin, address_t end) noexcept
+	{
+		if (m_main_exec_segment)
+			flush_execute_segment<W>(*this, *m_main_exec_segment, begin, end);
+		for (auto& segment : m_exec) {
+			if (segment)
+				flush_execute_segment<W>(*this, *segment, begin, end);
+		}
+	}
+
+	template <int W>
 	void Memory<W>::evict_execute_segment(DecodedExecuteSegment<W>& segment)
 	{
-		const SegmentKey key = SegmentKey::from(segment, memory_arena_size());
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+		// See evict_execute_segments(): a background translation must not outlive
+		// the Machine it was started from.
+		segment.wait_for_compilation_complete();
+#endif
+		const SegmentKey key = SegmentKey::from(*this, segment);
+		if (m_main_exec_segment.get() == &segment) {
+			m_main_exec_segment = nullptr;
+			shared_execute_segments<W>.remove_if_unique(key);
+			return;
+		}
 		for (auto& seg : m_exec) {
 			if (seg.get() == &segment) {
 				seg = nullptr;

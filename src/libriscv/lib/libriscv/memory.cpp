@@ -2,6 +2,7 @@
 
 #include "decoder_cache.hpp"
 #include "internal_common.hpp"
+#include <algorithm>
 #include <inttypes.h>
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__wasm__)
 #define DEMANGLE_ENABLED
@@ -15,7 +16,20 @@ __cxa_demangle(const char *name, char *buf, size_t *n, int *status);
 
 namespace riscv
 {
-	[[maybe_unused]] static constexpr uint64_t UNBOUNDED_ARENA_SIZE = (1ULL << encompassing_Nbit_arena) + Page::size();
+	// The arena data pointer is offset OVERALLOCATE into the mapping, so the
+	// mapping needs one extra page on each side of the guest address space in
+	// order to absorb the tail of multi-byte accesses at the last guest
+	// address without bounds-checking the access size on every access.
+	[[maybe_unused]] static constexpr uint64_t UNBOUNDED_ARENA_SIZE = (1ULL << encompassing_Nbit_arena) + 2 * Page::size();
+
+	// True when every byte in the range is zero.
+	[[maybe_unused]] static bool is_zeroed(const uint8_t* data, size_t len) noexcept
+	{
+		for (size_t i = 0; i < len; i++)
+			if (data[i] != 0)
+				return false;
+		return true;
+	}
 
 	template <int W>
 	Memory<W>::Memory(Machine<W>& mach, std::string_view bin,
@@ -25,6 +39,15 @@ namespace riscv
 		  m_binary {bin}
 	{
 #ifdef RISCV_VIRTUAL_PAGING
+		// Bound the page table, including attribute-only pages that are
+		// created outside of the page fault handler (eg. mmap, mprotect)
+		if (options.memory_max != 0)
+		{
+			const size_t pgmax = std::max(size_t(1), size_t(options.memory_max / Page::size()));
+			this->m_pages_max = (pgmax <= size_t(-1) / PAGE_TABLE_OVERCOMMIT)
+				? pgmax * PAGE_TABLE_OVERCOMMIT : size_t(-1);
+		}
+
 		if (options.page_fault_handler != nullptr)
 		{
 			this->m_page_fault_handler = std::move(options.page_fault_handler);
@@ -61,10 +84,12 @@ namespace riscv
 					this->m_arena.data = (PageData *)(base_ptr + Memory::OVERALLOCATE);
 					this->m_arena.pages = (1ULL << encompassing_Nbit_arena) / Page::size();
 				} else {
-					// Over-allocate by 1 page in order to avoid bounds-checking with size
-					// The extra page also provides over-allocation on both sides
-					const size_t len = (pages_max + 1) * Page::size();
-					auto* base_ptr = (uint8_t *)mmap(NULL, len, PROT_READ | PROT_WRITE,
+				// Over-allocate by one page on each side in order to avoid
+				// bounds-checking with size: the front page absorbs accesses
+				// before the arena, and the tail page absorbs the tail of
+				// multi-byte accesses at the last guest address.
+				const size_t len = (pages_max + 2) * Page::size();
+				auto* base_ptr = (uint8_t *)mmap(NULL, len, PROT_READ | PROT_WRITE,
 						MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
 					this->m_arena.pages = pages_max;
 					// mmap() returns MAP_FAILED (-1) when mapping fails
@@ -88,13 +113,13 @@ namespace riscv
 					this->m_arena.data = (PageData *)(base_ptr + Memory::OVERALLOCATE);
 					this->m_arena.pages = (1ULL << encompassing_Nbit_arena) / Page::size();
 				} else {
-					// TODO: XXX: Investigate if this is a time sink
-					auto* base_ptr = (uint8_t *)new PageData[pages_max + 1];
-					// Adjust pointer forward by OVERALLOCATE to provide over-allocation on both sides
-					// while keeping arena at same logical address (relative to zero)
-					this->m_arena.data = (PageData *)(base_ptr + Memory::OVERALLOCATE);
-					this->m_arena.pages = pages_max;
-				}
+				// TODO: XXX: Investigate if this is a time sink
+				auto* base_ptr = (uint8_t *)new PageData[pages_max + 2];
+				// Adjust pointer forward by OVERALLOCATE to provide over-allocation on both sides
+				// while keeping arena at same logical address (relative to zero)
+				this->m_arena.data = (PageData *)(base_ptr + Memory::OVERALLOCATE);
+				this->m_arena.pages = pages_max;
+			}
 #endif
 			}
 
@@ -107,7 +132,7 @@ namespace riscv
 				this->m_page_fault_handler =
 				[anywhere_pages] (auto& mem, const address_t page, bool init) -> Page&
 				{
-					if (mem.pages_active() < anywhere_pages || mem.owned_pages_active() < anywhere_pages)
+					if (mem.pages_active() < anywhere_pages || mem.owned_pages_below(anywhere_pages))
 					{
 						// Within linear arena at the start
 						if (page < mem.m_arena.pages)
@@ -130,7 +155,7 @@ namespace riscv
 				this->m_page_fault_handler =
 					[pages_max](auto &mem, const address_t page, bool init) -> Page &
 				{
-					if (mem.pages_active() < pages_max || mem.owned_pages_active() < pages_max)
+					if (mem.pages_active() < pages_max || mem.owned_pages_below(pages_max))
 					{
 						// Create page on-demand
 						return mem.allocate_page(page,
@@ -163,6 +188,13 @@ namespace riscv
 		m_original_machine {false},
 		m_binary{other.memory.binary()}
 	{
+		if (UNLIKELY(options.use_memory_arena &&
+			other.memory.uses_flat_memory_arena()))
+		{
+			throw MachineException(ILLEGAL_OPERATION,
+				"Forked machines cannot use a non-empty flat memory arena",
+				other.memory.memory_arena_size());
+		}
 #ifdef RISCV_EXT_ATOMICS
 		this->m_atomics = other.memory.m_atomics;
 #endif
@@ -189,7 +221,7 @@ namespace riscv
 				// munmap() the entire address space
 				munmap(base_ptr, UNBOUNDED_ARENA_SIZE);
 			} else {
-				munmap(base_ptr, (this->m_arena.pages + 1) * Page::size());
+				munmap(base_ptr, (this->m_arena.pages + 2) * Page::size());
 			}
 #else
 			// Adjust back to the original base pointer (subtract OVERALLOCATE)
@@ -283,7 +315,12 @@ namespace riscv
 			// Write directly to the arena (rodata boundary set after copy)
 			if (UNLIKELY(vaddr + len > memory_arena_size()))
 				throw MachineException(INVALID_PROGRAM, "ELF segment exceeds arena size");
-			std::memcpy(&((char*)m_arena.data)[vaddr], src, len);
+			// A shared image already holds the bytes below its end, read-only
+			const address_t shared_end = this->shared_rodata_end();
+			const size_t skip = (vaddr < shared_end)
+				? std::min(len, size_t(shared_end - vaddr)) : 0u;
+			if (skip < len)
+				std::memcpy(&((char*)m_arena.data)[vaddr + skip], src + skip, len - skip);
 		} else {
 			// Load into virtual memory
 			this->memcpy(vaddr, src, len);
@@ -318,7 +355,7 @@ namespace riscv
 		if (W <= 8 && !options.ignore_text_section)
 		{
 			// Look for a .text section inside this segment:
-			const auto* texthdr = section_by_name(".text");
+			const auto* texthdr = section_by_name_validated(".text");
 			if (texthdr != nullptr
 				// Validate that the .text section is inside this
 				// execute segment.
@@ -328,22 +365,6 @@ namespace riscv
 				data = m_binary.data() + texthdr->sh_offset;
 				vaddr = this->elf_base_address(texthdr->sh_addr);
 				exlen = texthdr->sh_size;
-				// Work-around for Zig's __lcxx_override section
-				// It comes right after .text, so we can merge them
-				// TODO: Automatically merge sections that are adjacent
-				const auto *lcxxhdr = section_by_name("__lcxx_override");
-				if (lcxxhdr != nullptr && lcxxhdr->sh_addr == texthdr->sh_addr + texthdr->sh_size)
-				{
-					const unsigned size = texthdr->sh_size + lcxxhdr->sh_size;
-					if (size <= hdr->p_filesz && texthdr->sh_addr + size <= vaddr + hdr->p_filesz)
-					{
-						// Merge the two sections
-						exlen = size;
-					} else if (options.verbose_loader) {
-						printf("* __lcxx_override section is outside of program header: %p -> %p where %zu <= %zu\n",
-							(void*)uintptr_t(vaddr), (void*)uintptr_t(vaddr + exlen), size_t(size), size_t(hdr->p_filesz));
-					}
-				}
 			}
 			//printf("* Found .text section inside segment: %p -> %p\n",
 			//	(void*)uintptr_t(vaddr), (void*)uintptr_t(vaddr + exlen));
@@ -360,6 +381,158 @@ namespace riscv
 	}
 
 	// ELF32 and ELF64 loader
+	template <int W> RISCV_INTERNAL
+	void Memory<W>::prepare_shared_rodata(const MachineOptions<W>& options,
+		const typename Elf::Header* elf)
+	{
+		// With virtual paging the arena is loaned out through the page table,
+		// instead of being the only home of guest memory
+		if constexpr (virtual_paging_enabled)
+			return;
+		// An encompassing arena stores without consulting the write boundary,
+		// so a read-only mapping turns an ordinary guest store into a crash
+		if constexpr (encompassing_Nbit_arena != 0)
+			return;
+
+		if (!options.use_shared_rodata || !options.load_program)
+			return;
+		if (!this->uses_flat_memory_arena() || !shared_rodata_supported())
+			return;
+
+		// One read-only segment, and where in the binary its bytes come from.
+		struct RoSeg {
+			address_t vaddr;
+			uint64_t  offset;
+			uint64_t  size;
+		};
+		std::vector<RoSeg> segments;
+
+		const auto* phdr = (typename Elf::ProgramHeader*) (m_binary.data() + elf->e_phoff);
+		address_t rodata_end = 0;
+		address_t writable_begin = ~address_t(0);
+
+		for (const auto* hdr = phdr; hdr < phdr + elf->e_phnum; hdr++)
+		{
+			if (hdr->p_type != Elf::PT_LOAD)
+				continue;
+			const address_t vaddr = this->elf_base_address(hdr->p_vaddr);
+
+			// A writable segment can sit anywhere: remember the lowest one, as
+			// its first page can never be shared
+			if (hdr->p_flags & Elf::PF_W) {
+				writable_begin = std::min(writable_begin, vaddr);
+				continue;
+			}
+			// The conditions in binary_load_ph() that extend the read-only
+			// boundary: loaded, readable and not writable
+			if (hdr->p_filesz == 0 || (hdr->p_flags & Elf::PF_R) == 0)
+				continue;
+			// binary_load_ph() rejects segments outside the binary too, but only
+			// runs after us. 64-bit arithmetic, as the sum of two 32-bit ELF
+			// fields wraps in a 32-bit binary.
+			const uint64_t file_offset = uint64_t(hdr->p_offset);
+			const uint64_t file_end = file_offset + uint64_t(hdr->p_filesz);
+			if (file_end < file_offset || file_end > m_binary.size())
+				continue;
+			if (vaddr + hdr->p_filesz < vaddr)
+				continue;
+
+			rodata_end = std::max(rodata_end, address_t(vaddr + hdr->p_filesz));
+			segments.push_back(RoSeg {
+				.vaddr = vaddr, .offset = file_offset, .size = uint64_t(hdr->p_filesz)
+			});
+		}
+
+		if (rodata_end == 0)
+			return;
+		// Interleaved segments, which a single write boundary cannot express
+		if (writable_begin < rodata_end)
+			return;
+
+		// Only whole pages can be shared
+		static constexpr address_t page_mask = ~address_t(Page::size()-1);
+		address_t shared_end = rodata_end & page_mask;
+		if (writable_begin != ~address_t(0))
+			shared_end = std::min(shared_end, address_t(writable_begin & page_mask));
+
+		if (shared_end == 0 || shared_end > this->memory_arena_size())
+			return;
+
+		// Sorted by address, so that the layout does not depend on the order of
+		// the program headers, and verify() below can walk it in one pass
+		std::sort(segments.begin(), segments.end(),
+			[] (const RoSeg& a, const RoSeg& b) { return a.vaddr < b.vaddr; });
+
+		std::vector<RoSeg> shared_segments;
+		std::vector<RodataSegment> layout;
+		for (const auto& seg : segments) {
+			if (seg.vaddr >= shared_end)
+				continue;
+			const uint64_t size = std::min(seg.size, uint64_t(shared_end - seg.vaddr));
+			shared_segments.push_back(RoSeg { seg.vaddr, seg.offset, size });
+			layout.push_back(RodataSegment { uint64_t(seg.vaddr), size });
+		}
+
+		// Nothing of the program itself lands inside the shared region
+		if (layout.empty())
+			return;
+
+		this->m_rodata_key = RodataKey {
+			.rodata_end = uint64_t(shared_end),
+			.arena_size = uint64_t(this->memory_arena_size()),
+			.segments   = std::move(layout),
+		};
+
+		// The layout only narrows the search: an image belongs to this program
+		// only when every shared byte matches, gaps included. Anything weaker
+		// would hand one programs memory to another.
+		auto verify = [&] (const uint8_t* image, size_t len) -> bool {
+			if (len != size_t(shared_end))
+				return false;
+			uint64_t pos = 0;
+			for (const auto& seg : shared_segments) {
+				if (seg.vaddr < pos || seg.vaddr + seg.size > len)
+					return false;
+				if (!is_zeroed(image + pos, size_t(seg.vaddr - pos)))
+					return false;
+				if (std::memcmp(image + seg.vaddr, m_binary.data() + seg.offset, seg.size) != 0)
+					return false;
+				pos = seg.vaddr + seg.size;
+			}
+			return is_zeroed(image + pos, size_t(len - pos));
+		};
+
+		// Mapping it now also lets the loader skip the segments it covers
+		auto image = find_shared_rodata_image(this->m_rodata_key, verify);
+		if (image == nullptr)
+			return;
+		if (!image->map_over(this->m_arena.data))
+			return;
+		this->m_rodata_image = std::move(image);
+
+		if (UNLIKELY(options.verbose_loader)) {
+			printf("* Attached shared read-only memory of %zu bytes\n", size_t(shared_end));
+		}
+	}
+
+	template <int W> RISCV_INTERNAL
+	void Memory<W>::publish_shared_rodata()
+	{
+		// Already sharing, or not a candidate at all
+		if (this->m_rodata_image != nullptr || this->m_rodata_key.rodata_end == 0)
+			return;
+
+		// The arena now holds the finished read-only region, relocations and all
+		const size_t len = size_t(this->m_rodata_key.rodata_end);
+		auto image = create_shared_rodata_image(this->m_rodata_key, this->m_arena.data, len);
+		if (image == nullptr)
+			return;
+
+		// Invisible to us: the bytes are the ones we just copied out of here
+		if (image->map_over(this->m_arena.data))
+			this->m_rodata_image = std::move(image);
+	}
+
 	template <int W> RISCV_INTERNAL
 	void Memory<W>::binary_loader(const MachineOptions<W>& options)
 	{
@@ -410,6 +583,9 @@ namespace riscv
 		if (UNLIKELY(elf->e_phoff + program_headers * sizeof(typename Elf::ProgramHeader) > m_binary.size())) {
 			throw MachineException(INVALID_PROGRAM, "ELF program-headers are outside the binary");
 		}
+		if (UNLIKELY(elf->e_phoff % alignof(typename Elf::ProgramHeader) != 0)) {
+			throw MachineException(INVALID_PROGRAM, "ELF program-headers are not aligned");
+		}
 
 		// Load program segments
 		const auto* phdr = (typename Elf::ProgramHeader*) (m_binary.data() + elf->e_phoff);
@@ -418,6 +594,9 @@ namespace riscv
 		// is_dynamic() is used to determine the ELF base address
 		this->m_start_address = this->elf_base_address(elf->e_entry);
 		this->m_heap_address = 0;
+
+		// Before loading, so that the loader can skip the shared segments
+		this->prepare_shared_rodata(options, elf);
 
 		for (const auto* hdr = phdr; hdr < phdr + program_headers; hdr++)
 		{
@@ -469,9 +648,20 @@ namespace riscv
 		// TODO: We should check if the heap starts too close to the end
 		// of the address space now, and move it around if necessary.
 		this->m_mmap_address = m_heap_address + BRK_MAX;
+		this->m_brk_address  = m_heap_address;
 
 		// Default stack
 		this->m_stack_address = mmap_allocate(options.stack_size) + options.stack_size;
+
+		// The arena boundaries are final once every PT_LOAD is in place, and they
+		// must be settled before any execute segment is created: the JIT bakes them
+		// into the generated code and keys shared segments on them.
+		if (this->uses_flat_memory_arena() && this->memory_arena_size() >= m_arena.initial_rodata_end) {
+			this->m_arena.read_boundary = std::min(this->memory_arena_size(), size_t(this->memory_arena_size() - RWREAD_BEGIN));
+			this->m_arena.write_boundary = std::min(this->memory_arena_size(), size_t(this->memory_arena_size() - m_arena.initial_rodata_end));
+		} else {
+			this->m_arena.initial_rodata_end = 0;
+		}
 
 		if (!options.default_exit_function.empty())
 		{
@@ -491,6 +681,7 @@ namespace riscv
 		{
 			auto host_page = this->mmap_allocate(Page::size());
 			this->m_exit_address = host_page;
+			this->m_sigreturn_address = host_page + SIGRETURN_OFFSET;
 #ifdef RISCV_VIRTUAL_PAGING
 			// Insert host code page, with exit function, enabling VM calls.
 			this->install_shared_page(page_number(host_page), Page::host_page());
@@ -498,6 +689,10 @@ namespace riscv
 			// Write exit code directly into the arena
 			static constexpr uint8_t exit_code[] = {
 				0x73, 0x00, 0xf0, 0x7f, // STOP: 0x7ff00073
+				0x6f, 0xf0, 0xdf, 0xff, // JMP -4: 0xffdff06f
+				// Signal trampoline, at Memory::SIGRETURN_OFFSET
+				0x93, 0x08, 0xb0, 0x08, // LI a7, 139 (rt_sigreturn)
+				0x73, 0x00, 0x00, 0x00, // ECALL
 				0x6f, 0xf0, 0xdf, 0xff, // JMP -4: 0xffdff06f
 			};
 			if (host_page + sizeof(exit_code) <= memory_arena_size()) {
@@ -507,13 +702,6 @@ namespace riscv
 			this->create_execute_segment(options,
 				exit_code, host_page, sizeof(exit_code), false);
 #endif
-		}
-
-		if (this->uses_flat_memory_arena() && this->memory_arena_size() >= m_arena.initial_rodata_end) {
-			this->m_arena.read_boundary = std::min(this->memory_arena_size(), size_t(this->memory_arena_size() - RWREAD_BEGIN));
-			this->m_arena.write_boundary = std::min(this->memory_arena_size(), size_t(this->memory_arena_size() - m_arena.initial_rodata_end));
-		} else {
-			this->m_arena.initial_rodata_end = 0;
 		}
 
 		// Now that we know the boundries of the program, generate
@@ -531,6 +719,15 @@ namespace riscv
 			}
 		}
 
+		// Offer the region to later machines, unless already sharing one
+		const bool was_sharing = this->shared_rodata_end() != 0;
+		this->publish_shared_rodata();
+
+		if (UNLIKELY(options.verbose_loader) && !was_sharing && this->shared_rodata_end() != 0) {
+			printf("* Created shared read-only memory of %zu bytes\n",
+				size_t(this->shared_rodata_end()));
+		}
+
 		if (UNLIKELY(options.verbose_loader)) {
 			printf("* Entry is at %p\n",
 				(void*)uintptr_t(this->start_address()));
@@ -542,6 +739,8 @@ namespace riscv
 		const Machine<W>& master, const MachineOptions<W>& options)
 	{
 #ifdef RISCV_VIRTUAL_PAGING
+		this->m_pages_max = master.memory.m_pages_max;
+
 		if (options.minimal_fork == false)
 		{
 			this->m_page_fault_handler = master.memory.m_page_fault_handler;
@@ -574,7 +773,9 @@ namespace riscv
 		this->m_start_address = master.memory.m_start_address;
 		this->m_stack_address = master.memory.m_stack_address;
 		this->m_exit_address = master.memory.m_exit_address;
+		this->m_sigreturn_address = master.memory.m_sigreturn_address;
 		this->m_heap_address = master.memory.m_heap_address;
+		this->m_brk_address  = master.memory.m_brk_address;
 		this->m_mmap_address = master.memory.m_mmap_address;
 		this->m_mmap_cache   = master.memory.m_mmap_cache;
 
@@ -583,6 +784,9 @@ namespace riscv
 		this->m_exec = master.memory.m_exec;
 
 		if (options.use_memory_arena) {
+			// A fork references the arena of its master, image and all
+			this->m_rodata_key = master.memory.m_rodata_key;
+			this->m_rodata_image = master.memory.m_rodata_image;
 			this->m_arena.data = master.memory.m_arena.data;
 			this->m_arena.pages = master.memory.m_arena.pages;
 			this->m_arena.read_boundary = master.memory.m_arena.read_boundary;
@@ -599,27 +803,16 @@ namespace riscv
 	{
 		if (!Elf::validate(this->m_binary))
 			return {};
-
-		const auto* sym_hdr = section_by_name(".symtab");
-		if (sym_hdr == nullptr) return {};
-		const auto* str_hdr = section_by_name(".strtab");
-		if (str_hdr == nullptr) return {};
 		// backtrace can sometimes find null addresses
 		if (address == 0x0) return {};
-		// ELF with no symbols
-		if (UNLIKELY(sym_hdr->sh_size == 0)) return {};
 
 		// Add the correct offset to address for dynamically loaded programs
 		address = this->elf_base_address(address);
 
-		const auto* symtab = elf_offset<typename Elf::Sym>(sym_hdr->sh_offset);
-		const size_t symtab_ents = sym_hdr->sh_size / sizeof(typename Elf::Sym);
-		const char* strtab = elf_offset<char>(str_hdr->sh_offset);
-
 		const auto result =
-			[] (const char* strtab, address_t addr, const auto* sym)
+			[] (const char* symname, address_t addr, const auto& sym)
 		{
-			const char* symname = &strtab[sym->st_name];
+			if (symname == nullptr) symname = "(invalid)";
 			std::string result;
 #ifdef DEMANGLE_ENABLED
 			if (char* dma = __cxa_demangle(symname, nullptr, nullptr, nullptr); dma != nullptr) {
@@ -633,35 +826,25 @@ namespace riscv
 #endif
 			return Callsite {
 				.name = result,
-				.address = static_cast<address_t>(sym->st_value),
-				.offset = (uint32_t) (addr - sym->st_value),
-				.size   = size_t(sym->st_size)
+				.address = static_cast<address_t>(sym.st_value),
+				.offset = (uint32_t) (addr - sym.st_value),
+				.size   = size_t(sym.st_size)
 			};
 		};
 
 		const typename Elf::Sym* best = nullptr;
-		for (size_t i = 0; i < symtab_ents; i++)
-		{
-			if (Elf::SymbolType(symtab[i].st_info) != Elf::STT_FUNC) continue;
-			/*printf("Testing %#X vs  %#X to %#X = %s\n",
-					address, symtab[i].st_value,
-					symtab[i].st_value + symtab[i].st_size, symname);*/
+		const char* best_name = nullptr;
+		for_each_symbol([&] (const auto& sym, const char* symname) {
+			if (Elf::SymbolType(sym.st_info) != Elf::STT_FUNC) return;
 
-			if (address >= symtab[i].st_value &&
-				address < symtab[i].st_value + symtab[i].st_size)
-			{
-				// The current symbol was the best match
-				return result(strtab, address, &symtab[i]);
-			}
-			else if (address >= symtab[i].st_value && (!best ||
-				symtab[i].st_value > best->st_value))
-			{
+			if (address >= sym.st_value && (!best || sym.st_value > best->st_value)) {
 				// best guess (symbol + 0xOff)
-				best = &symtab[i];
+				best = &sym;
+				best_name = symname;
 			}
-		}
+		});
 		if (best)
-			return result(strtab, address, best);
+			return result(best_name, address, *best);
 		return {};
 	}
 	template <int W>

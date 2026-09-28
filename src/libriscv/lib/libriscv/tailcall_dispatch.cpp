@@ -127,6 +127,12 @@ namespace riscv
 #define REGISTERS() cpu.registers()
 #define VECTORS()   cpu.registers().rvv()
 #define MACHINE()   cpu.machine()
+#define RECONSTRUCT_PC() ((d - exec->decoder_cache()) << DecoderData<W>::SHIFT)
+#define ENTER_NEW_EXECUTE_SEGMENT()                            \
+	exec = resolve_execute_segment<W>(cpu, pc);                \
+	d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];   \
+	BEGIN_BLOCK();                                             \
+	EXECUTE_CURRENT();
 
 
 #include "bytecode_impl.cpp"
@@ -164,19 +170,39 @@ namespace riscv
 		VIEW_INSTR();
 		auto new_values = 
 			exec->mapping_at(instr.whole)(CPU(), counter.value()-1, counter.max(), pc);
+#ifdef RISCV_LIBTCC
+		if (UNLIKELY(CPU().has_current_exception())) {
+			const auto except = CPU().current_exception();
+			CPU().clear_current_exception();
+			std::rethrow_exception(except);
+		}
+#endif
 		counter.set_counters(new_values.counter, new_values.max_counter);
 		if (new_values.max_counter == 0) {
-#ifdef RISCV_LIBTCC
-			// We need to check if we have a current exception
-			if (UNLIKELY(CPU().has_current_exception())) {
-				const auto except = CPU().current_exception();
-				CPU().clear_current_exception();
-				std::rethrow_exception(except);
-			}
-#endif
 			return RETURN_VALUES();
 		}
 		pc = REGISTERS().pc;
+		OVERFLOW_CHECK();
+		UNCHECKED_JUMP();
+	}
+#endif
+
+#ifdef RISCV_ASMJIT
+	INSTRUCTION(RV32I_BC_ASMJIT, asmjit_function) {
+		AjState<W> state { counter.value() - d->instruction_count(), counter.max(), pc };
+		do {
+			exec->unchecked_asmjit_mapping_at(d->instr)(cpu, &state);
+			if (UNLIKELY(state.max_counter == 0 && cpu.has_current_exception())) {
+				const auto except = cpu.current_exception();
+				cpu.clear_current_exception();
+				std::rethrow_exception(except);
+			}
+			pc = state.pc;
+			if (UNLIKELY(!(pc >= exec->exec_begin() && pc < exec->exec_end())))
+				break;
+			d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];
+		} while (state.counter < state.max_counter && d->get_bytecode() == RV32I_BC_ASMJIT);
+		counter.set_counters(state.counter, state.max_counter);
 		OVERFLOW_CHECK();
 		UNCHECKED_JUMP();
 	}
@@ -195,8 +221,7 @@ namespace riscv
 		if (UNLIKELY(pc != cpu.registers().pc))
 		{
 			pc = cpu.registers().pc;
-			QUICK_EXEC_CHECK();
-			d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];
+			OVERFLOW_CHECKED_JUMP();
 		}
 		// Overflow-check, next block
 		NEXT_BLOCK(4, true);
@@ -214,18 +239,15 @@ namespace riscv
 	{
 		// Calculate the current PC (mid block)
 		pc = (d - exec->decoder_cache()) << DecoderData<W>::SHIFT;
-		// Check if the instruction is still invalid
-		bool stale = false;
-		try {
-			if (d->instr == 0 && MACHINE().memory.template read<uint16_t>(pc) != 0) {
-				exec->set_stale(true);
-				stale = true;
-			}
-		} catch (...) {}
-		if (stale) {
-			exec = resolve_execute_segment<W>(cpu, pc);
-			d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];
-			NEXT_BLOCK(0, true);
+		// See the same fallback in cpu_dispatch.cpp
+		if (d->instr == 0 && LIKELY(exec->is_within(pc))) {
+			counter.apply(MACHINE());
+			pc = cpu.simulate_undecoded(pc);
+			counter.retrieve_counters(MACHINE());
+			OVERFLOW_CHECK();
+			if (UNLIKELY(exec->is_stale()))
+				exec = resolve_execute_segment<W>(cpu, pc);
+			UNCHECKED_JUMP();
 		}
 		cpu.registers().pc = pc;
 		cpu.trigger_exception(ILLEGAL_OPCODE, d->instr);
@@ -354,16 +376,13 @@ namespace riscv
 		[RV32F_BC_FMUL]    = rv32f_fmul,
 		[RV32F_BC_FDIV]    = rv32f_fdiv,
 		[RV32F_BC_FMADD]   = rv32f_fmadd,
-#ifdef RISCV_EXT_VECTOR
-		[RV32V_BC_VLE32]   = rv32v_vle32,
-		[RV32V_BC_VSE32]   = rv32v_vse32,
-		[RV32V_BC_VFADD_VV] = rv32v_vfadd_vv,
-		[RV32V_BC_VFMUL_VF] = rv32v_vfmul_vf,
-#endif
 		[RV32I_BC_FUNCTION] = execute_decoded_function,
 		[RV32I_BC_FUNCBLOCK] = execute_function_block,
 #ifdef RISCV_BINARY_TRANSLATION
 		[RV32I_BC_TRANSLATOR] = translated_function,
+#endif
+#ifdef RISCV_ASMJIT
+		[RV32I_BC_ASMJIT] = asmjit_function,
 #endif
 		[RV32I_BC_LIVEPATCH] = execute_livepatch,
 		[RV32I_BC_SYSTEM]  = rv32i_system,

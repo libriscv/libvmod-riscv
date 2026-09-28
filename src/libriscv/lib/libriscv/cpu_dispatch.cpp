@@ -1,3 +1,4 @@
+#include "internal_common.hpp"
 #include "machine.hpp"
 #include "decoder_cache.hpp"
 #include "instruction_counter.hpp"
@@ -104,6 +105,11 @@ bool CPU<W>::simulate(address_t pc, uint64_t inscounter, uint64_t maxcounter)
 	if (LIKELY(decoder->get_bytecode() == RV32I_BC_TRANSLATOR))
 		goto begin_translated_function;
 #  endif
+#  ifdef RISCV_ASMJIT
+	decoder = &exec_decoder[pc >> DecoderData<W>::SHIFT];
+	if (LIKELY(decoder->get_bytecode() == RV32I_BC_ASMJIT))
+		goto begin_asmjit_function;
+#  endif
 
 continue_segment:
 	decoder = &exec_decoder[pc >> DecoderData<W>::SHIFT];
@@ -129,6 +135,8 @@ while (true) {
 #define REGISTERS() registers()
 #define VECTORS()   registers().rvv()
 #define MACHINE()   machine()
+#define RECONSTRUCT_PC() ((decoder - exec_decoder) << DecoderData<W>::SHIFT)
+#define ENTER_NEW_EXECUTE_SEGMENT() goto new_execute_segment
 
 	/** Instruction handlers **/
 
@@ -163,10 +171,21 @@ retry_translated_function:
 	// Invoke translated code
 	auto bintr_results = 
 		exec->unchecked_mapping_at(decoder->instr)(*this, cnt, max, pc);
+#ifdef RISCV_LIBTCC
+	if (UNLIKELY(CPU().has_current_exception()))
+		goto handle_rethrow_exception;
+#endif
+
 	pc = REGISTERS().pc;
 	cnt = bintr_results.counter;
 	max = bintr_results.max_counter;
+
 	if (LIKELY(cnt < max && (pc - current_begin < current_end - current_begin))) {
+		if (UNLIKELY(exec->is_stale())) {
+			// check_jump would send us back into the segment we just invalidated
+			counter.set_counters(cnt, max);
+			goto new_execute_segment;
+		}
 		decoder = &exec_decoder[pc >> DecoderData<W>::SHIFT];
 		if (decoder->get_bytecode() == RV32I_BC_TRANSLATOR) {
 			goto retry_translated_function;
@@ -178,6 +197,33 @@ retry_translated_function:
 	goto check_jump;
 }
 #endif // RISCV_BINARY_TRANSLATION
+
+#ifdef RISCV_ASMJIT
+INSTRUCTION(RV32I_BC_ASMJIT, asmjit_function) {
+	// Undo the counter increment that continue_segment applied for this entry.
+	counter.increment_counter(-int64_t(decoder->instruction_count()));
+begin_asmjit_function:
+	AjState<W> state { counter.value(), counter.max(), pc };
+retry_asmjit_function:
+	// Invoke asmjit-generated code. Re-entering here without rebuilding state is
+	// correct: the callee already wrote counter, max_counter and pc into it.
+	exec->unchecked_asmjit_mapping_at(decoder->instr)(*this, &state);
+	pc = state.pc;
+	if (LIKELY(state.counter < state.max_counter
+		&& (pc - current_begin < current_end - current_begin)))
+	{
+		decoder = &exec_decoder[pc >> DecoderData<W>::SHIFT];
+		if (decoder->get_bytecode() == RV32I_BC_ASMJIT)
+			goto retry_asmjit_function;
+		counter.set_counters(state.counter, state.max_counter);
+		goto continue_segment;
+	}
+	counter.set_counters(state.counter, state.max_counter);
+	if (UNLIKELY(state.max_counter == 0 && CPU().has_current_exception()))
+		goto handle_rethrow_exception;
+	goto check_jump;
+}
+#endif // RISCV_ASMJIT
 
 INSTRUCTION(RV32I_BC_SYSCALL, rv32i_syscall) {
 	// Make the current PC visible
@@ -226,7 +272,7 @@ check_jump:
 		goto new_execute_segment;
 
 counter_overflow:
-#ifdef RISCV_LIBTCC
+#if defined(RISCV_LIBTCC) || defined(RISCV_ASMJIT)
 	// We need to check if we have a current exception
 	if (UNLIKELY(CPU().has_current_exception()))
 		goto handle_rethrow_exception;
@@ -252,18 +298,22 @@ new_execute_segment: {
 execute_invalid:
 	// Calculate the current PC from the decoder pointer
 	pc = (decoder - exec_decoder) << DecoderData<W>::SHIFT;
-	// Check if the instruction is still invalid
-	try {
-		if (decoder->instr == 0 && MACHINE().memory.template read<uint16_t>(pc) != 0) {
-			exec->set_stale(true);
+	// We cannot directly say whether the instruction is truly invalid.
+	// It is, for example, possible that the decoder cache encountered
+	// mid-stream JIT constants and lost alignment.
+	if (decoder->instr == 0 && LIKELY(exec->is_within(pc))) {
+		counter.apply(MACHINE());
+		pc = this->simulate_undecoded(pc);
+		counter.retrieve_counters(MACHINE());
+		if (UNLIKELY(exec->is_stale() && !counter.overflowed()))
 			goto new_execute_segment;
-		}
-	} catch (...) {}
+		goto check_jump;
+	}
 	MACHINE().set_instruction_counter(counter.value());
 	registers().pc = pc;
 	trigger_exception(ILLEGAL_OPCODE, decoder->instr);
 
-#ifdef RISCV_LIBTCC
+#if defined(RISCV_LIBTCC) || defined(RISCV_ASMJIT)
 handle_rethrow_exception:
 	// We have an exception, so we need to rethrow it
 	const auto except = CPU().current_exception();

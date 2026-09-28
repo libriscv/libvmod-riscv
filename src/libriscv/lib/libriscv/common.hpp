@@ -37,7 +37,7 @@
 #endif
 
 #ifndef RISCV_BRK_MEMORY_SIZE
-#define RISCV_BRK_MEMORY_SIZE  (1ull << 20) // 1MB
+#define RISCV_BRK_MEMORY_SIZE  (16ull << 20) // 16MB
 #endif
 
 #ifndef RISCV_MAX_EXECUTE_SEGS
@@ -78,6 +78,11 @@ namespace riscv
 		/// instead of writing to a file.
 		/// @details Puts freestanding C99 code into the std::string pointer.
 		std::string* result_c99 = nullptr;
+
+		/// @brief An optional std::string pointer for the shared library variant.
+		/// @details The returned source includes every required preprocessor define
+		/// and exports init/mappings symbols for CPU::load_translation().
+		std::string* result_shared_c99 = nullptr;
 	};
 	using MachineTranslationOptions = std::variant<MachineTranslationCrossOptions, MachineTranslationEmbeddableCodeOptions>;
 
@@ -126,12 +131,24 @@ namespace riscv
 		/// locality and also enables read-write arena if the CMake option is ON.
 		bool use_memory_arena = true;
 
+		/// @brief Preserve the vector registers, vl and vtype whenever register
+		/// state is copied: forking a machine, switching threads and delivering
+		/// a signal. Disabling skips 1kB of register state.
+		bool preserve_vector_registers = true;
+
 		/// @brief Enable sharing of execute segments between machines.
 		/// @details This will allow multiple machines to share the same execute
 		/// segment, reducing memory usage and increasing performance.
 		/// When binary translation is enabled, this will also share the dynamically
 		/// translated code between machines. (Prevents some optimizations)
 		bool use_shared_execute_segments = true;
+
+		/// @brief Share read-only memory between machines.
+		/// @details Machines loaded from the same binary map one sealed image of
+		/// the programs text and rodata over the low part of their arena, instead
+		/// of each holding a private copy. The host can then no longer write there
+		/// through a raw arena pointer. Requires a linear arena, and Linux.
+		bool use_shared_rodata = true;
 
 		/// @brief Override a default-injected exit function with another function
 		/// that is found by looking up the provided symbol name in the current program.
@@ -146,6 +163,12 @@ namespace riscv
 		/// @details This is useful for debugging and live-patching programs.
 		std::vector<std::variant<address_type<W>, std::string>> ebreak_locations {};
 
+		/// @brief Hot-patch well-known libc functions (memcpy, memset, strlen, ...)
+		/// so that calls to them are performed natively instead of emulated.
+		/// @details The functions are found by name in the ELF symbol table, and
+		/// only the decoder cache is modified, preserving the original machine code.
+		bool libc_fastpath = false;
+
 #ifdef RISCV_BINARY_TRANSLATION
 		/// @brief Enable the binary translator.
 		bool translate_enabled = true;
@@ -155,7 +178,7 @@ namespace riscv
 		bool translate_enable_embedded = true;
 		/// @brief Translate not just the initial execute segments of the ELF program,
 		/// but also any future shared objects or JIT-produced segments.
-		bool translate_future_segments = true;
+		bool translate_future_segments = false;
 		/// @brief Enable compiling execute segment on-demand during emulation.
 		/// @details Not available on most Windows systems.
 #if defined(_WIN32) && !defined(RISCV_LIBTCC)
@@ -175,26 +198,30 @@ namespace riscv
 		/// @details If disabled, remote machines will be able to make remote
 		/// calls to this machine. In most cases, this is not needed.
 		bool translation_use_arena = true;
+#endif // RISCV_BINARY_TRANSLATION
 		/// @brief Allow the program to run forever, ignoring the instruction counter limit.
 		/// @details This is useful when there are other ways of interrupting and cancelling the program.
-		/// @note This option is only available when the binary translator is enabled. The main dispatch
+		/// @note Honored by both native back-ends. The main dispatch
 		/// will always check the instruction counter limit.
 		/// It is completely fine to enable this option when running from the command line,
 		/// as a simple Ctrl+C will stop the program.
 		bool translate_ignore_instruction_limit = false;
-		/// @brief Enable the use of register caching for the binary translator. Always enabled
-		/// when binary translation with libtcc is enabled.
-		/// @details Enable this when compiling with -O0 or when using simple compilers like TCC.
+#ifdef RISCV_BINARY_TRANSLATION
+		/// @brief Enable the use of register caching for the binary translator.
+		/// @details Guest registers become C vars, synced to the register file only
+		/// when exiting to the host
 #ifdef RISCV_LIBTCC
 		bool translate_use_register_caching = true;
 #else
 		bool translate_use_register_caching = false;
 #endif
-		bool translate_use_syscall_clobbering_optimization = false;
-		/// @brief Enable automatic n-bit address space for the binary translator by rounding down to the nearest power of 2.
-		/// @details This will allow the binary translator to use and-masked addresses
+#endif // RISCV_BINARY_TRANSLATION
+		/// @brief Enable automatic n-bit address space for the native back-ends by rounding the arena down to the nearest power of 2.
+		/// @details This will allow the back-end to use and-masked addresses
 		/// for all memory accesses, which can drastically improve performance.
+		/// @note Masked accesses skip bounds checks; the guest can write anywhere in the arena.
 		bool translate_automatic_nbit_address_space = false;
+#ifdef RISCV_BINARY_TRANSLATION
 		/// @brief Enable access to virtual pages outside of the arena in the binary translator.
 		/// @details Disabling this will simplifiy memory accesses, allowing up to 8 nearby
 		/// accesses to use only a single bounds-check. However, accessing virtual pages
@@ -205,10 +232,16 @@ namespace riscv
 #else
 			false;
 #endif
-		/// @brief Enable unsafe removal of checks in the binary translator.
-		/// @details This will remove checks that prevent the program from crashing, such
-		/// as memory access checks, and other checks that sandboxes normally provide.
+#endif // RISCV_BINARY_TRANSLATION
+		/// @brief Remove arena bounds checks in both back-ends.
+		/// @details Outside the RISCV_BINARY_TRANSLATION block so asmjit-only builds have it.
 		bool translate_unsafe_remove_checks = false;
+#ifdef RISCV_BINARY_TRANSLATION
+		/// @brief Scan the data segments of the ELF for addresses into the code, and
+		/// treat them as jump targets: switch tables and function pointer tables.
+		/// @details An indirect jump into a known target stays inside the translated
+		/// function; anything else exits to the interpreter.
+		bool translate_scan_data_jump_targets = true;
 		/// @brief Enable recording of slowpaths to jump hints for the binary translator.
 		/// @note This option is only available when RISCV_DEBUG and the binary translator is enabled.
 		/// @details This will record slowpaths to the MachineOptions jump hints vector.
@@ -231,6 +264,15 @@ namespace riscv
 		/// either of these limits. The limits are per shared object.
 		unsigned translate_blocks_max = 1024;
 		unsigned translate_instr_max = 500'000;
+		/// @brief Minimum number of instructions in a code block, which is one C function.
+		/// @details A block only ends at a return or an indirect jump after this many
+		/// instructions. Calls and returns inside a block are direct jumps; between
+		/// blocks they cost a full register sync each way, so a program that fits in a
+		/// few blocks runs faster. The cost is compile time, which grows faster than
+		/// linearly with the block size: a 33k-instruction program took 7 s as 27
+		/// blocks of 1250 and 72 s as a single block with GCC -O2. Raise it when the
+		/// translation is baked ahead of time. Ignored by libtcc, which uses 5000.
+		unsigned translate_block_split = 1250;
 		/// @brief Jump location hints for the binary translator.
 		/// @details These hints can improve performance of the binary translation.
 		std::vector<address_type<W>> translator_jump_hints {};
@@ -268,9 +310,51 @@ namespace riscv
 		std::string libtcc1_location {};
 #endif
 #endif
+
+		// NOTE: emulator/src/main.cpp uses designated initializers, so the asmjit
+		// fields must stay declared (and assigned) after every bintr field.
+#ifdef RISCV_ASMJIT
+		/// @brief Enable the asmjit native code generator.
+		bool asmjit_enabled = true;
+		/// @brief Let asmjit claim execute segments before binary translation does.
+		/// @details Only meaningful when both backends are compiled in. Used to
+		/// A/B compare the two backends on the same program.
+		bool asmjit_override_bintr = false;
+		/// @brief Print the emitted machine code and region layout.
+		bool asmjit_verbose = false;
+		/// @brief Print timing information for the asmjit translation phase.
+		bool asmjit_timing = false;
+		/// @brief Maximum number of emitted regions per execute segment.
+		unsigned asmjit_blocks_max = 16384;
+		/// @brief Maximum number of RISC-V instructions emitted per execute segment.
+		unsigned asmjit_instr_max = 500'000;
+		/// @brief Maximum number of RISC-V instructions in a single region.
+		/// @details Regions partition the segment, so this does not bound total
+		/// emission -- the segment size does. It bounds how large a single emitted
+		/// host function may get, which is what register allocation cost scales
+		/// with. It needs to be comfortably above the size of a hot function:
+		/// a region cut short in the middle of a loop exits to the interpreter on
+		/// every iteration, which costs far more than the emission it saves.
+		unsigned asmjit_region_instr_max = 1024;
+		/// @brief Chain direct guest calls between asmjit regions on the host stack.
+		/// @details Disable this for tooling that must observe every guest call at
+		/// the central dispatcher. Breakpoint addresses remain region boundaries.
+		bool asmjit_direct_calls = true;
+		/// @brief Maximum chained guest-call depth before returning to the dispatcher.
+		unsigned asmjit_direct_call_depth = 256;
+		/// @brief Enable background translation, using a user-provided callback to
+		/// run the translation step on another thread.
+		/// @details Short-lived programs should leave this disabled, as the
+		/// translation often takes longer than simply interpreting the program.
+		std::function<void(std::function<void()>& translation_step)> asmjit_background_callback = nullptr;
+#endif
 	};
 
 	static constexpr int SYSCALL_EBREAK = RISCV_SYSCALL_EBREAK_NR;
+
+	/// @brief Runtime toggle for verbose system call, threading and socket logging.
+	/// @details Takes effect when libriscv is built with RISCV_VERBOSE_SYSCALLS=ON.
+	inline bool verbose_syscalls_enabled = true;
 
 	static constexpr size_t PageSize = RISCV_PAGE_SIZE;
 	static constexpr size_t PageMask = RISCV_PAGE_SIZE-1;
@@ -291,16 +375,10 @@ namespace riscv
 	static constexpr bool memory_alignment_check = true;
 	static constexpr bool verbose_branches_enabled = false;
 	static constexpr bool unaligned_memory_slowpaths = true;
-	static constexpr bool nanboxing = true;
 #else
 	static constexpr bool memory_alignment_check = false;
 	static constexpr bool verbose_branches_enabled = false;
 	static constexpr bool unaligned_memory_slowpaths = false;
-#ifdef RISCV_ALWAYS_NANBOXING // In order to override the default
-	static constexpr bool nanboxing = true;
-#else
-	static constexpr bool nanboxing = false;
-#endif
 #endif
 
 #ifdef RISCV_EXT_A
@@ -332,6 +410,15 @@ namespace riscv
 #else
 	static constexpr bool fcsr_emulation = false;
 #endif
+// NaN-boxing is a correctness feature, not a functional one: scripting guests
+// never observe the upper 32 bits of a single-precision f-register unless they
+// deliberately go looking. It costs a store on every FP32 write, so it rides
+// along with FCSR emulation instead of being a knob of its own.
+#if defined(RISCV_FCSR) || defined(RISCV_DEBUG) || defined(RISCV_ALWAYS_NANBOXING)
+	static constexpr bool nanboxing = true;
+#else
+	static constexpr bool nanboxing = false;
+#endif
 #ifdef RISCV_BINARY_TRANSLATION
 	static constexpr bool binary_translation_enabled = true;
 #else
@@ -358,6 +445,11 @@ namespace riscv
 	static constexpr bool libtcc_enabled = true;
 #else
 	static constexpr bool libtcc_enabled = false;
+#endif
+#ifdef RISCV_ASMJIT
+	static constexpr bool asmjit_enabled = true;
+#else
+	static constexpr bool asmjit_enabled = false;
 #endif
 
 
@@ -420,16 +512,19 @@ namespace riscv
 #define RISCV_HOT_PATH() __attribute__((hot))
 #endif
 #define RISCV_ALWAYS_INLINE __attribute__((always_inline))
+#define RISCV_NOINLINE      __attribute__((noinline))
 #else
 #define LIKELY(x)   (x)
 #define UNLIKELY(x) (x)
 #define RISCV_COLD_PATH() /* */
 #define RISCV_HOT_PATH()  /* */
 #define RISCV_ALWAYS_INLINE /* */
+#define RISCV_NOINLINE      /* */
 #endif
 
 #ifdef _MSC_VER
 #undef RISCV_ALWAYS_INLINE
+#undef RISCV_NOINLINE
 #define RISCV_ALWAYS_INLINE __forceinline
 #define RISCV_NOINLINE      __declspec(noinline)
 #endif

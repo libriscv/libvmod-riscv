@@ -69,6 +69,7 @@ static RISCVPageAttributes convert_to_c(const PageAttributes& attr) {
 	return c;
 }
 
+#ifdef RISCV_VIRTUAL_PAGING
 struct ParentPageInfo {
 	PageData* data;
 	PageAttributes attr;
@@ -90,6 +91,7 @@ static ParentPageInfo get_parent_page_readonly(
 	}
 	return {Page::cow_page().m_page.get(), Page::cow_page().attr};
 }
+#endif // RISCV_VIRTUAL_PAGING
 
 extern "C"
 void libriscv_set_defaults(RISCVOptions *options)
@@ -111,6 +113,7 @@ void libriscv_set_defaults(RISCVOptions *options)
 	options->protect_segments = mo.protect_segments ? 1 : 0;
 	options->native_syscall_base = 0;
 	options->arena_size = 8ULL << 20;
+	options->native_heap_max_chunks = 0;
 }
 
 extern "C"
@@ -154,7 +157,8 @@ RISCVMachine *libriscv_new(const void *elf_prog, unsigned elf_length, const RISC
 		if (options->native_syscall_base > 0) {
 			const unsigned base = options->native_syscall_base;
 			Machine<RISCV_ARCH>::setup_native_memory(base + 5);
-			m->setup_native_heap(base, m->memory.heap_address(), options->arena_size);
+			m->setup_native_heap(base, m->memory.mmap_allocate(options->arena_size),
+				options->arena_size, options->native_heap_max_chunks);
 			u->arena_syscall_base = base;
 			u->arena_total_size = options->arena_size;
 		}
@@ -533,6 +537,8 @@ int libriscv_load_binary_file(const char *filename, char **data)
 
 /*** Fast-fork API ***/
 
+#ifdef RISCV_VIRTUAL_PAGING
+
 extern "C"
 RISCVMachine *libriscv_fast_fork(const RISCVMachine *parent, RISCVOptions *opts)
 {
@@ -609,7 +615,8 @@ RISCVMachine *libriscv_fast_fork(const RISCVMachine *parent, RISCVOptions *opts)
 			const auto syscall_base = parent_ud.arena_syscall_base;
 			if (total_size > 0 && syscall_base > 0) {
 				const auto remaining = total_size - (watermark - arena_base);
-				m->setup_native_heap(syscall_base, watermark, remaining);
+				m->setup_native_heap(syscall_base, watermark, remaining,
+					opts ? opts->native_heap_max_chunks : 0);
 
 				m->arena().on_unknown_free(
 					[](auto, auto*) -> int { return 0; });
@@ -670,6 +677,32 @@ const void *libriscv_get_parent_page_data(
 		return NULL;
 	}
 }
+
+#else // RISCV_VIRTUAL_PAGING
+
+extern "C"
+RISCVMachine *libriscv_fast_fork(const RISCVMachine *, RISCVOptions *opts)
+{
+	if (opts && opts->error)
+		opts->error(opts->opaque, RISCV_ERROR_TYPE_GENERAL_EXCEPTION,
+			"Forking requires enabling virtual paging", 0);
+	return NULL;
+}
+
+extern "C"
+int libriscv_is_forked(const RISCVMachine *)
+{
+	return 0;
+}
+
+extern "C"
+const void *libriscv_get_parent_page_data(
+	const RISCVMachine *, uint64_t, RISCVPageAttributes *)
+{
+	return NULL;
+}
+
+#endif // RISCV_VIRTUAL_PAGING
 
 
 /*** Arena management ***/
@@ -830,6 +863,12 @@ int libriscv_insert_non_owned_memory(
 	RISCVMachine *m, uint64_t dst, void *src, uint64_t size,
 	const RISCVPageAttributes *attr)
 {
+#ifndef RISCV_VIRTUAL_PAGING
+	(void)dst; (void)src; (void)size; (void)attr;
+	ERROR_CALLBACK(MACHINE(m), RISCV_ERROR_TYPE_GENERAL_EXCEPTION,
+		"Non-owned memory requires enabling virtual paging", 0);
+	return RISCV_ERROR_TYPE_GENERAL_EXCEPTION;
+#else
 	try {
 		PageAttributes cpp_attr;
 		if (attr) {
@@ -844,6 +883,7 @@ int libriscv_insert_non_owned_memory(
 		ERROR_CALLBACK(MACHINE(m), RISCV_ERROR_TYPE_GENERAL_EXCEPTION, e.what(), 0);
 		return RISCV_ERROR_TYPE_GENERAL_EXCEPTION;
 	}
+#endif // RISCV_VIRTUAL_PAGING
 }
 
 

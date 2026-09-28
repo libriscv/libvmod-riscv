@@ -59,26 +59,6 @@ void Machine<W>::setup_posix_threads()
 	if (this->m_mt == nullptr)
 		this->m_mt.reset(new MultiThreading<W>(*this));
 
-	static constexpr int SYSCALL_CLONE        = 220;
-	static constexpr int SYSCALL_CLONE3	      = 435;
-	static constexpr int SYSCALL_SCHED_YIELD  = 124;
-	static constexpr int SYSCALL_EXIT         = 93;
-	static constexpr int SYSCALL_EXIT_GROUP   = 94;
-	static constexpr int SYSCALL_FUTEX        = 98;
-	static constexpr int SYSCALL_FUTEX_TIME64 = 422;
-	static constexpr int SYSCALL_TKILL        = 130;
-	static constexpr int SYSCALL_TGKILL       = 131;
-	// There may be more, but these are known to clobber all registers
-	register_clobbering_syscall(SYSCALL_CLONE);
-	register_clobbering_syscall(SYSCALL_CLONE3);
-	register_clobbering_syscall(SYSCALL_SCHED_YIELD);
-	register_clobbering_syscall(SYSCALL_EXIT);
-	register_clobbering_syscall(SYSCALL_EXIT_GROUP);
-	register_clobbering_syscall(SYSCALL_FUTEX);
-	register_clobbering_syscall(SYSCALL_FUTEX_TIME64);
-	register_clobbering_syscall(SYSCALL_TKILL);
-	register_clobbering_syscall(SYSCALL_TGKILL);
-
 	// exit & exit_group
 	this->install_syscall_handler(93,
 	[] (Machine<W>& machine) {
@@ -134,6 +114,15 @@ void Machine<W>::setup_posix_threads()
 		const int sig = machine.template sysarg<int> (2);
 		THPRINT(machine,
 			">>> tgkill on tid=%d signal=%d\n", tid, sig);
+#ifdef THREADS_DEBUG
+		if (riscv::verbose_syscalls_enabled
+			&& (sig == 4 || sig == 6 || sig == 8 || sig == 11)) {
+			machine.memory.print_backtrace([&machine] (std::string_view line) {
+				machine.print(line.data(), line.size());
+				machine.print("\n", 1);
+			});
+		}
+#endif
 		auto* thread = machine.threads().get_thread(tid);
 		if (thread != nullptr) {
 			// If the signal is unhandled, exit the thread
@@ -290,7 +279,7 @@ template <int W>
 int Machine<W>::gettid() const noexcept
 {
 	if (m_mt) return m_mt->get_tid();
-	return 0;
+	return MAIN_THREAD_TID;
 }
 
 #ifdef RISCV_32I

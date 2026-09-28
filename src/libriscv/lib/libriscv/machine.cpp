@@ -18,9 +18,6 @@ namespace riscv
 #else
 	static std::random_device rd{};
 #endif
-#ifdef RISCV_BINARY_TRANSLATION
-	static std::unordered_set<size_t> clobbering_syscalls;
-#endif
 
 	template <int W>
 	inline Machine<W>::Machine(std::string_view binary, const MachineOptions<W>& options)
@@ -32,7 +29,7 @@ namespace riscv
 	}
 	template <int W>
 	inline Machine<W>::Machine(const Machine& other, const MachineOptions<W>& options)
-		: cpu(*this, other),
+		: cpu(*this, other, options),
 		  memory(*this, other, options),
 		  m_arena(nullptr)
 	{
@@ -64,6 +61,15 @@ namespace riscv
 	}
 
 	template <int W>
+	typename Registers<W>::Options Machine<W>::register_copy_options() const noexcept
+	{
+		if (!has_options() || options().preserve_vector_registers)
+			return Registers<W>::Options::Everything;
+		else
+			return Registers<W>::Options::NoVectors;
+	}
+
+	template <int W>
 	void Machine<W>::unknown_syscall_handler(Machine<W>& machine)
 	{
 		const auto syscall_number = machine.cpu.reg(REG_ECALL);
@@ -78,25 +84,6 @@ namespace riscv
 	}
 
 	template <int W>
-	void Machine<W>::register_clobbering_syscall(size_t sysnum)
-	{
-#ifdef RISCV_BINARY_TRANSLATION
-		clobbering_syscalls.insert(sysnum);
-#endif
-		(void)sysnum;
-	}
-
-	template <int W>
-	bool Machine<W>::is_clobbering_syscall(size_t sysnum) noexcept {
-#ifdef RISCV_BINARY_TRANSLATION
-		return clobbering_syscalls.count(sysnum) > 0;
-#else
-		(void)sysnum;
-		return false; // No clobbering syscalls in non-binary translation mode
-#endif
-	}
-
-	template <int W>
 	void Machine<W>::set_result_or_error(int result)
 	{
 		if (result >= 0)
@@ -106,7 +93,7 @@ namespace riscv
 	}
 
 	template <int W>
-	void Machine<W>::penalize(uint32_t val)
+	void Machine<W>::penalize(uint64_t val)
 	{
 		m_counter += val;
 	}
@@ -144,6 +131,9 @@ namespace riscv
 		sp &= ~(address_t)0xF; // mandated 16-byte stack alignment
 
 		this->copy_to_guest(sp, argv.data(), argsize);
+
+		// preserve argc/argv/envp and the auxiliary vector for the program lifetime
+		this->memory.set_stack_initial(sp);
 	}
 
 	template <int W, typename T>
@@ -275,11 +265,105 @@ namespace riscv
 		this->copy_to_guest(dst, argv.data(), argsize);
 		// re-initialize machine stack-pointer
 		this->cpu.reg(REG_SP) = dst;
+		// preserve argc/argv/envp and the auxiliary vector for the program lifetime
+		this->memory.set_stack_initial(dst);
 	}
+
+	template <int W>
+	static void handle_unhandled_csr(Machine<W>& machine, uint32_t csr, int rd, int rs1)
+	{
+		if ((csr & 0x300) != 0) {
+			machine.cpu.trigger_exception(ILLEGAL_OPERATION, csr);
+			return;
+		}
+		Machine<W>::on_unhandled_csr(machine, csr, rd, rs1);
+	}
+
+#ifdef RISCV_EXT_VECTOR
+	/**
+	 * The vector CSRs, which all six CSR instructions reach the same way:
+	 * read the old value into rd, then write back the value the operation
+	 * computes from it. Returns false for a CSR that is not one of ours, so
+	 * the caller can carry on with its own table.
+	 *
+	 * vl, vtype and vlenb are read-only -- only vsetvl writes them -- so a
+	 * CSR instruction that would write one raises illegal-operation. The
+	 * set/clear forms only count as a write when their source is nonzero,
+	 * which is what makes `csrr rd, vl` (a CSRRS with rs1=x0) legal.
+	 */
+	template <int W>
+	static bool handle_vector_csr(Machine<W>& machine, union rv32i_instruction instr)
+	{
+		const uint32_t csr = instr.Itype.imm;
+		switch (csr) {
+			case 0x008: case 0x009: case 0x00A: case 0x00F:
+			case 0xC20: case 0xC21: case 0xC22:
+				break;
+			default:
+				return false;
+		}
+		auto& cpu = machine.cpu;
+		auto& rvv = cpu.registers().rvv();
+		using register_t = typename Machine<W>::address_t;
+
+		const unsigned funct3 = instr.Itype.funct3;
+		const bool immediate = funct3 >= 0x5;
+		// CSRRWI and friends take a 5-bit unsigned immediate where the
+		// register forms take rs1.
+		const register_t src = immediate
+			? register_t(instr.Itype.rs1) : cpu.reg(instr.Itype.rs1);
+		// A swap always writes; set and clear only when they have bits to
+		// set or clear, which is how a plain read is spelled. Both forms
+		// name their source in rs1, so one test covers them.
+		const bool writes = (funct3 == 0x1 || funct3 == 0x5)
+			|| instr.Itype.rs1 != 0;
+
+		register_t old;
+		switch (csr) {
+			case 0x008: old = rvv.vstart(); break;
+			case 0x009: old = rvv.vxsat();  break;
+			case 0x00A: old = rvv.vxrm();   break;
+			case 0x00F: old = rvv.vcsr();   break;
+			case 0xC20: old = rvv.vl();     break;
+			case 0xC21: old = rvv.vtype();  break;
+			default:    old = rvv.vlenb();  break; // 0xC22
+		}
+
+		if (writes && csr >= 0xC20) {
+			cpu.trigger_exception(ILLEGAL_OPERATION, csr);
+			return true;
+		}
+		if (instr.Itype.rd != 0)
+			cpu.reg(instr.Itype.rd) = old;
+		if (!writes)
+			return true;
+
+		const register_t value =
+			(funct3 == 0x1 || funct3 == 0x5) ? src :
+			(funct3 == 0x2 || funct3 == 0x6) ? register_t(old | src) :
+			register_t(old & ~src);
+
+		switch (csr) {
+			case 0x008: rvv.set_vstart(value); break;
+			case 0x009: rvv.set_vxsat(value & 1); break;
+			case 0x00A: rvv.set_vxrm((unsigned)value); break;
+			default:    rvv.set_vcsr((unsigned)value); break; // 0x00F
+		}
+		return true;
+	}
+#endif
 
 	template <int W>
 	void Machine<W>::system(union rv32i_instruction instr)
 	{
+#ifdef RISCV_EXT_VECTOR
+		// The vector CSRs are shared by all six CSR instructions, so they
+		// are handled once here rather than in each of the tables below.
+		if (instr.Itype.funct3 != 0x0 && instr.Itype.funct3 != 0x4) {
+			if (handle_vector_csr(*this, instr))
+				return;
+		}
+#endif
 		switch (instr.Itype.funct3) {
 		case 0x0: // SYSTEM functions
 			switch (instr.Itype.imm)
@@ -292,6 +376,10 @@ namespace riscv
 				return;
 			case 0x105: // WFI
 				this->stop();
+				return;
+			case 0x00D: // Zawrs: WRS.NTO
+			case 0x01D: // Zawrs: WRS.STO
+				// Wait-on-reservation-set -> spurious wakeup
 				return;
 			case 0x7FF: // Stop machine
 				this->stop();
@@ -313,6 +401,9 @@ namespace riscv
 			case 0x003: // fcsr: control and status register
 				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().whole;
 				cpu.registers().fcsr().whole = cpu.reg(instr.Itype.rs1) & 0xFF;
+				return;
+			case 0xC01: // CSR RDTIME (lower) is read-only
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
 				return;
 			}
 			[[fallthrough]];
@@ -350,25 +441,32 @@ namespace riscv
 				if (rd) cpu.reg(instr.Itype.rd) = this->instruction_counter() >> 32u;
 				return;
 			case 0xC01: // CSR RDTIME (lower)
+				if (instr.Itype.rs1 != 0) {
+					cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+					return;
+				}
 				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this);
 				return;
 			case 0xC81: // CSR RDTIME (upper)
 				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this) >> 32u;
 				return;
 			case 0xF11: // CSR marchid
-				if (rd) cpu.reg(instr.Itype.rd) = 0;
+				// Machine-level CSRs are not accessible to the U-mode guest
+				// this emulator models; matching the handle_unhandled_csr
+				// privilege gate, accessing them must raise illegal-operation.
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
 				return;
 			case 0xF12: // CSR mvendorid
-				if (rd) cpu.reg(instr.Itype.rd) = 0;
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
 				return;
 			case 0xF13: // CSR mimpid
-				if (rd) cpu.reg(instr.Itype.rd) = 1;
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
 				return;
 			case 0xF14: // CSR mhartid
-				if (rd) cpu.reg(instr.Itype.rd) = cpu.cpu_id();
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
 				return;
 			default:
-				on_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
+				handle_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
 				return;
 			}
 			} break;
@@ -388,9 +486,29 @@ namespace riscv
 				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().whole;
 				cpu.registers().fcsr().whole &= ~(cpu.reg(instr.Itype.rs1) & 0xFF);
 				return;
+			case 0xC01: // CSR RDTIME (lower)
+				if (instr.Itype.rs1 != 0) {
+					cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+					return;
+				}
+				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this);
+				return;
 			}
 			break;
 		}
+		case 0x4: { // Zimop: the may-be-operations
+			//   MOP.R.n    1 n4 00 n3 n2 0111 n1 n0 | rs1 | 100 | rd
+			//   MOP.RR.n   1 n2 00 n1 n0 1 | rs2  | rs1 | 100 | rd
+			const uint32_t hi = instr.whole >> 25;
+			const bool wellformed = (hi & 0b1011000) == 0b1000000
+				&& ((hi & 1) != 0 || (instr.whole & (0b111 << 22)) == (0b111 << 22));
+			if (wellformed) {
+				if (instr.Itype.rd != 0)
+					cpu.reg(instr.Itype.rd) = 0;
+				return;
+			}
+			break;
+		} // Zimop
 		case 0x5: { // CSRWI: CSRW from uimm[4:0] in RS1
 			const bool rd = instr.Itype.rd != 0;
 			const uint32_t imm = instr.Itype.rs1;
@@ -408,11 +526,61 @@ namespace riscv
 				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().whole;
 				cpu.registers().fcsr().whole = imm & 0xFF;
 				return;
+			case 0xC01: // CSR RDTIME (lower) is read-only
+				cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+				return;
 			default:
-				on_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
+				handle_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
 				return;
 			}
 		} // CSRWI
+		case 0x6: { // CSRRSI: Atomically read and set bit mask using immediate
+			const bool rd = instr.Itype.rd != 0;
+			const uint32_t imm = instr.Itype.rs1;
+			switch (instr.Itype.imm)
+			{
+			case 0x001: // fflags (accrued exceptions)
+				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().fflags;
+				cpu.registers().fcsr().fflags |= imm;
+				return;
+			case 0x002: // frm (rounding-mode)
+				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().frm;
+				cpu.registers().fcsr().frm |= imm;
+				return;
+			case 0x003: // fcsr (control and status register)
+				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().whole;
+				cpu.registers().fcsr().whole |= imm & 0xFF;
+				return;
+			case 0xC00: // CSR RDCYCLE (lower)
+			case 0xC02: // RDINSTRET (lower)
+				if (rd) {
+					cpu.reg(instr.Itype.rd) = this->instruction_counter();
+					return;
+				} else {
+					if (imm == 0) // UNIMP instruction
+						cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, instr.Itype.imm);
+					else // CYCLE is not writable
+						cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+				}
+			case 0xC80: // CSR RDCYCLE (upper)
+			case 0xC82: // RDINSTRET (upper)
+				if (rd) cpu.reg(instr.Itype.rd) = this->instruction_counter() >> 32u;
+				return;
+			case 0xC01: // CSR RDTIME (lower)
+				if (imm != 0) {
+					cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+					return;
+				}
+				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this);
+				return;
+			case 0xC81: // CSR RDTIME (upper)
+				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this) >> 32u;
+				return;
+			default:
+				handle_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
+				return;
+			}
+		} // CSRRSI
 		case 0x7: { // CSRRCI: Atomically read and clear CSR using immediate
 			const bool rd = instr.Itype.rd != 0;
 			const uint32_t imm = instr.Itype.rs1;
@@ -430,8 +598,15 @@ namespace riscv
 				if (rd) cpu.reg(instr.Itype.rd) = cpu.registers().fcsr().whole;
 				cpu.registers().fcsr().whole &= ~(imm & 0xFF);
 				return;
+			case 0xC01: // CSR RDTIME (lower)
+				if (imm != 0) {
+					cpu.trigger_exception(ILLEGAL_OPERATION, instr.Itype.imm);
+					return;
+				}
+				if (rd) cpu.reg(instr.Itype.rd) = m_rdtime(*this);
+				return;
 			default:
-				on_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
+				handle_unhandled_csr(*this, instr.Itype.imm, instr.Itype.rd, instr.Itype.rs1);
 				return;
 			}
 			break;

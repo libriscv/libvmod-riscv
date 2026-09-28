@@ -1,19 +1,81 @@
 #include "rvfd.hpp"
+#include "fp16.hpp"
 #include "instr_helpers.hpp"
+#include "rvfd_util.hpp"
 #include <cmath>
+#include <limits>
+#include <type_traits>
 
 namespace riscv
 {
-	// RISC-V Canonical NaNs
-	static constexpr uint32_t CANONICAL_NAN_F32 = 0x7fc00000;
-	static constexpr uint64_t CANONICAL_NAN_F64 = 0x7ff8000000000000;
+	// The canonical NaNs, the rounding modes, fcvt_to_integer() and the FMIN/
+	// FMAX and FCLASS rules all live in rvfd_util.hpp, because the asmjit
+	// backend's host helpers must implement exactly the same semantics.
 
+	// Convert an integer to float/double, reporting NX when the destination
+	// mantissa was too narrow to hold it. long double is exact for every 64-bit
+	// integer wherever it is an 80- or 128-bit format; where it is merely double
+	// (MSVC), the 64-bit sources simply do not report NX. Only compiled in under
+	// FCSR emulation — the comparison is not free.
+	template <typename F, typename T>
+	static inline F fcvt_from_integer(T value, unsigned rm, bool& inexact) {
+		const F converted = F(value);
+		if constexpr (fcsr_emulation) {
+			const long double exact = (long double)value;
+			inexact = (long double)converted != exact;
+			if (inexact) {
+				// The host cast is round-to-nearest-even; adjust the result
+				// for the other RISC-V rounding modes using the float grid.
+				const long double cld = (long double)converted;
+				switch (rm) {
+				case 0x1: // RTZ: toward zero
+					// Adjust only when the RNE result moved away from zero
+					// (|cld| > |exact|); when it already rounded toward zero
+					// (|cld| < |exact|) the RNE result is the RTZ result.
+					if (exact > 0.0L && cld > exact) return std::nextafter(converted, F(0.0f));
+					if (exact < 0.0L && cld < exact) return std::nextafter(converted, F(0.0f));
+					break;
+				case 0x2: // RDN: toward -inf
+					if (cld > exact) return std::nextafter(converted, F(-INFINITY));
+					break;
+				case 0x3: // RUP: toward +inf
+					if (cld < exact) return std::nextafter(converted, F(INFINITY));
+					break;
+				case 0x4: { // RMM: ties away from zero
+					// RMM differs from RNE *only* at an exact halfway point,
+					// where it takes the larger magnitude instead of the even
+					// significand. Everywhere else nearest is nearest, so the
+					// host cast is already right.
+					if (fabsl(cld) < fabsl(exact)) {
+						const F away = std::nextafter(converted,
+							converted < F(0.0) ? F(-INFINITY) : F(INFINITY));
+						if (fabsl((long double)away - exact) == fabsl(exact - cld))
+							return away;
+					}
+					break;
+				}
+				default: break; // RNE (0)
+				}
+			}
+		}
+		return converted;
+	}
+
+	// A signaling NaN has an all-ones exponent, a clear quiet bit and a non-zero
+	// payload. The payload check is what separates it from an infinity, and the
+	// quiet bit must be masked at bit 22 (f32) / bit 51 (f64), not one below.
 	template <typename T>
 	static bool is_signaling_nan(T t) {
-		if constexpr (sizeof(T) == 4)
-			return (*(uint32_t*)&t & 0x7fa00000) == 0x7f800000;
-		else
-			return (*(uint64_t*)&t & 0x7ffe000000000000) == 0x7ff0000000000000;
+		if constexpr (sizeof(T) == 4) {
+			uint32_t bits;
+			__builtin_memcpy(&bits, &t, 4);
+			return (bits & 0x7fc00000) == 0x7f800000 && (bits & 0x003fffff) != 0;
+		} else {
+			uint64_t bits;
+			__builtin_memcpy(&bits, &t, 8);
+			return (bits & 0x7ff8000000000000ull) == 0x7ff0000000000000ull
+				&& (bits & 0x0007ffffffffffffull) != 0;
+		}
 	}
 
 #ifdef RISCV_FCSR
@@ -65,15 +127,8 @@ namespace riscv
 		dst.load_u32(cpu.machine().memory.template read<uint32_t> (addr));
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 8> insn {
-			"???", "FLH", "FLW", "FLD", "FLQ", "???", "???", "???"
-		};
-		return snprintf(buffer, len, "%s %s, [%s%+d]",
-						insn[fi.Itype.funct3],
-						RISCV::flpname(fi.Itype.rd),
-						RISCV::regname(fi.Stype.rs1),
-						fi.Itype.signed_imm());
+		return rv_expect_mnemonic(buffer, len, "flw",
+			RVFDISASM::op_load(buffer, len, instr));
 	});
 	FLOAT_INSTR(FLD,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
@@ -82,7 +137,42 @@ namespace riscv
 		auto addr = cpu.reg(fi.Itype.rs1) + fi.Itype.signed_imm();
 		auto& dst = cpu.registers().getfl(fi.Itype.rd);
 		dst.load_u64(cpu.machine().memory.template read<uint64_t> (addr));
-	}, DECODED_FLOAT(FLW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fld",
+			RVFDISASM::op_load(buffer, len, instr));
+	});
+
+	/* Zfhmin: the half-precision load and store. The extension has no
+	 * arithmetic of its own -- these two, the register moves and the
+	 * conversions are all of it -- so a half only ever travels between
+	 * memory and a NaN-boxed register, or through a conversion. */
+	FLOAT_INSTR(FLH,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
+	{
+		const rv32f_instruction fi { instr };
+		auto addr = cpu.reg(fi.Itype.rs1) + fi.Itype.signed_imm();
+		auto& dst = cpu.registers().getfl(fi.Itype.rd);
+		dst.load_u16(cpu.machine().memory.template read<uint16_t> (addr));
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "flh",
+			RVFDISASM::op_load(buffer, len, instr));
+	});
+
+	FLOAT_INSTR(FSH,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
+	{
+		const rv32f_instruction fi { instr };
+		const auto& src = cpu.registers().getfl(fi.Stype.rs2);
+		auto addr = cpu.reg(fi.Stype.rs1) + fi.Stype.signed_imm();
+		// A store takes the low sixteen bits as they are, boxed or not.
+		cpu.machine().memory.template write<uint16_t> (addr, uint16_t(src.i32[0]));
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fsh",
+			RVFDISASM::op_store(buffer, len, instr));
+	});
 
 	FLOAT_INSTR(FSW,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
@@ -93,15 +183,8 @@ namespace riscv
 		cpu.machine().memory.template write<uint32_t> (addr, src.i32[0]);
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 8> insn {
-			"???", "FSH", "FSW", "FSD", "FSQ", "???", "???", "???"
-		};
-		return snprintf(buffer, len, "%s [%s%+d], %s",
-						insn[fi.Stype.funct3],
-						RISCV::regname(fi.Stype.rs1),
-						fi.Stype.signed_imm(),
-						RISCV::flpname(fi.Stype.rs2));
+		return rv_expect_mnemonic(buffer, len, "fsw",
+			RVFDISASM::op_store(buffer, len, instr));
 	});
 	FLOAT_INSTR(FSD,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
@@ -110,7 +193,11 @@ namespace riscv
 		const auto& src = cpu.registers().getfl(fi.Stype.rs2);
 		auto addr = cpu.reg(fi.Stype.rs1) + fi.Stype.signed_imm();
 		cpu.machine().memory.template write<uint64_t> (addr, src.i64);
-	}, DECODED_FLOAT(FSW).printer);
+	},
+	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fsd",
+			RVFDISASM::op_store(buffer, len, instr));
+	});
 
 	FLOAT_INSTR(FMADD,
 	[] (auto& cpu, rv32i_instruction instr) RVINSTR_ATTR
@@ -123,6 +210,16 @@ namespace riscv
 		// RISC-V spec §11.6: FMA must round only once (fused).
 		// std::fma is IEEE 754 fused multiply-add.
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs3.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
 			dst.set_float(std::fma(rs1.f32[0], rs2.f32[0], rs3.f32[0]));
 			fsflags(cpu, (double)rs1.f32[0] * (double)rs2.f32[0] + (double)rs3.f32[0], dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -133,15 +230,8 @@ namespace riscv
 		}
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMADD.S", "FMADD.D", "???", "FMADD.Q"
-		};
-		return snprintf(buffer, len, "%s %s * %s + %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rs3),
-						RISCV::flpname(fi.R4type.rd));
+		return rv_expect_mnemonic(buffer, len, "fmadd",
+			RVFDISASM::op_fused(buffer, len, instr));
 	});
 
 	FLOAT_INSTR(FMSUB,
@@ -155,6 +245,16 @@ namespace riscv
 		// RISC-V spec §11.6: FMA must round only once (fused).
 		// FMSUB = rs1*rs2 - rs3 = fma(rs1, rs2, -rs3).
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs3.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
 			dst.set_float(std::fma(rs1.f32[0], rs2.f32[0], -rs3.f32[0]));
 			fsflags(cpu, (double)rs1.f32[0] * (double)rs2.f32[0] - (double)rs3.f32[0], dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -165,15 +265,8 @@ namespace riscv
 		}
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMSUB.S", "FMSUB.D", "???", "FMSUB.Q"
-		};
-		return snprintf(buffer, len, "%s %s * %s - %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rs3),
-						RISCV::flpname(fi.R4type.rd));
+		return rv_expect_mnemonic(buffer, len, "fmsub",
+			RVFDISASM::op_fused(buffer, len, instr));
 	});
 
 	FLOAT_INSTR(FNMADD,
@@ -187,6 +280,16 @@ namespace riscv
 		// RISC-V spec §11.6: FMA must round only once (fused).
 		// FNMADD = -(rs1*rs2) - rs3 = -fma(rs1, rs2, rs3).
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs3.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
 			dst.set_float(-std::fma(rs1.f32[0], rs2.f32[0], rs3.f32[0]));
 			fsflags(cpu, (double)-rs1.f32[0] * (double)rs2.f32[0] - (double)rs3.f32[0], dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -197,14 +300,8 @@ namespace riscv
 		}
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMADD.S", "FMADD.D", "???", "FMADD.Q"
-		};
-		return snprintf(buffer, len, "%s %s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+		return rv_expect_mnemonic(buffer, len, "fnmadd",
+			RVFDISASM::op_fused(buffer, len, instr));
 	});
 
 	FLOAT_INSTR(FNMSUB,
@@ -218,6 +315,16 @@ namespace riscv
 		// RISC-V spec §11.6: FMA must round only once (fused).
 		// FNMSUB = -(rs1*rs2) + rs3 = fma(-rs1, rs2, rs3).
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs3.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
 			dst.set_float(std::fma(-rs1.f32[0], rs2.f32[0], rs3.f32[0]));
 			fsflags(cpu, (double)-rs1.f32[0] * (double)rs2.f32[0] + (double)rs3.f32[0], dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -228,16 +335,8 @@ namespace riscv
 		}
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FNMSUB.S", "FNMSUB.D", "???", "FNMSUB.Q"
-		};
-		return snprintf(buffer, len, "%s -(%s * %s) + %s, %s",
-						f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rs3),
-						RISCV::flpname(fi.R4type.rd));
+		return rv_expect_mnemonic(buffer, len, "fnmsub",
+			RVFDISASM::op_fused(buffer, len, instr));
 	});
 
 	FLOAT_INSTR(FADD,
@@ -248,6 +347,27 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
+			// A quiet NaN operand propagates as the canonical qNaN without
+			// raising NV — only a signaling NaN, or an invalid operation such
+			// as inf + -inf, is invalid. fsflags() cannot tell those apart
+			// because it only sees the result, so handle it up front.
+			if constexpr (fcsr_emulation) {
+				if ((std::isnan(rs1.f32[0]) || std::isnan(rs2.f32[0]))
+					&& !is_signaling_nan(rs1.f32[0]) && !is_signaling_nan(rs2.f32[0])) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					cpu.registers().fcsr().fflags = 0;
+					return;
+				}
+			}
 			dst.set_float(rs1.f32[0] + rs2.f32[0]);
 			fsflags(cpu, (double)(rs1.f32[0]) + (double)(rs2.f32[0]), dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -257,15 +377,9 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FADD.S", "FADD.D", "???", "FADD.Q"
-		};
-		return snprintf(buffer, len, "%s %s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fadd",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FSUB,
@@ -276,6 +390,15 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		if (fi.R4type.funct2 == 0x0) { // float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
 			dst.set_float(rs1.f32[0] - rs2.f32[0]);
 			fsflags(cpu, (double)(rs1.f32[0]) - (double)(rs2.f32[0]), dst.f32[0]);
 		} else if (fi.R4type.funct2 == 0x1) { // float64
@@ -285,15 +408,9 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FSUB.S", "FSUB.D", "???", "FSUB.Q"
-		};
-		return snprintf(buffer, len, "%s %s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fsub",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FMUL,
@@ -304,8 +421,46 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		if (fi.R4type.funct2 == 0x0) { // float32
-			dst.set_float(rs1.f32[0] * rs2.f32[0]);
-			fsflags(cpu, (double)(rs1.f32[0]) * (double)(rs2.f32[0]), dst.f32[0]);
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
+			// Operands are read out before the store, because rd is allowed to
+			// alias rs1 or rs2.
+			const uint32_t ia = rs1.i32[0], ib = rs2.i32[0];
+			const float fa = rs1.f32[0], fb = rs2.f32[0];
+			dst.set_float(fa * fb);
+			fsflags(cpu, (double)fa * (double)fb, dst.f32[0]);
+			if constexpr (fcsr_emulation) {
+				// Finite inputs that produce an infinity overflowed; finite
+				// inputs that produce an inexact subnormal underflowed.
+				// fsflags() already raised NX for both.
+				if ((ia & 0x7f800000u) != 0x7f800000u
+					&& (ib & 0x7f800000u) != 0x7f800000u) {
+					const uint32_t result = dst.i32[0] & 0x7fffffffu;
+					if (result == 0x7f800000u) {
+						cpu.registers().fcsr().fflags |= 4; // OF
+						// The overflow value depends on the rounding mode
+						// (IEEE 754 §7.4): RTZ saturates to the largest finite
+						// number for either sign, RDN only for a positive
+						// result and RUP only for a negative one. RNE and RMM
+						// keep the infinity the host FPU produced.
+						const unsigned rm = cpu.registers().fcsr().frm;
+						const bool neg = (dst.i32[0] & 0x80000000u) != 0;
+						if (rm == 0x1 || (rm == 0x2 && !neg) || (rm == 0x3 && neg)) {
+							dst.i32[0] = (dst.i32[0] & 0x80000000u) | 0x7F7FFFFFu;
+						}
+					}
+					else if (result < 0x00800000u
+						&& (double)fa * (double)fb != dst.f32[0])
+						cpu.registers().fcsr().fflags |= 2; // UF
+				}
+			}
 		} else if (fi.R4type.funct2 == 0x1) { // float64
 			dst.f64 = rs1.f64 * rs2.f64;
 			fsflags(cpu, (long double)(rs1.f64) * (long double)(rs2.f64), dst.f64);
@@ -313,15 +468,9 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMUL.S", "FMUL.D", "???", "FMUL.Q"
-		};
-		return snprintf(buffer, len, "%s %s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fmul",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FDIV,
@@ -332,24 +481,45 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		if (fi.R4type.funct2 == 0x0) { // fp32
-			dst.set_float(rs1.f32[0] / rs2.f32[0]);
-			fsflags(cpu, (double)(rs1.f32[0]) / (double)(rs2.f32[0]), dst.f32[0]);
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
+			// Operands read out before the store: rd may alias rs1 or rs2. DZ
+			// is only for a finite non-zero numerator over zero: 0/0 is NV and
+			// inf/0 is exact.
+			const uint32_t ia = rs1.i32[0], ib = rs2.i32[0];
+			const float fa = rs1.f32[0], fb = rs2.f32[0];
+			dst.set_float(fa / fb);
+			fsflags(cpu, (double)fa / (double)fb, dst.f32[0]);
+			if constexpr (fcsr_emulation) {
+				if ((ia & 0x7fffffffu) != 0 && (ia & 0x7f800000u) != 0x7f800000u
+					&& (ib & 0x7fffffffu) == 0)
+					cpu.registers().fcsr().fflags |= 8; // DZ
+			}
 		} else if (fi.R4type.funct2 == 0x1) { // fp64
-			dst.f64 = rs1.f64 / rs2.f64;
-			fsflags(cpu, (long double)(rs1.f64) / (long double)(rs2.f64), dst.f64);
+			const uint64_t ia = rs1.i64, ib = rs2.i64;
+			const double da = rs1.f64, db = rs2.f64;
+			dst.f64 = da / db;
+			fsflags(cpu, (long double)da / (long double)db, dst.f64);
+			if constexpr (fcsr_emulation) {
+				if ((ia & 0x7fffffffffffffffull) != 0
+					&& (ia & 0x7ff0000000000000ull) != 0x7ff0000000000000ull
+					&& (ib & 0x7fffffffffffffffull) == 0)
+					cpu.registers().fcsr().fflags |= 8; // DZ
+			}
 		} else {
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FDIV.S", "FDIV.D", "???", "FDIV.Q"
-		};
-		return snprintf(buffer, len, "%s %s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fdiv",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FSQRT,
@@ -360,10 +530,38 @@ namespace riscv
 		auto& dst = cpu.registers().getfl(fi.R4type.rd);
 		switch (fi.R4type.funct2) {
 		case 0x0: // FSQRT.S
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u32(CANONICAL_NAN_F32);
+					return;
+				}
+			}
+			// sqrt(qNaN) is the canonical qNaN and is *not* an invalid
+			// operation; only a signaling NaN input raises NV. fsflags() would
+			// raise it for both, so quiet NaNs are handled before we get there.
+			if constexpr (fcsr_emulation) {
+				if (UNLIKELY(std::isnan(rs1.f32[0]))) {
+					// Classified before the store, as rd may alias rs1.
+					const bool snan = is_signaling_nan(rs1.f32[0]);
+					dst.load_u32(CANONICAL_NAN_F32);
+					cpu.registers().fcsr().fflags = snan ? 16 : 0;
+					return;
+				}
+			}
 			dst.set_float(sqrtf(rs1.f32[0]));
 			fsflags(cpu, std::sqrt((double)(rs1.f32[0])), dst.f32[0]);
 			break;
 		case 0x1: // FSQRT.D
+			if constexpr (fcsr_emulation) {
+				if (UNLIKELY(std::isnan(rs1.f64))) {
+					const bool snan = is_signaling_nan(rs1.f64);
+					dst.load_u64(CANONICAL_NAN_F64);
+					cpu.registers().fcsr().fflags = snan ? 16 : 0;
+					return;
+				}
+			}
 			dst.f64 = sqrt(rs1.f64);
 			fsflags(cpu, std::sqrt((long double)(rs1.f64)), dst.f64);
 			break;
@@ -371,14 +569,9 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FSQRT.S", "FSQRT.D", "???", "FSQRT.Q"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fsqrt",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FMIN_FMAX,
@@ -389,40 +582,59 @@ namespace riscv
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		auto& dst = cpu.registers().getfl(fi.R4type.rd);
 
+		// RV64 NaN-boxing: an operand whose upper 32 bits are not all ones
+		// is read as the canonical quiet NaN, not as its low word. That also
+		// makes the FMIN/FMAX NaN-propagation agree with the spec: a single
+		// non-boxed operand yields the other operand, and a quiet NaN never
+		// raises NV.
+		if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+			if (fi.R4type.funct2 == 0x0
+				&& UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+				const bool nb1 = static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu;
+				const bool nb2 = static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu;
+				if (nb1 && nb2)
+					dst.load_u32(CANONICAL_NAN_F32);
+				else if (nb1)
+					dst.load_u32(rs2.i32[0]);
+				else
+					dst.load_u32(rs1.i32[0]);
+				if constexpr (fcsr_emulation)
+					cpu.registers().fcsr().fflags = 0;
+				return;
+			}
+		}
+
 		// RISC-V spec §11.6 FMIN/FMAX: treat -0.0 < +0.0 (IEEE 754
-		// fmin/fmax leave ±0 ordering implementation-defined). We
-		// disambiguate by inspecting sign bits whenever both operands
-		// compare equal to zero.
-		auto fmin32 = [&](uint32_t ab, uint32_t bb) -> uint32_t {
+		// fmin/fmax leave ±0 ordering implementation-defined). The rules
+		// live in rvfd_util.hpp; these wrappers only move bits in and out,
+		// as an f-register holds a raw pattern rather than a host float.
+		// rv_fmin/rv_fmax canonicalize two-NaN operands themselves, which
+		// the non-FCSR paths below deliberately keep, as it is the only
+		// result a program can meaningfully use.
+		auto fmin32 = [](uint32_t ab, uint32_t bb) -> uint32_t {
 			float a, b; __builtin_memcpy(&a, &ab, 4); __builtin_memcpy(&b, &bb, 4);
-			if (a == 0.0f && b == 0.0f) {
-				// -0 < +0 → return -0 if either is negative.
-				return ((ab | bb) & 0x80000000u) ? 0x80000000u : 0x00000000u;
-			}
-			float r = std::fmin(a, b); uint32_t rb; __builtin_memcpy(&rb, &r, 4); return rb;
+			float r = rv_fmin32(a, b); uint32_t rb; __builtin_memcpy(&rb, &r, 4); return rb;
 		};
-		auto fmax32 = [&](uint32_t ab, uint32_t bb) -> uint32_t {
+		auto fmax32 = [](uint32_t ab, uint32_t bb) -> uint32_t {
 			float a, b; __builtin_memcpy(&a, &ab, 4); __builtin_memcpy(&b, &bb, 4);
-			if (a == 0.0f && b == 0.0f) {
-				// -0 < +0 → return +0 if either is non-negative.
-				return (~(ab & bb) & 0x80000000u) ? 0x00000000u : 0x80000000u;
-			}
-			float r = std::fmax(a, b); uint32_t rb; __builtin_memcpy(&rb, &r, 4); return rb;
+			float r = rv_fmax32(a, b); uint32_t rb; __builtin_memcpy(&rb, &r, 4); return rb;
 		};
-		auto fmin64 = [&](uint64_t ab, uint64_t bb) -> uint64_t {
+		auto fmin64 = [](uint64_t ab, uint64_t bb) -> uint64_t {
 			double a, b; __builtin_memcpy(&a, &ab, 8); __builtin_memcpy(&b, &bb, 8);
-			if (a == 0.0 && b == 0.0) {
-				return ((ab | bb) & 0x8000000000000000ull) ? 0x8000000000000000ull : 0x0ull;
-			}
-			double r = std::fmin(a, b); uint64_t rb; __builtin_memcpy(&rb, &r, 8); return rb;
+			double r = rv_fmin64(a, b); uint64_t rb; __builtin_memcpy(&rb, &r, 8); return rb;
 		};
-		auto fmax64 = [&](uint64_t ab, uint64_t bb) -> uint64_t {
+		auto fmax64 = [](uint64_t ab, uint64_t bb) -> uint64_t {
 			double a, b; __builtin_memcpy(&a, &ab, 8); __builtin_memcpy(&b, &bb, 8);
-			if (a == 0.0 && b == 0.0) {
-				return (~(ab & bb) & 0x8000000000000000ull) ? 0x0ull : 0x8000000000000000ull;
-			}
-			double r = std::fmax(a, b); uint64_t rb; __builtin_memcpy(&rb, &r, 8); return rb;
+			double r = rv_fmax64(a, b); uint64_t rb; __builtin_memcpy(&rb, &r, 8); return rb;
 		};
+
+		// A signaling NaN operand raises NV; a quiet one does not. Classified
+		// before the result is stored, because rd may alias rs1 or rs2, and by
+		// funct2 (the operand precision) rather than through the low 32 bits.
+		const bool snan = !fcsr_emulation ? false : (fi.R4type.funct2 == 0x0)
+			? (is_signaling_nan(rs1.f32[0]) || is_signaling_nan(rs2.f32[0]))
+			: (is_signaling_nan(rs1.f64) || is_signaling_nan(rs2.f64));
 
 		switch (fi.R4type.funct3 | (fi.R4type.funct2 << 4))
 		{
@@ -430,6 +642,10 @@ namespace riscv
 			if constexpr (fcsr_emulation) {
 				if (std::isnan(rs1.f32[0]) && std::isnan(rs2.f32[0]))
 					dst.load_u32(CANONICAL_NAN_F32);
+				else if (std::isnan(rs1.f32[0]))
+					dst.load_u32(rs2.i32[0]);
+				else if (std::isnan(rs2.f32[0]))
+					dst.load_u32(rs1.i32[0]);
 				else
 					dst.load_u32(fmin32(rs1.i32[0], rs2.i32[0]));
 			} else {
@@ -440,6 +656,10 @@ namespace riscv
 			if constexpr (fcsr_emulation) {
 				if (std::isnan(rs1.f32[0]) && std::isnan(rs2.f32[0]))
 					dst.load_u32(CANONICAL_NAN_F32);
+				else if (std::isnan(rs1.f32[0]))
+					dst.load_u32(rs2.i32[0]);
+				else if (std::isnan(rs2.f32[0]))
+					dst.load_u32(rs1.i32[0]);
 				else
 					dst.load_u32(fmax32(rs1.i32[0], rs2.i32[0]));
 			} else {
@@ -470,23 +690,11 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 		if constexpr (fcsr_emulation) {
-			if (is_signaling_nan(rs1.f32[0]) || is_signaling_nan(rs2.f32[0]))
-				cpu.registers().fcsr().fflags = 16;
-			else
-				cpu.registers().fcsr().fflags = 0;
+			cpu.registers().fcsr().fflags = snan ? 16 : 0;
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 8> insn {
-			"FMIN", "FMAX", "???", "???", "???", "???", "???", "???"
-		};
-		return snprintf(buffer, len, "%s.%c %s %s, %s",
-						insn[fi.R4type.funct3],
-						RISCV::flpsize(fi.R4type.funct2),
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::regname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
 	});
 
 	FLOAT_INSTR(FEQ_FLT_FLE,
@@ -496,6 +704,29 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		auto& dst = cpu.reg(fi.R4type.rd);
+
+		// RV64 NaN-boxing: an operand whose upper 32 bits are not all ones
+		// is read as the canonical quiet NaN, not as its low word. All
+		// compares then return false; a quiet NaN input does not raise NV,
+		// so clear the flags the same way feqflags would.
+		if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+			if (fi.R4type.funct2 == 0x0
+				&& UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+				dst = 0;
+				if constexpr (fcsr_emulation) {
+					// FLE/FLT are signaling compares: any NaN operand
+					// (including the canonical qNaN a non-boxed operand is
+					// read as) raises NV. FEQ is quiet: only sNaN raises NV.
+					const unsigned op = fi.R4type.funct3 | (fi.R4type.funct2 << 4);
+					if (op == 0x0 || op == 0x1 || op == 0x10 || op == 0x11)
+						cpu.registers().fcsr().fflags = 16; // NV
+					else
+						cpu.registers().fcsr().fflags = 0;
+				}
+				return;
+			}
+		}
 
 		switch (fi.R4type.funct3 | (fi.R4type.funct2 << 4))
 		{
@@ -527,17 +758,8 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> insn {
-			"FLE", "FLT", "FEQ", "F???"
-		};
-		return snprintf(buffer, len, "%s.%c %s %s, %s",
-						insn[fi.R4type.funct3],
-						RISCV::flpsize(fi.R4type.funct2),
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::regname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
 	});
 
 	FLOAT_INSTR(FCVT_SD_DS,
@@ -546,25 +768,70 @@ namespace riscv
 		const rv32f_instruction fi { instr };
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		// Zfhmin adds three of the four half-precision conversions to this
+		// group; rs2 names the source format the same way funct2 names the
+		// destination, so a half on either side is rs2 == 2 or funct2 == 2.
+		if (fi.R4type.rs2 == 0x2 || fi.R4type.funct2 == 0x2) {
+			switch ((fi.R4type.funct2 << 3) | fi.R4type.rs2) {
+			case (0x0 << 3) | 0x2: // FCVT.S.H
+				dst.set_float(fp16::to_f32(rs1.get_half()));
+				return;
+			case (0x1 << 3) | 0x2: // FCVT.D.H
+				dst.set_double(fp16::to_f64(rs1.get_half()));
+				return;
+			case (0x2 << 3) | 0x0: // FCVT.H.S
+				// The single-precision source is itself NaN-boxed on RV64,
+				// and an unboxed one is the canonical NaN.
+				if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+					if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu)) {
+						dst.load_u16(0x7E00);
+						return;
+					}
+				}
+				dst.load_u16(fp16::from_f32(rs1.f32[0]));
+				return;
+			case (0x2 << 3) | 0x1: // FCVT.H.D
+				// Narrowing in one step: going via f32 would round twice.
+				dst.load_u16(fp16::from_f64(rs1.f64));
+				return;
+			}
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+			return;
+		}
+		// rs2 names the source format: the only pair left is single and
+		// double, so it must be whichever of the two the destination is not.
+		if (fi.R4type.rs2 != (fi.R4type.funct2 ^ 1)) {
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+			return;
+		}
 		switch (fi.R4type.funct2) {
 		case 0x0: // FCVT.S.D (64 -> 32)
-			dst.set_float(rs1.f64);
+			if (std::isnan(rs1.f64))
+				dst.load_u32(CANONICAL_NAN_F32);
+			else
+				dst.set_float(rs1.f64);
 			break;
 		case 0x1: // FCVT.D.S (32 -> 64)
-			dst.f64 = rs1.f32[0];
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu)) {
+					dst.load_u64(CANONICAL_NAN_F64);
+					break;
+				}
+			}
+			if (std::isnan(rs1.f32[0]))
+				dst.load_u64(CANONICAL_NAN_F64);
+			else
+				dst.f64 = rs1.f32[0];
 			break;
 		default:
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FCVT.S.D", "FCVT.D.S", "???", "???"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fcvt",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FCVT_W_SD,
@@ -572,69 +839,73 @@ namespace riscv
 	{
 		const rv32f_instruction fi { instr };
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
-		const auto rmm = fi.R4type.funct3; // RMM is encoded in funct3 field
+		auto rmm = fi.R4type.funct3; // rounding mode is encoded in funct3
+		if (rmm == 0x7) // DYN: use the dynamic mode from the fcsr CSR (frm field)
+			rmm = cpu.registers().fcsr().frm;
 		auto& dst = cpu.reg(fi.R4type.rd);
+		bool invalid = false, inexact = false;
 		switch (fi.R4type.funct2) {
-		case 0x0: // from float32
-			if (fi.R4type.rs2 == 0x0 && rmm == 0x1) // FCVT.W.S with RMM=RTZ
-				dst = int32_t(std::trunc(rs1.f32[0]));
-			else if (fi.R4type.rs2 == 0x0 && rmm == 0x2) // FCVT.W.S with RMM=RDN
-				dst = int32_t(std::floor(rs1.f32[0]));
-			else if (fi.R4type.rs2 == 0x0) // FCVT.W.S with RMM=...
-				dst = (int32_t) rs1.f32[0];
-			else if (fi.R4type.rs2 == 0x1 && rmm == 0x1) // FCVT.WU.S with RMM=RTZ
-				dst = uint32_t(std::trunc(rs1.f32[0]));
-			else if (fi.R4type.rs2 == 0x1 && rmm == 0x2) // FCVT.WU.S with RMM=RDN
-				dst = uint32_t(std::floor(rs1.f32[0]));
-			else if (fi.R4type.rs2 == 0x1) // FCVT.WU.S with RMM=...
-				dst = (uint32_t) rs1.f32[0];
-			return;
+		case 0x0: { // from float32
+			// RV64 NaN-boxing: an operand whose upper 32 bits are not all
+			// ones is read as the canonical quiet NaN, not as its low word.
+			// A NaN operand converts to the maximum value and raises NV,
+			// which fcvt_to_integer() below already does for qNaN. The source
+			// register itself must not be modified, so substitute a local.
+			float src = rs1.f32[0];
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu))
+					__builtin_memcpy(&src, &CANONICAL_NAN_F32, sizeof(src));
+			}
+			switch (fi.R4type.rs2) {
+			case 0x0: // FCVT.W.S (sign-extended 32-bit result)
+				dst = fcvt_to_integer<int32_t>(src, rmm, invalid, inexact);
+				break;
+			case 0x1: // FCVT.WU.S (sign-extended 32-bit result)
+				dst = int32_t(fcvt_to_integer<uint32_t>(src, rmm, invalid, inexact));
+				break;
+			case 0x2: // FCVT.L.S
+				dst = fcvt_to_integer<int64_t>(src, rmm, invalid, inexact);
+				break;
+			case 0x3: // FCVT.LU.S
+				dst = fcvt_to_integer<uint64_t>(src, rmm, invalid, inexact);
+				break;
+			default:
+				cpu.trigger_exception(ILLEGAL_OPERATION);
+			}
+			break;
+		}
 		case 0x1: // from float64
 			switch (fi.R4type.rs2) {
-			case 0x0: // FCVT.W.D
-				if (rmm == 0x1) // RMM=RTZ
-					dst = int32_t(std::trunc(rs1.f64));
-				else if (rmm == 0x2) // RMM=RDN
-					dst = int32_t(std::floor(rs1.f64));
-				else // RMM=...
-					dst = (int32_t) rs1.f64;
-				return;
-			case 0x1: // FCVT.WU.D
-				if (rmm == 0x1) // RMM=RTZ
-					dst = uint32_t(std::trunc(rs1.f64));
-				else if (rmm == 0x2) // RMM=RDN
-					dst = uint32_t(std::floor(rs1.f64));
-				else // RMM=...
-					dst = (uint32_t) rs1.f64;
-				return;
+			case 0x0: // FCVT.W.D (sign-extended 32-bit result)
+				dst = fcvt_to_integer<int32_t>(rs1.f64, rmm, invalid, inexact);
+				break;
+			case 0x1: // FCVT.WU.D (sign-extended 32-bit result)
+				dst = int32_t(fcvt_to_integer<uint32_t>(rs1.f64, rmm, invalid, inexact));
+				break;
 			case 0x2: // FCVT.L.D
-				if (rmm == 0x1) // RMM=RTZ
-					dst = int64_t(std::trunc(rs1.f64));
-				else if (rmm == 0x2) // RMM=RDN
-					dst = int64_t(std::floor(rs1.f64));
-				else // RMM=...
-					dst = (int64_t) rs1.f64;
-				return;
+				dst = fcvt_to_integer<int64_t>(rs1.f64, rmm, invalid, inexact);
+				break;
 			case 0x3: // FCVT.LU.D
-				if (rmm == 0x1) // RMM=RTZ
-					dst = uint64_t(std::trunc(rs1.f64));
-				else if (rmm == 0x2) // RMM=RDN
-					dst = uint64_t(std::floor(rs1.f64));
-				else // RMM=...
-					dst = (uint64_t) rs1.f64;
-				return;
+				dst = fcvt_to_integer<uint64_t>(rs1.f64, rmm, invalid, inexact);
+				break;
+			default:
+				cpu.trigger_exception(ILLEGAL_OPERATION);
 			}
+			break;
+		default:
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+			return;
 		}
-		cpu.trigger_exception(ILLEGAL_OPERATION);
+		if constexpr (fcsr_emulation) {
+			if (invalid)
+				cpu.registers().fcsr().fflags |= 16; // NV
+			else if (inexact)
+				cpu.registers().fcsr().fflags |= 1; // NX
+		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FCVT.W.S", "FCVT.W.D", "???", "FCVT.W.Q"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::regname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fcvt",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FCVT_SD_W,
@@ -643,39 +914,59 @@ namespace riscv
 		const rv32f_instruction fi { instr };
 		auto& rs1 = cpu.reg(fi.R4type.rs1);
 		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		bool inexact = false;
+		auto rmm = fi.R4type.funct3; // rounding mode is encoded in funct3
+		if (rmm == 0x7) // DYN: use the dynamic mode from the fcsr CSR (frm field)
+			rmm = cpu.registers().fcsr().frm;
 		switch (fi.R4type.funct2) {
 		case 0x0: // to float32
-			if (fi.R4type.rs2 == 0x0) // FCVT.S.W
-				dst.set_float((int32_t)rs1);
-			else // FCVT.S.WU
-				dst.set_float((uint32_t)rs1);
-			return;
+			switch (fi.R4type.rs2) {
+			case 0x0: // FCVT.S.W
+				dst.set_float(fcvt_from_integer<float>((int32_t)rs1, rmm, inexact));
+				break;
+			case 0x1: // FCVT.S.WU
+				dst.set_float(fcvt_from_integer<float>((uint32_t)rs1, rmm, inexact));
+				break;
+			case 0x2: // FCVT.S.L
+				dst.set_float(fcvt_from_integer<float>((int64_t)rs1, rmm, inexact));
+				break;
+			case 0x3: // FCVT.S.LU
+				dst.set_float(fcvt_from_integer<float>((uint64_t)rs1, rmm, inexact));
+				break;
+			default:
+				cpu.trigger_exception(ILLEGAL_OPERATION);
+			}
+			break;
 		case 0x1: // to float64
 			switch (fi.R4type.rs2) {
 			case 0x0: // FCVT.D.W
-				dst.f64 = (int32_t)rs1;
-				return;
+				dst.f64 = fcvt_from_integer<double>((int32_t)rs1, rmm, inexact);
+				break;
 			case 0x1: // FCVT.D.WU
-				dst.f64 = (uint32_t)rs1;
-				return;
+				dst.f64 = fcvt_from_integer<double>((uint32_t)rs1, rmm, inexact);
+				break;
 			case 0x2: // FCVT.D.L
-				dst.f64 = (int64_t)rs1;
-				return;
+				dst.f64 = fcvt_from_integer<double>((int64_t)rs1, rmm, inexact);
+				break;
 			case 0x3: // FCVT.D.LU
-				dst.f64 = (uint64_t)rs1;
-				return;
+				dst.f64 = fcvt_from_integer<double>((uint64_t)rs1, rmm, inexact);
+				break;
+			default:
+				cpu.trigger_exception(ILLEGAL_OPERATION);
 			}
+			break;
+		default:
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+			return;
 		}
-		cpu.trigger_exception(ILLEGAL_OPERATION);
+		if constexpr (fcsr_emulation) {
+			if (inexact)
+				cpu.registers().fcsr().fflags |= 1; // NX
+		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FCVT.S.W", "FCVT.D.W", "???", "FCVT.Q.W"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::regname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fcvt",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FSGNJ_NX,
@@ -685,6 +976,19 @@ namespace riscv
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
 		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
 		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		// RV64 NaN-boxing: an operand whose upper 32 bits are not all ones
+		// is read as the canonical quiet NaN, not as its low word. Both
+		// source registers are checked: the sign-selecting operand rs2 is
+		// read as a NaN too, so any non-boxed input makes the result NaN.
+		if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+			if (fi.R4type.funct2 == 0x0
+				&& UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+				// FSGNJN inverts the sign bit of the NaN result (§11.6).
+				dst.load_u32(fi.R4type.funct3 == 0x1 ? 0xFFC00000u : CANONICAL_NAN_F32);
+				return;
+			}
+		}
 		switch (fi.R4type.funct3) {
 		case 0x0: // FSGNJ
 			switch (fi.R4type.funct2) {
@@ -726,24 +1030,8 @@ namespace riscv
 			cpu.trigger_exception(ILLEGAL_OPERATION);
 		}
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-
-		if (fi.R4type.rs1 == fi.R4type.rs2) {
-			static const char* insn[4] = {"FMV", "FNEG", "FABS", "???"};
-			return snprintf(buffer, len, "%s.%c %s, %s",
-							insn[fi.R4type.funct3],
-							RISCV::flpsize(fi.R4type.funct2),
-							RISCV::flpname(fi.R4type.rs1),
-							RISCV::flpname(fi.R4type.rd));
-		}
-		static const char* insn[4] = {"FSGNJ", "FSGNJN", "FSGNJX", "???"};
-		return snprintf(buffer, len, "%s.%c %s %s, %s",
-						insn[fi.R4type.funct3],
-						RISCV::flpsize(fi.R4type.funct2),
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rs2),
-						RISCV::flpname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
 	});
 
 	FLOAT_INSTR(FCLASS, // 1110 f3 = 0x1
@@ -752,60 +1040,22 @@ namespace riscv
 		const rv32f_instruction fi { instr };
 		auto& dst = cpu.reg(fi.R4type.rd);
 		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
+		// FCLASS sets exactly one bit, derived from the raw sign/exponent/fraction
+		// fields. Host floating-point comparisons cannot be used here, as they
+		// don't distinguish subnormals from normals, or sNaN from qNaN.
 		switch (fi.R4type.funct2) {
 		case 0x0: // FCLASS.S
-			dst = 0;
-			if (rs1.f32[0] == -std::numeric_limits<float>::infinity())
-				dst |= 1U << 0;
-			if (rs1.f32[0] < 0)
-				dst |= 1U << 1;
-			if (rs1.f32[0] == -std::numeric_limits<float>::denorm_min())
-				dst |= 1U << 2;
-			if (rs1.f32[0] == -0.0)
-				dst |= 1U << 3;
-			if (rs1.f32[0] == +0.0)
-				dst |= 1U << 4;
-			if (rs1.f32[0] == std::numeric_limits<float>::denorm_min())
-				dst |= 1U << 5;
-			if (rs1.f32[0] >= std::numeric_limits<float>::epsilon())
-				dst |= 1U << 6;
-			if (rs1.f32[0] == std::numeric_limits<float>::infinity())
-				dst |= 1U << 7;
-			if (std::isnan(rs1.f32[0]))
-				dst |= 3U << 8;
+			dst = rv_fclass32(rs1.i32[0]);
 			return;
 		case 0x1: // FCLASS.D
-			dst = 0;
-			if (rs1.f64 == -std::numeric_limits<double>::infinity())
-				dst |= 1U << 0;
-			if (rs1.f64 < 0)
-				dst |= 1U << 1;
-			if (rs1.f64 == -std::numeric_limits<double>::denorm_min())
-				dst |= 1U << 2;
-			if (rs1.f64 == -0.0)
-				dst |= 1U << 3;
-			if (rs1.f64 == +0.0)
-				dst |= 1U << 4;
-			if (rs1.f64 == std::numeric_limits<double>::denorm_min())
-				dst |= 1U << 5;
-			if (rs1.f64 >= std::numeric_limits<double>::epsilon())
-				dst |= 1U << 6;
-			if (rs1.f64 == std::numeric_limits<double>::infinity())
-				dst |= 1U << 7;
-			if (std::isnan(rs1.f64))
-				dst |= 3U << 8;
+			dst = rv_fclass64(rs1.i64);
 			return;
 		}
 		cpu.trigger_exception(ILLEGAL_OPERATION);
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FCLASS.S", "FCLASS.D", "???", "FCLASS.Q"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::regname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fclass",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FMV_X_W, // 1110 f3 = 0x0
@@ -828,17 +1078,18 @@ namespace riscv
 				return;
 			}
 			break;
+		case 0x2: // FMV.X.H (Zfhmin)
+			// Like FMV.X.W, the bits move untouched and the sign extends
+			// across the rest of the destination. The box is not checked:
+			// this is a bit move, not a read of a half-precision value.
+			dst = RVSIGNTYPE(cpu)(int16_t(rs1.i32[0]));
+			return;
 		}
 		cpu.trigger_exception(ILLEGAL_OPERATION);
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
-		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMV.X.W", "FMV.X.D", "???", "FMV.X.Q"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::flpname(fi.R4type.rs1),
-						RISCV::regname(fi.R4type.rd));
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fmv",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 
 	FLOAT_INSTR(FMV_W_X, // 1111
@@ -857,16 +1108,302 @@ namespace riscv
 				return;
 			}
 			break;
+		case 0x2: // FMV.H.X (Zfhmin)
+			dst.load_u16(uint16_t(rs1));
+			return;
 		}
 		cpu.trigger_exception(ILLEGAL_OPERATION);
 	},
-	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) RVPRINTR_ATTR {
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fmv",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
+	});
+
+	static constexpr uint32_t FLI_TABLE_S[32] = {
+		0xBF800000u, 0x00800000u, 0x37800000u, 0x38000000u,
+		0x3B800000u, 0x3C000000u, 0x3D800000u, 0x3E000000u,
+		0x3E800000u, 0x3EA00000u, 0x3EC00000u, 0x3EE00000u,
+		0x3F000000u, 0x3F200000u, 0x3F400000u, 0x3F600000u,
+		0x3F800000u, 0x3FA00000u, 0x3FC00000u, 0x3FE00000u,
+		0x40000000u, 0x40200000u, 0x40400000u, 0x40800000u,
+		0x41000000u, 0x41800000u, 0x43000000u, 0x43800000u,
+		0x47000000u, 0x47800000u, 0x7F800000u, 0x7FC00000u
+	};
+	static constexpr uint64_t FLI_TABLE_D[32] = {
+		0xBFF0000000000000ull, 0x0010000000000000ull,
+		0x3EF0000000000000ull, 0x3F00000000000000ull,
+		0x3F70000000000000ull, 0x3F80000000000000ull,
+		0x3FB0000000000000ull, 0x3FC0000000000000ull,
+		0x3FD0000000000000ull, 0x3FD4000000000000ull,
+		0x3FD8000000000000ull, 0x3FDC000000000000ull,
+		0x3FE0000000000000ull, 0x3FE4000000000000ull,
+		0x3FE8000000000000ull, 0x3FEC000000000000ull,
+		0x3FF0000000000000ull, 0x3FF4000000000000ull,
+		0x3FF8000000000000ull, 0x3FFC000000000000ull,
+		0x4000000000000000ull, 0x4004000000000000ull,
+		0x4008000000000000ull, 0x4010000000000000ull,
+		0x4020000000000000ull, 0x4030000000000000ull,
+		0x4060000000000000ull, 0x4070000000000000ull,
+		0x40E0000000000000ull, 0x40F0000000000000ull,
+		0x7FF0000000000000ull, 0x7FF8000000000000ull
+	};
+
+	FLOAT_INSTR(FLI,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
 		const rv32f_instruction fi { instr };
-		static const std::array<const char*, 4> f2 {
-			"FMV.W.X", "FMV.D.X", "???", "FMV.Q.X"
-		};
-		return snprintf(buffer, len, "%s %s, %s", f2[fi.R4type.funct2],
-						RISCV::regname(fi.R4type.rs1),
-						RISCV::flpname(fi.R4type.rd));
+		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		switch (fi.R4type.funct2) {
+		case 0x0:
+			dst.load_u32(FLI_TABLE_S[fi.R4type.rs1]);
+			return;
+		case 0x1:
+			dst.load_u64(FLI_TABLE_D[fi.R4type.rs1]);
+			return;
+		}
+		cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fli",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
+	});
+
+	FLOAT_INSTR(FMINM_FMAXM,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
+		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
+		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		const bool is_max = (fi.R4type.funct3 & 1) != 0;
+
+		switch (fi.R4type.funct2) {
+		case 0x0: {
+			uint32_t ab = rs1.i32[0];
+			uint32_t bb = rs2.i32[0];
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu))
+					ab = CANONICAL_NAN_F32;
+				if (UNLIKELY(static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu))
+					bb = CANONICAL_NAN_F32;
+			}
+			float a, b;
+			__builtin_memcpy(&a, &ab, 4);
+			__builtin_memcpy(&b, &bb, 4);
+			const bool snan = !fcsr_emulation ? false
+				: (is_signaling_nan(a) || is_signaling_nan(b));
+			uint32_t rb;
+			if (std::isnan(a) || std::isnan(b)) {
+				rb = CANONICAL_NAN_F32;
+			} else if (a == 0.0f && b == 0.0f) {
+				rb = is_max
+					? (((ab & bb) & 0x80000000u) ? 0x80000000u : 0x00000000u)
+					: (((ab | bb) & 0x80000000u) ? 0x80000000u : 0x00000000u);
+			} else {
+				const float r = is_max ? std::fmax(a, b) : std::fmin(a, b);
+				__builtin_memcpy(&rb, &r, 4);
+			}
+			dst.load_u32(rb);
+			if constexpr (fcsr_emulation)
+				cpu.registers().fcsr().fflags = snan ? 16 : 0;
+			return;
+		}
+		case 0x1: {
+			const uint64_t ab = rs1.i64;
+			const uint64_t bb = rs2.i64;
+			const double a = rs1.f64;
+			const double b = rs2.f64;
+			const bool snan = !fcsr_emulation ? false
+				: (is_signaling_nan(a) || is_signaling_nan(b));
+			uint64_t rb;
+			if (std::isnan(a) || std::isnan(b)) {
+				rb = CANONICAL_NAN_F64;
+			} else if (a == 0.0 && b == 0.0) {
+				rb = is_max
+					? (((ab & bb) & 0x8000000000000000ull) ? 0x8000000000000000ull : 0x0ull)
+					: (((ab | bb) & 0x8000000000000000ull) ? 0x8000000000000000ull : 0x0ull);
+			} else {
+				const double r = is_max ? std::fmax(a, b) : std::fmin(a, b);
+				__builtin_memcpy(&rb, &r, 8);
+			}
+			dst.load_u64(rb);
+			if constexpr (fcsr_emulation)
+				cpu.registers().fcsr().fflags = snan ? 16 : 0;
+			return;
+		}
+		}
+		cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
+	});
+
+	FLOAT_INSTR(FROUND,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
+		auto& dst = cpu.registers().getfl(fi.R4type.rd);
+		auto rmm = fi.R4type.funct3;
+		if (rmm == 0x7)
+			rmm = cpu.registers().fcsr().frm;
+		const bool signal_inexact = (fi.R4type.rs2 == 0x5);
+
+		switch (fi.R4type.funct2) {
+		case 0x0: {
+			float src = rs1.f32[0];
+			if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+				if (UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu))
+					__builtin_memcpy(&src, &CANONICAL_NAN_F32, sizeof(src));
+			}
+			if (UNLIKELY(std::isnan(src))) {
+				if constexpr (fcsr_emulation)
+					cpu.registers().fcsr().fflags = is_signaling_nan(src) ? 16 : 0;
+				dst.load_u32(CANONICAL_NAN_F32);
+				return;
+			}
+			const float result = fcvt_round(src, rmm);
+			if constexpr (fcsr_emulation)
+				cpu.registers().fcsr().fflags =
+					(signal_inexact && result != src) ? 1 : 0;
+			dst.set_float(result);
+			return;
+		}
+		case 0x1: {
+			const double src = rs1.f64;
+			if (UNLIKELY(std::isnan(src))) {
+				if constexpr (fcsr_emulation)
+					cpu.registers().fcsr().fflags = is_signaling_nan(src) ? 16 : 0;
+				dst.load_u64(CANONICAL_NAN_F64);
+				return;
+			}
+			const double result = fcvt_round(src, rmm);
+			if constexpr (fcsr_emulation)
+				cpu.registers().fcsr().fflags =
+					(signal_inexact && result != src) ? 1 : 0;
+			dst.set_double(result);
+			return;
+		}
+		}
+		cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
+	});
+
+	FLOAT_INSTR(FCVTMOD_W_D,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		const double src = cpu.registers().getfl(fi.R4type.rs1).f64;
+		auto& dst = cpu.reg(fi.R4type.rd);
+		bool invalid = false, inexact = false;
+		int32_t result = 0;
+
+		if (UNLIKELY(std::isnan(src) || std::isinf(src))) {
+			invalid = true;
+		} else {
+			const double trunced = std::trunc(src);
+			if (!(trunced >= -2147483648.0 && trunced < 2147483648.0))
+				invalid = true;
+			else if constexpr (fcsr_emulation)
+				inexact = (trunced != src);
+			const double wrapped = std::fmod(trunced, 4294967296.0);
+			result = int32_t(uint32_t(int64_t(wrapped)));
+		}
+		dst = RVSIGNTYPE(cpu)(result);
+		if constexpr (fcsr_emulation) {
+			auto& fcsr = cpu.registers().fcsr();
+			fcsr.fflags = 0;
+			if (invalid)
+				fcsr.fflags |= 16;
+			else if (inexact)
+				fcsr.fflags |= 1;
+		}
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fcvtmod",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
+	});
+
+	FLOAT_INSTR(FLEQ_FLTQ,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		auto& rs1 = cpu.registers().getfl(fi.R4type.rs1);
+		auto& rs2 = cpu.registers().getfl(fi.R4type.rs2);
+		auto& dst = cpu.reg(fi.R4type.rd);
+
+		if constexpr (RVISGE64BIT(cpu) && nanboxing) {
+			if (fi.R4type.funct2 == 0x0
+				&& UNLIKELY(static_cast<uint32_t>(rs1.i32[1]) != 0xFFFFFFFFu
+					|| static_cast<uint32_t>(rs2.i32[1]) != 0xFFFFFFFFu)) {
+				dst = 0;
+				if constexpr (fcsr_emulation)
+					cpu.registers().fcsr().fflags = 0;
+				return;
+			}
+		}
+
+		switch (fi.R4type.funct3 | (fi.R4type.funct2 << 4))
+		{
+		case 0x4: // FLEQ.S
+			dst = (rs1.f32[0] <= rs2.f32[0]) ? 1 : 0;
+			feqflags<false>(cpu, rs1.f32[0], rs2.f32[0], dst);
+			break;
+		case 0x5: // FLTQ.S
+			dst = (rs1.f32[0] < rs2.f32[0]) ? 1 : 0;
+			feqflags<false>(cpu, rs1.f32[0], rs2.f32[0], dst);
+			break;
+		case 0x14: // FLEQ.D
+			dst = (rs1.f64 <= rs2.f64) ? 1 : 0;
+			feqflags<false>(cpu, rs1.f64, rs2.f64, dst);
+			break;
+		case 0x15: // FLTQ.D
+			dst = (rs1.f64 < rs2.f64) ? 1 : 0;
+			feqflags<false>(cpu, rs1.f64, rs2.f64, dst);
+			break;
+		default:
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+		}
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu));
+	});
+
+	FLOAT_INSTR(FMVH_X_D,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		if constexpr (RVIS32BIT(cpu)) {
+			if (fi.R4type.funct2 == 0x1) {
+				cpu.reg(fi.R4type.rd) = cpu.registers().getfl(fi.R4type.rs1).i32[1];
+				return;
+			}
+		}
+		cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fmvh",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
+	});
+
+	FLOAT_INSTR(FMVP_D_X,
+	[] (auto& cpu, rv32i_instruction instr) RVINSTR_COLDATTR
+	{
+		const rv32f_instruction fi { instr };
+		if constexpr (RVIS32BIT(cpu)) {
+			if (fi.R4type.funct2 == 0x1 && fi.R4type.funct3 == 0x0) {
+				const uint64_t lower = uint32_t(cpu.reg(fi.R4type.rs1));
+				const uint64_t upper = uint32_t(cpu.reg(fi.R4type.rs2));
+				cpu.registers().getfl(fi.R4type.rd).load_u64((upper << 32) | lower);
+				return;
+			}
+		}
+		cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[] (char* buffer, size_t len, auto& cpu, rv32i_instruction instr) RVPRINTR_ATTR {
+		return rv_expect_mnemonic(buffer, len, "fmvp",
+			RVFDISASM::op_fp(buffer, len, instr, RVISGE64BIT(cpu)));
 	});
 }

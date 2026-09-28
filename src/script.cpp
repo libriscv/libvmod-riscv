@@ -109,7 +109,6 @@ Script::Script(
 		.translate_enabled = true,
 		.translation_use_arena = false,
 		//.translate_ignore_instruction_limit = true,
-		.translate_use_syscall_clobbering_optimization = true,
 #  ifdef RISCV_LIBTCC
 		.translate_background_callback = [this](std::function<void()>& callback) {
 			std::thread([this, callback = std::move(callback)]() {
