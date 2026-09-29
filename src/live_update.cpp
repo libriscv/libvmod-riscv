@@ -58,11 +58,11 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 			/* Decrements reference when it goes out of scope.
 			   We need the *new* instance alive for access to the binary
 			   when writing it to disk. Don't *move*. See below. */
-			old = std::atomic_exchange(&vrm->program, inst);
+			old = rvs::atomic_exchange(&vrm->program, inst);
 
 		} else {
 			/* Live-debugging temporary tenant */
-			old = std::atomic_exchange(&vrm->debug_program, inst);
+			old = rvs::atomic_exchange(&vrm->debug_program, inst);
 		}
 
 		if (old != nullptr) { // 10 == on_live_update
@@ -141,25 +141,25 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 		/* If an extra argument is given, atomically swap in a new argv vector
 		   that includes it. Readers in machine_setup snapshot the shared_ptr
 		   atomically, so they see a consistent vector at all times. */
-		auto old_argv = std::atomic_load(&vrm->config.group.argv);
+		auto old_argv = rvs::atomic_load(&vrm->config.group.argv);
 		if (append_argument != nullptr) {
 			auto new_argv = std::make_shared<std::vector<std::string>>(*old_argv);
 			new_argv->push_back(append_argument);
-			std::atomic_store(&vrm->config.group.argv, std::move(new_argv));
+			rvs::atomic_store(&vrm->config.group.argv, std::move(new_argv));
 		}
 
 		std::shared_ptr<MachineInstance> inst;
 		try {
 			inst = std::make_shared<MachineInstance>(std::move(binary), ctx, vrm, false);
 		} catch (...) {
-			std::atomic_store(&vrm->config.group.argv, old_argv);
+			rvs::atomic_store(&vrm->config.group.argv, old_argv);
 			throw;
 		}
 		/* Restore the original argv now that the machine is fully constructed */
-		std::atomic_store(&vrm->config.group.argv, old_argv);
+		rvs::atomic_store(&vrm->config.group.argv, old_argv);
 
 		/* Atomically swap in the new program */
-		auto old = std::atomic_exchange(&vrm->program, inst);
+		auto old = rvs::atomic_exchange(&vrm->program, inst);
 
 		/* Transfer serialized state if both machines support it */
 		if (old != nullptr) { // 10 == on_live_update

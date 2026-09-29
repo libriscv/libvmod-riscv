@@ -43,6 +43,16 @@ function(add_vmod LIBNAME VCCNAME comment)
 	configure_file(${CMAKE_SOURCE_DIR}/src/config.h.in ${CMAKE_BINARY_DIR}/config.h)
 	# generate VCC .c and .h
 	set(VCCFILE "${CMAKE_CURRENT_SOURCE_DIR}/${VCCNAME}")
+	# $Addon is a Varnish Enterprise stanza, unknown to open-source vmodtool
+	file(READ ${VMODTOOL} VMODTOOL_SOURCE)
+	string(FIND "${VMODTOOL_SOURCE}" "AddonStanza" HAS_ADDON_STANZA)
+	if (HAS_ADDON_STANZA EQUAL -1)
+		set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VCCFILE})
+		file(READ ${VCCFILE} VCC_SOURCE)
+		string(REGEX REPLACE "\\$Addon[ \t]*\n" "" VCC_SOURCE "${VCC_SOURCE}")
+		set(VCCFILE "${CMAKE_CURRENT_BINARY_DIR}/${VCCNAME}")
+		file(WRITE ${VCCFILE} "${VCC_SOURCE}")
+	endif()
 	set(OUTFILES vcc_if.c vcc_if.h)
 	# for compatibility with automake naming
 	# NOTE: this will *NOT* work on Windows

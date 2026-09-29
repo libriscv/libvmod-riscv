@@ -1,5 +1,9 @@
 #pragma once
 
+/* vdef.h unconditionally defines dummy LIKELY/UNLIKELY, which clashes
+   with libriscv's definitions. Keep the branch hints. */
+#undef LIKELY
+#undef UNLIKELY
 extern "C" {
 # include <vdef.h>
 # include <vre.h>
@@ -14,3 +18,7 @@ extern "C" {
 	void VSL(enum VSL_tag_e tag, uint32_t vxid, const char *fmt, ...);
 	void VSLb(struct vsl_log *, int tag, const char *fmt, ...);
 }
+#undef LIKELY
+#undef UNLIKELY
+#define LIKELY(x)   __builtin_expect((x), 1)
+#define UNLIKELY(x) __builtin_expect((x), 0)

@@ -166,7 +166,7 @@ void tenant_append_main_argument(VRT_CTX, const char* tenant, const char* arg)
 		/* vcl_init is single-threaded, but use copy-and-swap for consistency */
 		auto new_argv = std::make_shared<std::vector<std::string>>(*t->config.group.argv);
 		new_argv->push_back(arg);
-		std::atomic_store(&t->config.group.argv, std::move(new_argv));
+		rvs::atomic_store(&t->config.group.argv, std::move(new_argv));
 	} else {
 		VSL(SLT_Error, 0,
 			"Attempted to add main argument to non-existent tenant '%s'",

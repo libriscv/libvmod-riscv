@@ -95,8 +95,14 @@ BUILT_SOURCES = vcc_if.h
 
 vcc_if.h vmod_riscv.rst vmod_riscv.man.rst: vcc_if.c
 
+## $Addon is a Varnish Enterprise stanza, unknown to open-source vmodtool.
 vcc_if.c: $(srcdir)/vmod_riscv.vcc
-	$(PYTHON) $(VMODTOOL) -o vcc_if $(srcdir)/vmod_riscv.vcc
+	if grep -q AddonStanza $(VMODTOOL); then \
+		$(PYTHON) $(VMODTOOL) -o vcc_if $(srcdir)/vmod_riscv.vcc; \
+	else \
+		sed '/^\$$Addon/d' $(srcdir)/vmod_riscv.vcc > vmod_riscv_oss.vcc && \
+		$(PYTHON) $(VMODTOOL) -o vcc_if vmod_riscv_oss.vcc; \
+	fi
 
 vmod_riscv.3: vmod_riscv.man.rst
 	$(RST2MAN) vmod_riscv.man.rst $@
@@ -128,5 +134,5 @@ EXTRA_DIST = \
 	$(VMOD_TESTS)
 
 CLEANFILES = \
-	vcc_if.c vcc_if.h \
+	vcc_if.c vcc_if.h vmod_riscv_oss.vcc \
 	vmod_riscv.rst vmod_riscv.man.rst vmod_riscv.3

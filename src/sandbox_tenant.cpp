@@ -2,6 +2,8 @@
 #include "varnish.hpp"
 #include <libriscv/util/crc32.hpp>
 #include "builder/builder.hpp"
+#include <climits>
+#include <unistd.h>
 using riscv::crc32;
 typedef void mi_output_fun(const char*, void*);
 extern "C" void mi_stats_print_out (mi_output_fun* out, void* arg);
@@ -132,9 +134,9 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug)
 	#endif
 		std::shared_ptr<MachineInstance> prog;
 		if (LIKELY(!debug))
-			prog = std::atomic_load(&this->program);
+			prog = rvs::atomic_load(&this->program);
 		else
-			prog = std::atomic_load(&this->debug_program);
+			prog = rvs::atomic_load(&this->debug_program);
 		/* First-time tenants could have no program loaded */
 		if (UNLIKELY(prog == nullptr))
 			return nullptr;

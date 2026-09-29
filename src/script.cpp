@@ -306,7 +306,7 @@ void Script::machine_setup(machine_t& machine, bool init)
 		machine.cpu.reset_stack_pointer(); // DONT TOUCH (YES YOU)
 		std::vector<std::string> args;
 		args.push_back(name());
-		auto argv_snap = std::atomic_load(&tenant().config.group.argv);
+		auto argv_snap = rvs::atomic_load(&tenant().config.group.argv);
 		for (const auto& a : *argv_snap) {
 			args.push_back(a);
 		}
