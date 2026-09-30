@@ -128,8 +128,9 @@ VCL_INT vmod_run(VRT_CTX, VCL_STRING arg)
 	default:
 		/* Unsupported method */
 		if (ctx && ctx->vsl) {
-			VSLb(ctx->vsl, SLT_Error, 0,
-				"riscv.run() called from unsupported VCL method %d", ctx->method);
+			VSLb(ctx->vsl, SLT_Error,
+			    "riscv.run() called from unsupported VCL method %d",
+			    ctx->method);
 		}
 		return -1;
 	}
