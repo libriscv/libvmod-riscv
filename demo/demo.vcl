@@ -8,6 +8,11 @@ backend default {
 }
 
 sub vcl_recv {
+	/* Keep the request body so POSTs can reach the VM backend on hash */
+	if (req.method == "POST") {
+		std.cache_req_body(1MB);
+		set req.http.X-Method = req.method;
+	}
 	//riscv.fork("qjs.com");
 	//if (req.url != "/cat" && req.url != "/verify") {
 	//	/* Verify request signature, decoded from base64 */
@@ -46,6 +51,10 @@ sub vcl_deliver {
 }
 
 sub vcl_backend_fetch {
+	/* Varnish turns hashed requests into GETs, restore POST to keep the body */
+	if (bereq.http.X-Method == "POST") {
+		set bereq.method = "POST";
+	}
 	if (bereq.http.X-Tenant) {
 		if (riscv.fork(bereq.http.X-Tenant)) {
 			riscv.run();
