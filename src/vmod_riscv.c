@@ -31,8 +31,8 @@ extern int  riscv_current_apply_hash(VRT_CTX);
 #define HDR_INVALID   UINT32_MAX
 static inline vcall_info enum_to_idx(VCL_ENUM e)
 {
-#ifdef VARNISH_PLUS
-#define VENUM(x) vmod_enum_##x
+#ifndef VENUM
+#  define VENUM(x) vmod_enum_##x
 #endif
 	if (e == VENUM(ON_REQUEST)) return (vcall_info){1, HDR_REQ, HDR_INVALID};
 	if (e == VENUM(ON_HASH))    return (vcall_info){2, HDR_INVALID, HDR_INVALID};
