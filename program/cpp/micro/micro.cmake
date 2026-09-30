@@ -16,6 +16,10 @@ set (APIPATH "${CMAKE_CURRENT_LIST_DIR}/api")
 set (UTILPATH "${CMAKE_CURRENT_LIST_DIR}/src/util")
 
 set(WARNINGS  "-Wall -Wextra -Werror=return-type -Wno-unused")
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	# extern "C" trampolines return C++ structs, VLA asm operands, fmt with -ffast-math
+	set(WARNINGS "${WARNINGS} -Wno-return-type-c-linkage -Wno-vla-cxx-extension -Wno-nan-infinity-disabled")
+endif()
 set(COMMON    "-fno-math-errno -fno-stack-protector")
 set(COMMON    "${COMMON} -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-memmove -fno-builtin-memcmp")
 set(COMMON    "${COMMON} -fno-builtin-strlen -fno-builtin-strcmp -fno-builtin-strncmp")
@@ -26,7 +30,11 @@ else()
 endif()
 
 # we have a linker script with separated text and rodata
-if (GCC_TRIPLE STREQUAL "riscv64-linux-gnu")
+if (GCC_TRIPLE STREQUAL "riscv64-linux-musl")
+	# zig c++ uses -mcpu instead of -march
+	set(COMMON "-mcpu=baseline_rv64+zba+zbb+zbc+zbs+zicond ${COMMON}")
+	option(LIBC_WRAP_NATIVE "" OFF)
+elseif (GCC_TRIPLE STREQUAL "riscv64-linux-gnu")
 	set(COMMON "-march=rv64gc_zba_zbb_zbc_zbs_zicond -mabi=lp64d ${COMMON}")
 	option(LIBC_WRAP_NATIVE "" OFF)
 elseif (GCC_TRIPLE STREQUAL "riscv64-unknown-elf")
@@ -42,7 +50,12 @@ if (XO_SCRIPT)
 	set(EXECUTE_ONLY TRUE)
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--script=${XO_SCRIPT}")
 endif()
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Ttext 0x120000")
+if (GCC_TRIPLE STREQUAL "riscv64-linux-musl")
+	# zig cc does not forward -Ttext
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--image-base=0x120000")
+else()
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Ttext 0x120000")
+endif()
 set(FLAGS "${WARNINGS} ${RISCV_ABI} ${COMMON}")
 
 if (LTO)

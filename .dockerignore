@@ -2,5 +2,6 @@
 program/riscv32-unknown-elf/
 program/riscv64-unknown-elf/
 program/riscv64-linux-gnu/
+program/riscv64-linux-musl/
 build/
 .build/

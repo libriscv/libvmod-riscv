@@ -2,6 +2,7 @@
 riscv32-unknown-elf/
 riscv64-unknown-elf/
 riscv64-linux-gnu/
+riscv64-linux-musl/
 .build/
 .vscode/
 *.log

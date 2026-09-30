@@ -35,7 +35,6 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get install -y \
-            g++-14-riscv64-linux-gnu \
             clang-18 \
             lld-18 \
             autoconf \
@@ -56,20 +55,13 @@ jobs:
           key: automake-ubuntu-linux-24.04
           max-size: 200M
 
-      - name: Build RISC-V programs
-        working-directory: program
-        run: |
-          export GCC_TRIPLE="riscv64-linux-gnu"
-          source detect_compiler.sh
-          mkdir -p $GCC_TRIPLE
-          cd $GCC_TRIPLE
-          cmake ../cpp \
-            -DGCC_TRIPLE=$GCC_TRIPLE \
-            -DCMAKE_TOOLCHAIN_FILE=micro/toolchain.cmake
-          make -j4
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
 
-      - name: Update test symlinks
-        run: ln -sfn ../program/riscv64-linux-gnu/js tests/js
+      - name: Build RISC-V programs
+        run: program/build.sh
 
       - name: Bootstrap (autogen + configure)
         env:

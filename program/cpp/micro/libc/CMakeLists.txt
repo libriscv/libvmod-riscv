@@ -31,6 +31,11 @@ if (LIBC_WRAP_NATIVE)
 		WRAP_NATIVE_SYSCALLS=1)
 endif()
 
+if (GCC_TRIPLE STREQUAL "riscv64-linux-musl")
+	target_compile_definitions(libc PRIVATE
+		LIBC_MUSL=1)
+endif()
+
 if (USE_NEWLIB)
 	target_compile_definitions(libc PUBLIC
 		USE_NEWLIB=1

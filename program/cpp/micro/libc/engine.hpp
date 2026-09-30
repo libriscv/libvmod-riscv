@@ -46,7 +46,7 @@ inline auto rdtime()
 inline auto rdcycle()
 {
 	uint64_t whole;
-	asm ("rdcycle %1" : "=r"(whole));
+	asm ("rdcycle %0" : "=r"(whole));
 	return whole;
 }
 inline auto rdtime()

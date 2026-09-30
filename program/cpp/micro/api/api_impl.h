@@ -88,7 +88,7 @@ using backend_function_a = response(*)();
 using backend_function_b = response(*)(Request, Response);
 using backend_function_c = response(*)(Request, Response, void*, size_t);
 extern "C" response backend_trampoline(backend_function_b);
-extern "C" response backend_trampoline_post(backend_function_c);
+extern "C" response backend_trampoline_post(backend_function_c, void*, size_t);
 inline void forge(Cache c, backend_function_a func)
 {
 	strace("forge(backend(), {})", (void*)func);
@@ -365,6 +365,7 @@ inline HTTP from_where(gethdr_e where) {
 		default:
 			assert(false && "Invalid header field");
 	}
+	__builtin_unreachable();
 }
 inline HTTP HeaderField::http() const {
 	strace("HTTP(", wstr(where), ")::http()");

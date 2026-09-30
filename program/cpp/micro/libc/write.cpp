@@ -15,11 +15,13 @@ ssize_t write(int, const void* buffer, size_t len)
 	return sys_write((const char*) buffer, len);
 }
 
+#ifndef LIBC_MUSL // musl defines fwrite alongside fwrite_unlocked
 extern "C"
 size_t fwrite(const void*__restrict buffer, size_t sz, size_t count, FILE*)
 {
 	return sys_write((const char*) buffer, sz * count);
 }
+#endif
 
 extern "C"
 int fputs (const char* str, FILE*)
