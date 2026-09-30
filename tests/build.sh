@@ -1,36 +1,14 @@
 #!/usr/bin/env bash
-CLANG_VERSION=10
-if command -v "clang-11" &> /dev/null; then
-	CLANG_VERSION=11
-fi
-if command -v "clang-12" &> /dev/null; then
-	CLANG_VERSION=12
-fi
-if command -v "clang-13" &> /dev/null; then
-	CLANG_VERSION=13
-fi
-if command -v "clang-14" &> /dev/null; then
-	CLANG_VERSION=14
-fi
-if command -v "clang-15" &> /dev/null; then
-	CLANG_VERSION=15
-fi
-if command -v "clang-16" &> /dev/null; then
-	CLANG_VERSION=16
-fi
-if command -v "clang-17" &> /dev/null; then
-	CLANG_VERSION=17
-fi
-if command -v "clang-18" &> /dev/null; then
-	CLANG_VERSION=18
-fi
-if command -v "clang-19" &> /dev/null; then
-	CLANG_VERSION=19
-fi
-if command -v "clang-20" &> /dev/null; then
-	CLANG_VERSION=20
-fi
-export RCC="clang-${CLANG_VERSION}"
-export RLD="ld.lld-${CLANG_VERSION}"
+CLANG_VERSION=
+for v in {22..10}
+do
+	if command -v "clang-$v" &> /dev/null
+	then
+		CLANG_VERSION="-$v"
+		break
+	fi
+done
+export RCC="clang${CLANG_VERSION}"
+export RLD="ld.lld${CLANG_VERSION}"
 $RCC -O0 -Wall -Wextra -I$2 -target riscv64 -march=rv64imafd -ffreestanding -nostdlib -c $1 -o $3.o
 $RLD -Ttext=0x120000 $3.o -o $3
