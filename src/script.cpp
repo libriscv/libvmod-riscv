@@ -12,6 +12,7 @@
 extern "C" void riscv_SetHash(struct req*, VSHA256_CTX*);
 
 namespace rvs {
+namespace vcl { void install_syscalls(); }
 	inline timespec time_now();
 	inline long nanodiff(timespec start_time, timespec end_time);
 	static constexpr uint64_t SIGHANDLER_INSN = 60'000;
@@ -27,6 +28,7 @@ namespace rvs {
 void Script::init()
 {
 	setup_syscall_interface();
+	vcl::install_syscalls();
 	// Show current emulator features enabled
 	printf("[RISC-V features] Architecture: %s  Vectors (RVV): %s  Compressed (RVC): %s\n",
 		MARCH == riscv::RISCV64 ? "64-bit" : "32-bit",
@@ -159,7 +161,9 @@ void Script::machine_initialize()
 	// run through the initialization
 	try {
 		machine().simulate<true>(max_instructions());
-		if (!this->is_paused()) {
+		// A VCL program's main() just exits: its hooks are exported by
+		// name, not registered by waiting for requests.
+		if (!this->is_paused() && !m_inst.is_vcl) {
 			throw std::runtime_error("The machine was not waiting for requests. "
 			"Did you forget to call wait_for_requests()?");
 		}
@@ -327,7 +331,11 @@ void Script::machine_setup(machine_t& machine, bool init)
 	#endif
 		// Add system call interfaces
 		machine.on_unhandled_syscall = [] (auto& m, size_t num) {
+			// The handler is shared by every machine of this type, and
+			// the VCL compiler's machine (vcl/compiler.cpp) has no Script.
 			auto* script = m.template get_userdata<Script>();
+			if (script == nullptr)
+				return;
 			const std::string text =
 				"Unhandled system call: " + std::to_string(num);
 			script->print(text);

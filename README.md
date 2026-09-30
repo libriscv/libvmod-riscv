@@ -135,6 +135,100 @@ sub vcl_recv {
 
 The available hooks mirror the VCL stages: `on_recv`, `on_hash`, `on_synth`, `on_deliver`, `on_backend_fetch`, `on_backend_response`. Each hook receives request/response objects with `get`, `set`, and `unset` methods for header manipulation. Return an array like `["synth", 200]` or a string like `"pass"` to drive the VCL decision.
 
+## VCL tenants
+
+A tenant can also be plain VCL. Point `"filename"` at a `.vcl` file and the VMOD compiles it to a tenant program at `vcl_init`. It uses the same compiler that [Carapace](https://github.com/varnish/carapace) uses for its policies, built as a RISC-V program and embedded in the VMOD. So the tenant's source is compiled *inside the sandbox*: a fresh VM per compile, an instruction budget, no filesystem and no sockets. A compile takes about 10 ms. No toolchain is needed.
+
+```vcl
+vcl 4.1;
+
+sub vcl_recv {
+    if (req.url ~ "^/admin") {
+        return (synth(403, "denied"));
+    }
+    set req.http.X-Tenant = "customer1";
+    return (hash);
+}
+
+sub vcl_synth {
+    set resp.http.Content-Type = "text/plain";
+    synthetic("no");
+}
+
+sub vcl_backend_response {
+    set beresp.ttl = 1m;
+}
+```
+
+The surrounding VCL forks the tenant in each task and calls `riscv.run()` in each subroutine the tenant may define:
+
+```vcl
+sub vcl_init {
+    riscv.embed_tenants("""{
+        "customer1.com": { "filename": "/etc/varnish/tenants/customer1.vcl" }
+    }""");
+    riscv.finalize_tenants();
+}
+
+sub vcl_recv {
+    if (!riscv.fork(req.http.Host)) {
+        return (synth(403));
+    }
+    riscv.run();
+    if (riscv.want_result() == "synth") {
+        return (synth(riscv.want_status()));
+    }
+    if (riscv.want_result() == "pass") {
+        return (pass);
+    }
+}
+
+sub vcl_synth {
+    if (riscv.active()) {
+        riscv.run();     # applies the tenant's vcl_synth
+        return (deliver);
+    }
+}
+
+sub vcl_backend_fetch {
+    if (riscv.fork(bereq.http.Host)) {
+        riscv.run();
+    }
+}
+
+sub vcl_backend_response {
+    if (riscv.active()) {
+        riscv.run();
+        if (riscv.want_result() == "abandon") {
+            return (abandon);
+        }
+    }
+}
+
+sub vcl_deliver {
+    if (riscv.active()) {
+        riscv.run();
+        if (riscv.want_result() == "synth") {
+            return (synth(riscv.want_status()));
+        }
+    }
+}
+```
+
+`riscv.want_result()` is what the tenant's subroutine returned: `""` (carry on), `"pass"`, `"deliver"`, `"synth"` or `"abandon"`. A `return (pass)` from `vcl_backend_response` has already set `beresp.uncacheable`.
+
+What a tenant's VCL can do:
+- `req`, `bereq`, `beresp` and `resp` headers, `bereq.url`, `beresp.ttl`, `grace`, `keep` and `uncacheable`, `client.ip`, `now` and `req.cache_hit`.
+- Regular expressions, which are compiled with Varnish's own engine. ACLs, user subroutines and `include`. Includes are confined to the directory of the tenant's file.
+- `std`, `str`, `digest`, `headerplus`, `cookieplus`, `urlplus`, and lexical locals (`var` inside a sub).
+- Request globals (`var` at the top level). A request's client side (`vcl_recv` through `vcl_deliver`) has one copy. Its backend fetch starts from the initialisers, not from the client's values, because it is a separate fork. Pass values to the fetch on `bereq` headers, as in Varnish.
+
+What it cannot do: `static var` is refused, because every request runs in a fresh fork and nothing persists between requests. `req.url` is read-only in `vcl_recv`. There are no backends, restarts, retries, bans or purges: the surrounding VCL owns those decisions. Header writes to framing headers (`Content-Length`, `Transfer-Encoding`, …) are refused.
+
+A policy that does not compile leaves its tenant without a program: `riscv.fork()` returns false, and the rendered diagnostics are in the log as `Error` records. `riscv.live_update_file()` accepts a `.vcl` too, and a broken one leaves the running program in place.
+
+Forks take their dirtied pages from the task workspace, so give tenants some room, e.g. `-p workspace_client=128k`. `vcl/README.md` has the compiler's layout and how to rebuild it.
+
 ## Benchmarks
 
 Performance comparison showing the minimal overhead of RISC-V VMs:

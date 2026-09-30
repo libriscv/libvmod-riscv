@@ -1,0 +1,214 @@
+use std::collections::BTreeSet;
+
+use crate::ast;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    pub(crate) fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+/// Block-nesting bound, shared by type checking and desugaring.
+///
+/// The parser bounds how deep one body may nest, but desugaring re-enters a
+/// fresh body at every inlined `call`, so a chain of subroutines multiplies
+/// that bound and would overflow the stack. Both walks count against the same
+/// limit and report a diagnostic instead. It sits above the parser's own limit
+/// so nesting the parser accepts is never rejected here for depth alone; the
+/// two walks must agree, or a body the checker accepted could fail to
+/// desugar.
+pub(crate) const MAX_BLOCK_DEPTH: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Phase {
+    Recv,
+    BackendRequest,
+    BackendResponse,
+    Deliver,
+    Synth,
+}
+
+impl Phase {
+    /// Whether the phase's writable header map is the response's.
+    ///
+    /// This is the header map `headerplus` reads and commits, which is why
+    /// its scope needs no state carried between statements: the phase decides
+    /// it, and `init(scope)` is checked against it.
+    pub(crate) fn writes_response_headers(self) -> bool {
+        matches!(self, Self::BackendResponse | Self::Deliver | Self::Synth)
+    }
+
+    pub(crate) const EXPORTED: [Self; 4] = [
+        Self::Recv,
+        Self::BackendRequest,
+        Self::BackendResponse,
+        Self::Deliver,
+    ];
+
+    pub(crate) fn hook(self) -> &'static str {
+        match self {
+            Self::Recv => "on_recv",
+            Self::BackendRequest => "on_backend_request",
+            Self::BackendResponse => "on_backend_response",
+            Self::Deliver => "on_deliver",
+            Self::Synth => unreachable!("vcl_synth is not an exported hook"),
+        }
+    }
+
+    pub(crate) fn vcl_name(self) -> &'static str {
+        match self {
+            Self::Recv => "vcl_recv",
+            Self::BackendRequest => "vcl_backend_fetch",
+            Self::BackendResponse => "vcl_backend_response",
+            Self::Deliver => "vcl_deliver",
+            Self::Synth => "vcl_synth",
+        }
+    }
+
+    pub(crate) fn from_vcl_name(name: &str) -> Option<Self> {
+        match name {
+            "vcl_recv" => Some(Self::Recv),
+            "vcl_backend_fetch" => Some(Self::BackendRequest),
+            "vcl_backend_response" => Some(Self::BackendResponse),
+            "vcl_deliver" => Some(Self::Deliver),
+            "vcl_synth" => Some(Self::Synth),
+            _ => None,
+        }
+    }
+
+    fn from_hook(name: &str) -> Option<Self> {
+        Self::EXPORTED
+            .into_iter()
+            .find(|phase| phase.hook() == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueType {
+    String,
+    Integer,
+    Duration,
+    Time,
+    Boolean,
+    /// A peer address, normalised to 16 bytes. Produced only by `client.ip`;
+    /// compares against an ACL and converts implicitly to its text form.
+    Ip,
+}
+
+impl From<ast::TypeName> for ValueType {
+    fn from(value: ast::TypeName) -> Self {
+        match value {
+            ast::TypeName::String => Self::String,
+            ast::TypeName::Integer => Self::Integer,
+            ast::TypeName::Duration => Self::Duration,
+            ast::TypeName::Time => Self::Time,
+            ast::TypeName::Boolean => Self::Boolean,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LocalId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StaticId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GlobalId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AclId(pub(crate) u32);
+
+/// The inline capacity of one `STRING` request global, in bytes.
+///
+/// A compiler constant, not a knob: a global's bytes live inside the region
+/// the host copies at every phase boundary, so its size is fixed when the
+/// program is compiled. A `set` that would exceed it traps at the VCL line.
+pub const MAX_GLOBAL_STRING: u64 = 256;
+
+/// The largest request-global region a program may declare, in bytes.
+///
+/// The host refuses the same total at engine construction
+/// (`carapace_scripting::MAX_GUEST_GLOBALS`); refusing it here as well is what
+/// lets a policy author see it before a reload does.
+pub const MAX_REQUEST_GLOBALS: u64 = 8 * 1024;
+
+/// Bytes one request global occupies in the region: an 8-byte scalar, or a
+/// `STRING`'s 8-byte length followed by its inline buffer. Every slot is a
+/// multiple of eight, so every slot is 8-byte aligned.
+pub(crate) fn global_slot_size(value_type: ValueType) -> u64 {
+    match value_type {
+        ValueType::String => 8 + MAX_GLOBAL_STRING,
+        ValueType::Integer
+        | ValueType::Boolean
+        | ValueType::Duration
+        | ValueType::Time
+        | ValueType::Ip => 8,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StringConversion {
+    Integer,
+    Duration,
+    Time,
+    Boolean,
+    Ip,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseSet(BTreeSet<Phase>);
+
+impl PhaseSet {
+    pub fn contains(&self, hook: &str) -> bool {
+        Phase::from_hook(hook).is_some_and(|phase| self.0.contains(&phase))
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().copied().map(Phase::hook)
+    }
+
+    pub(crate) fn from_phases(phases: impl IntoIterator<Item = Phase>) -> Self {
+        Self(phases.into_iter().collect())
+    }
+
+    /// Every phase, in the order [`PhaseSet::bits`] numbers them. The values
+    /// are wire ABI between a sandboxed compiler guest and its host, so the
+    /// order is fixed: append, never reorder.
+    const ALL: [Phase; 5] = [
+        Phase::Recv,
+        Phase::BackendRequest,
+        Phase::BackendResponse,
+        Phase::Deliver,
+        Phase::Synth,
+    ];
+
+    /// The set as a bitmask, for [`crate::wire`].
+    pub fn bits(&self) -> u8 {
+        Self::ALL
+            .iter()
+            .enumerate()
+            .filter(|(_, phase)| self.0.contains(phase))
+            .fold(0, |bits, (index, _)| bits | 1 << index)
+    }
+
+    /// Inverse of [`PhaseSet::bits`]. Bits above the known phases are
+    /// ignored: a host decoding a guest's answer must not be able to panic on
+    /// one, and there is nothing for an unknown phase to mean.
+    pub fn from_bits(bits: u8) -> Self {
+        Self(
+            Self::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| bits & 1 << index != 0)
+                .map(|(_, phase)| phase)
+                .collect(),
+        )
+    }
+}

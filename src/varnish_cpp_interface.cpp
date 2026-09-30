@@ -64,6 +64,24 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* a
 	using namespace rvs;
 
 	const auto& callbacks = script->program().callback_entries;
+	if (script->program().is_vcl && info.idx < callbacks.size())
+	{
+		// VRT ctx can easily change even on the same request due to waitlist
+		script->set_ctx(ctx);
+		// vcl_synth has no hook of its own: the compiler folded it into the
+		// hook that returned synth(...), which staged the response.
+		if (info.idx == 3) { // ON_SYNTH
+			rvs::vcl::apply_synth(*script);
+			return 0;
+		}
+		// Each hook states its own outcome; one it does not define (a
+		// policy without vcl_deliver) is a no-op, not an error.
+		script->set_result("", 0, false);
+		const auto addr = callbacks[info.idx];
+		if (addr == 0x0)
+			return 0;
+		return script->call(addr);
+	}
 	if (info.idx < callbacks.size())
 	{
 		auto addr = callbacks[info.idx];

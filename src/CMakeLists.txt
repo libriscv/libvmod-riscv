@@ -17,7 +17,17 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	vmod_riscv.c
 	vmod_riscv_post.c
 	vmod_riscv_update.c
+	vcl/compiler.cpp
+	vcl/vcl_program.cpp
+	vcl/vcl_syscalls.cpp
+	vcl/vcl_varnish.c
+	vcl/vclc_blob.c
 )
+# vcl/vclc_blob.c embeds the sandboxed VCL compiler with .incbin
+set(VCLC_ELF "${CMAKE_CURRENT_SOURCE_DIR}/../vcl/vclc.elf")
+set_source_files_properties(vcl/vclc_blob.c PROPERTIES
+	COMPILE_OPTIONS "-Wa,-I${CMAKE_CURRENT_SOURCE_DIR}/../vcl"
+	OBJECT_DEPENDS "${VCLC_ELF}")
 #add_vmod_vsc(vmod_riscv VSC_vmod_kvm.vsc)
 
 # RISC-V sandbox library
@@ -57,4 +67,8 @@ add_vmod_tests(vmod_riscv vmod_riscv
 	tests/js_header_edge_cases.vtc
 	tests/js_resp_setstatus.vtc
 	tests/js_live_update_file.vtc
+	tests/vcl_basic.vtc
+	tests/vcl_features.vtc
+	tests/vcl_errors.vtc
+	tests/vcl_abi_gates.vtc
 )

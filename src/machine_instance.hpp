@@ -1,5 +1,6 @@
 #pragma once
 #include "script.hpp"
+#include "vcl/vcl_program.hpp"
 #include <mutex>
 namespace riscv {
 	template <int W> struct RSPClient;
@@ -26,16 +27,22 @@ static inline std::array<const char*, 12> callback_names = {
 struct MachineInstance
 {
 	MachineInstance(std::vector<uint8_t>,
-		const vrt_ctx*, SandboxTenant*, bool = false);
+		const vrt_ctx*, SandboxTenant*, bool debug = false, bool vcl = false);
 	~MachineInstance();
 
 	const std::vector<uint8_t> binary;
+	/* A program compiled from VCL (vcl/compiler.hpp) rather than a tenant
+	   program that registers its own callbacks. */
+	const bool is_vcl;
 	Script   script;
 	std::array<Script::gaddr_t, 12> callback_entries;
 	std::unordered_map<std::string, Script::gaddr_t> function_map;
 
 	Script   storage;
 	std::mutex storage_mtx;
+
+	/* Set for a VCL program once its main() has run. */
+	std::unique_ptr<vcl::Program> vcl_program;
 
 	std::unique_ptr<riscv::RSPClient<Script::MARCH>> rspclient;
 	Script* rsp_script = nullptr;
