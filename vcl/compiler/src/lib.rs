@@ -910,6 +910,28 @@ sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
     }
 
     #[test]
+    fn statistics_are_capped_per_policy() {
+        let policy = |count: usize| {
+            let mut source = String::from("vcl 4.1;");
+            for i in 0..count {
+                source.push_str(&format!(" static var s{i}: INT stat;"));
+            }
+            source.push_str(" sub vcl_recv {}");
+            source
+        };
+        compile(&policy(types::MAX_STATS), CompileOptions::default())
+            .expect("a policy at the cap compiles");
+        let error = compile(&policy(types::MAX_STATS + 1), CompileOptions::default()).unwrap_err();
+        let [diagnostic] = error.diagnostics.as_slice() else {
+            panic!("expected one diagnostic, got {error}");
+        };
+        assert_eq!(
+            diagnostic.message,
+            format!("a policy declares at most {} statistics", types::MAX_STATS)
+        );
+    }
+
+    #[test]
     fn stat_annotation_diagnostics() {
         let cases = [
             (

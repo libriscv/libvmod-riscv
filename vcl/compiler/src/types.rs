@@ -316,6 +316,12 @@ pub(crate) const MAX_STAT_NAME: usize = 64;
 /// The longest a statistic description may be.
 pub(crate) const MAX_STAT_HELP: usize = 200;
 
+/// The most statistics a tenant may declare. Each is a Varnish counter that
+/// lives for the process, in shared memory every tenant and `varnishstat`
+/// use, so the host caps them too: per program, and per tenant across
+/// reloads (`MAX_STATS` in src/vcl/vcl_stats.cpp).
+pub(crate) const MAX_STATS: usize = 64;
+
 /// Whether `name` matches the statistic name grammar, `[a-z][a-z0-9_]*` not
 /// ending in `_`. Carapace's grammar, kept so a policy moves between the two
 /// unchanged.

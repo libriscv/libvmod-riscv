@@ -17,6 +17,13 @@ namespace vcl { void install_syscalls(); }
 	inline long nanodiff(timespec start_time, timespec end_time);
 	static constexpr uint64_t SIGHANDLER_INSN = 60'000;
 	static constexpr unsigned NATIVE_SYSCALLS_BASE = 580;
+	/* The native heap takes base+0..4 and the native memory helpers
+	   base+5..base+19 (their n+14 is "print backtrace"). EBREAK is system
+	   call RISCV_SYSCALLS_MAX-1: if it lands in that range, a guest's
+	   ebreak runs a helper and carries on instead of trapping, and every
+	   trap a compiled VCL policy relies on fails open. */
+	static_assert(riscv::SYSCALL_EBREAK >= NATIVE_SYSCALLS_BASE + 5 + 15,
+		"EBREAK collides with the native helpers: RISCV_SYSCALLS_MAX must be at least 601");
 	static constexpr bool VERBOSE_ERRORS = true;
 
 //#define ENABLE_TIMING

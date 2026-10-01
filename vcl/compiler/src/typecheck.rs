@@ -7,7 +7,7 @@ use crate::resolver::{ResolvedProgram, ResolvedUserSub, SubId, UserSubKind};
 use crate::types::{
     global_slot_size, stat_name_ok, AclId, GlobalId, LocalId, Phase, StatKind, StatSpec, StaticId,
     StringConversion, ValueType, MAX_BLOCK_DEPTH, MAX_GLOBAL_STRING, MAX_REQUEST_GLOBALS,
-    MAX_STAT_HELP, MAX_STAT_NAME,
+    MAX_STATS, MAX_STAT_HELP, MAX_STAT_NAME,
 };
 use crate::vars::{self, HostVar, Lowering, WriteConstraint};
 use crate::vmod::{Module, RecordSet, RegexSelect};
@@ -453,6 +453,12 @@ pub(crate) fn check(
             },
         };
         let stat = check_stat(declaration, annotation, value_type, &mut errors);
+        if stat.is_some() && statics.iter().filter(|s: &&TypedStatic| s.stat.is_some()).count() == MAX_STATS {
+            errors.push(Diagnostic::error(
+                declaration.name_span,
+                format!("a policy declares at most {MAX_STATS} statistics"),
+            ));
+        }
         let id = StaticId(statics.len() as u32);
         static_names.insert(declaration.name.clone(), (value_type, id));
         statics.push(TypedStatic {

@@ -18,6 +18,12 @@ static constexpr size_t ROW = 32;
 /* The compiler's caps (MAX_STAT_NAME, MAX_STAT_HELP in types.rs). */
 static constexpr size_t MAX_NAME = 64;
 static constexpr size_t MAX_HELP = 200;
+/* The most statistics a tenant has, per program and across every program
+   it has loaded since varnishd started (MAX_STATS in types.rs). A counter
+   is never freed, and they share VSM with every tenant, so without the
+   lifetime cap a tenant could reload with fresh names until the shared
+   memory runs out. */
+static constexpr size_t MAX_STATS = 64;
 
 static const char* kind_word(StatKind kind)
 {
@@ -77,6 +83,17 @@ static void bind_counters(const std::string& tenant, std::vector<Stat>& stats,
 	const std::vector<std::string>& names, const std::vector<std::string>& helps)
 {
 	std::lock_guard lock(registry_mtx);
+	size_t owned = 0, fresh = 0;
+	for (auto it = registry.lower_bound({tenant, std::string()});
+		it != registry.end() && it->first.first == tenant; ++it)
+		owned++;
+	for (size_t i = 0; i < stats.size(); i++)
+		if (registry.find({tenant, names[i]}) == registry.end())
+			fresh++;
+	if (owned + fresh > MAX_STATS)
+		throw std::runtime_error("VCL program: tenant " + tenant + " would have "
+			+ std::to_string(owned + fresh) + " statistics, past the limit of "
+			+ std::to_string(MAX_STATS) + " (a statistic lives until varnishd restarts)");
 	for (size_t i = 0; i < stats.size(); i++) {
 		auto it = registry.find({tenant, names[i]});
 		/* Two programs that disagree about what a name counts would fold
@@ -124,6 +141,9 @@ std::vector<Stat> install_stats(Script& master, const uint8_t* section,
 {
 	if (size % ROW != 0)
 		throw std::runtime_error("VCL program: .carapace.stats is not a whole number of rows");
+	if (size / ROW > MAX_STATS)
+		throw std::runtime_error("VCL program: .carapace.stats declares " + std::to_string(size / ROW)
+			+ " statistics; the limit is " + std::to_string(MAX_STATS));
 	auto& machine = master.machine();
 	const std::string& tenant = master.tenant().config.name;
 	if (bss_size > UINT64_MAX - bss_start)

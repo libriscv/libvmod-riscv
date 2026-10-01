@@ -34,7 +34,7 @@ set_source_files_properties(vcl/vclc_blob.c PROPERTIES
 # RISC-V sandbox library
 option(RISCV_FLAT_RW_ARENA "" OFF)
 add_subdirectory(libriscv)
-target_compile_definitions(riscv PUBLIC RISCV_SYSCALLS_MAX=600)
+target_compile_definitions(riscv PUBLIC RISCV_SYSCALLS_MAX=601)
 target_compile_options(riscv PUBLIC -fPIC)
 add_subdirectory(../ext/json ext_json)
 find_package(OpenSSL REQUIRED)

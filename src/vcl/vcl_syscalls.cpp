@@ -20,8 +20,11 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <algorithm>
+#include <climits>
 #include <cctype>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace rvs::vcl {
 using namespace abi;
@@ -263,6 +266,9 @@ void sys_log(machine_t& m)
 		m.set_result(FAILED);
 		return;
 	}
+	/* Named, like every other line the VMOD writes for a tenant, so one
+	   tenant cannot write lines that read as another's. */
+	msg.insert(0, "[" + script_of(m).name() + "] ");
 	vclv_log(ctx_of(m), msg.data(), msg.size());
 	m.set_result(0);
 }
@@ -521,39 +527,39 @@ void headers_commit(machine_t& m, bool response)
 		return;
 	}
 
-	auto values_of = [&](std::string_view name) {
-		std::vector<std::string_view> out;
-		for (auto& [n, v] : before)
-			if (iequals(n, name)) out.push_back(v);
+	/* Names compare case-insensitively. Keyed sets keep this linear: the
+	   vector holds up to MAX_HEADERS entries, and the host's work here is
+	   not charged to the instruction budget. */
+	auto lower = [](std::string_view name) {
+		std::string out(name);
+		for (auto& c : out) c = char(tolower((unsigned char)c));
 		return out;
 	};
+	std::unordered_map<std::string, std::vector<std::string_view>> values;
+	for (auto& [n, v] : before)
+		values[lower(n)].push_back(v);
 	/* Work out the edits first, so a refused name changes nothing. */
 	struct Edit { enum { Set, Add, Remove } op; std::string name; std::string value; };
 	std::vector<Edit> edits;
-	std::vector<std::string> present, written;
-	auto contains = [](const std::vector<std::string>& set, std::string_view name) {
-		for (auto& s : set) if (iequals(s, name)) return true;
-		return false;
-	};
+	std::unordered_set<std::string> present, written;
 	for (auto& e : entries) {
-		if (!contains(present, e.name))
-			present.push_back(e.name);
+		const auto key = lower(e.name);
+		present.insert(key);
 		if (!e.dirty)
 			continue;
-		if (!contains(written, e.name)) {
-			written.push_back(e.name);
-			const auto current = values_of(e.name);
-			if (current.size() != 1 || current[0] != e.value)
+		if (written.insert(key).second) {
+			auto it = values.find(key);
+			if (it == values.end() || it->second.size() != 1 || it->second[0] != e.value)
 				edits.push_back({Edit::Set, e.name, e.value});
 		} else {
 			edits.push_back({Edit::Add, e.name, e.value});
 		}
 	}
-	for (auto& [n, v] : before)
-		if (!contains(present, n) && !contains(written, n)) {
-			written.push_back(n); // remove each name once
+	for (auto& [n, v] : before) {
+		const auto key = lower(n);
+		if (!present.count(key) && written.insert(key).second) // remove each name once
 			edits.push_back({Edit::Remove, n, {}});
-		}
+	}
 	for (auto& edit : edits) {
 		if (is_framing_header(edit.name) || routing_header(script.ctx(), response, edit.name)) {
 			refuse(m, "a framing or routing header write");
@@ -610,6 +616,23 @@ const void* lookup_pattern(machine_t& m, gaddr_t ptr, gaddr_t len)
 	return re;
 }
 
+/* One match, as the policy sees it: 1, 0, or -1 when PCRE gave up at its
+   backtracking limits. A match is charged what those limits let it cost,
+   one instruction per backtracking step, so a policy cannot buy seconds of
+   host CPU with a slow pattern and a few instructions per call. */
+int charged_match(machine_t& m, const void* re, const char* subject, size_t len)
+{
+	m.penalize(VCLV_REGEX_MATCH_LIMIT);
+	const int rc = vclv_regex_match(re, subject, len);
+	if (rc < 0) {
+		auto* ctx = ctx_of(m);
+		if (ctx && ctx->vsl)
+			VSLb(ctx->vsl, SLT_VCL_Error, "[%s] vcl: regex match ran past its backtracking limit",
+				script_of(m).name().c_str());
+	}
+	return rc;
+}
+
 void sys_regex_match(machine_t& m)
 {
 	const auto [pptr, plen, sptr, slen, caps, maxcaps] =
@@ -622,7 +645,10 @@ void sys_regex_match(machine_t& m)
 		m.set_result(REGEX_REFUSED);
 		return;
 	}
-	m.set_result(vclv_regex_match(re, subject.data(), subject.size()) ? 0 : FAILED);
+	/* An undecided match traps at its VCL line, like a refused pattern:
+	   reading it as "no match" would let a deny rule fail open. */
+	const int rc = charged_match(m, re, subject.data(), subject.size());
+	m.set_result(rc > 0 ? 0 : rc == 0 ? FAILED : REGEX_REFUSED);
 }
 
 struct Descriptor { uint64_t f[5]; };
@@ -646,28 +672,41 @@ void sys_regsub(machine_t& m)
 		m.set_result(FAILED);
 		return;
 	}
-	/* Varnish's regsub, so `\1` in the replacement means what it means in
-	   the VCL around the policy. It works on C strings, and neither side
-	   can hold a NUL: header values and URLs cannot. */
+	/* Varnish's regsub semantics, so `\1` in the replacement means what it
+	   means in the VCL around the policy. It works on C strings, and
+	   neither side can hold a NUL: header values and URLs cannot. */
 	if (subject.find('\0') != std::string::npos || replacement.find('\0') != std::string::npos) {
 		m.set_result(FAILED);
 		return;
 	}
-	const char* result = vclv_regsub(ctx_of(m), all, subject.c_str(),
-		const_cast<void*>(re), replacement.c_str());
-	if (result == nullptr) {
+	/* A regsuball runs one match per replacement, up to one per byte of
+	   the subject. Each is charged like a single match, and the budget the
+	   policy has left bounds how many may run. */
+	const uint64_t left = m.max_instructions() > m.instruction_counter()
+		? m.max_instructions() - m.instruction_counter() : 0;
+	unsigned execs = unsigned(std::clamp<uint64_t>(left / VCLV_REGEX_MATCH_LIMIT, 1, UINT_MAX));
+	vsb* result = nullptr;
+	const int rc = vclv_regsub(all, subject.data(), subject.size(), re,
+		replacement.c_str(), MAX_VALUE, &execs, &result);
+	m.penalize(uint64_t(execs) * VCLV_REGEX_MATCH_LIMIT + subject.size());
+	if (rc < 0) {
+		auto* ctx = ctx_of(m);
+		if (ctx && ctx->vsl)
+			VSLb(ctx->vsl, SLT_VCL_Error, "[%s] vcl: regsub ran past its limits",
+				script_of(m).name().c_str());
 		m.set_result(FAILED);
 		return;
 	}
-	const size_t len = strlen(result);
-	const size_t limit = out != 0 ? std::min<size_t>(MAX_VALUE, cap) : MAX_VALUE;
-	if (len > limit) {
+	const size_t len = VSB_len(result);
+	if (out != 0 && len > cap) {
+		VSB_destroy(&result);
 		m.set_result(FAILED);
 		return;
 	}
 	if (out != 0 && len > 0)
-		m.copy_to_guest(out, result, len);
-	m.penalize(subject.size() + len);
+		m.copy_to_guest(out, VSB_data(result), len);
+	VSB_destroy(&result);
+	m.penalize(len);
 	m.set_result(len);
 }
 
@@ -716,7 +755,19 @@ void sys_regex_match_list(machine_t& m)
 		const size_t sublen = value_field ? vlen : nlen;
 		if (bits.size() <= index / 8)
 			bits.push_back('\0');
-		if (vclv_regex_match(re, subject, sublen)) {
+		/* Each match is charged, but the charge only stops the policy
+		   when the call returns: stop matching once the budget is spent,
+		   so one call cannot run thousands of matches past it. */
+		if (m.instruction_counter() >= m.max_instructions()) {
+			m.set_result(REGEX_REFUSED);
+			return;
+		}
+		const int rc = charged_match(m, re, subject, sublen);
+		if (rc < 0) {
+			m.set_result(REGEX_REFUSED);
+			return;
+		}
+		if (rc > 0) {
 			bits[index / 8] |= char(1u << (index % 8));
 			matched++;
 		}

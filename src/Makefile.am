@@ -15,7 +15,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/ext/json/single_include \
 	-DVMOD=1 \
 	-D_GNU_SOURCE \
-	-DRISCV_SYSCALLS_MAX=600 \
+	-DRISCV_SYSCALLS_MAX=601 \
 	$(CRYPTO_CFLAGS)
 
 ## -Wa,-I lets vcl/vclc_blob.c .incbin the sandboxed VCL compiler.

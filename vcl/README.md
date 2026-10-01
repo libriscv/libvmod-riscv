@@ -55,11 +55,21 @@ Differences from Carapace:
   a write to it even from an ELF the compiler did not make. In `vcl_hash` the
   VMOD feeds the tenant's name into the key before the hook runs.
 - Regular expressions are Varnish's (PCRE). The compiler still validates
-  patterns against its own, stricter rules.
+  patterns against its own, stricter rules, but those were written for a
+  linear-time engine and do not stop a pattern that backtracks. The host
+  matches under Varnish's default match limits (`vclv_vre_limits` in
+  `vcl_varnish.c`), charges each match that limit in instructions, and
+  reports a match the limits stopped as undecided, which traps. regsub and
+  regsuball are the host's own (`vclv_regsub`), with VRT_regsub's meaning,
+  so each match a regsuball runs is counted and charged.
+- A tenant's `std.log()` lines start with `[tenant]`, as the VMOD's own lines
+  do, so one tenant cannot write lines that read as another's.
 - A plain `static var` is refused, because each request runs in a fresh fork
   and has nothing to accumulate into. A `stat`-annotated static is allowed.
   The host folds each fork's changes to it into a Varnish counter,
-  `RISCV.<tenant>.<name>`, instead of a Prometheus family. Dynamic
+  `RISCV.<tenant>.<name>`, instead of a Prometheus family. A tenant has at
+  most 64 (`MAX_STATS`, in `types.rs` and `vcl_stats.cpp`), counted across
+  every program it has loaded, since a counter is never freed. Dynamic
   statistics (`stat NAME: KIND {KEYS} ttl ...`) are not ported.
 
 ## Rebuilding the blobs

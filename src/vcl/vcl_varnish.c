@@ -1,4 +1,6 @@
 #include <limits.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,6 +17,19 @@
    length prefix is one byte, and the policy ABI caps names at 1024 before
    they get here, so anything longer than the prefix can say is refused. */
 #define VCLV_MAX_SPEC_NAME 254
+
+/* Varnish Enterprise still takes STRING_LIST arguments, while Varnish
+   Cache 7.x takes STRANDS (with an optional prefix for the setters). */
+#ifdef VARNISH_PLUS
+#define VCLV_L_STRING(fn, ctx, v)	fn(ctx, v, vrt_magic_string_end)
+#define VCLV_NO_VXID			0
+#else
+#define VCLV_L_STRING(fn, ctx, v)	fn(ctx, NULL, TOSTRAND(v))
+#define VCLV_NO_VXID			NO_VXID
+/* VRE_capture() passes its options straight to pcre2_match(), and vre.h
+   has no name for this one. */
+#define VRE_NOTEMPTY			0x00000004u	/* PCRE2_NOTEMPTY */
+#endif
 
 enum vcl_phase
 vclv_phase(VRT_CTX)
@@ -391,7 +406,14 @@ vclv_var_get_string(VRT_CTX, int id, const char **out)
 		return (-1);
 	switch (id) {
 	case VCLV_XID:
+#ifdef VARNISH_PLUS
 		s = vclv_backend(ctx) ? VRT_r_bereq_xid(ctx) : VRT_r_req_xid(ctx);
+#else
+		s = WS_Printf(ctx->ws, "%jd", (intmax_t)(vclv_backend(ctx) ?
+		    VRT_r_bereq_xid(ctx) : VRT_r_req_xid(ctx)));
+		if (s == NULL)
+			return (-1);
+#endif
 		break;
 	case VCLV_BERESP_REASON: s = VRT_r_beresp_reason(ctx); break;
 	case VCLV_OBJ_REASON:	s = VRT_r_obj_reason(ctx); break;
@@ -459,15 +481,15 @@ vclv_var_set_string(VRT_CTX, int id, const char *v)
 	switch (id) {
 	case VCLV_METHOD:
 		if (vclv_backend(ctx))
-			VRT_l_bereq_method(ctx, v, vrt_magic_string_end);
+			VCLV_L_STRING(VRT_l_bereq_method, ctx, v);
 		else
-			VRT_l_req_method(ctx, v, vrt_magic_string_end);
+			VCLV_L_STRING(VRT_l_req_method, ctx, v);
 		break;
 	case VCLV_BERESP_REASON:
-		VRT_l_beresp_reason(ctx, v, vrt_magic_string_end);
+		VCLV_L_STRING(VRT_l_beresp_reason, ctx, v);
 		break;
 	case VCLV_RESP_REASON:
-		VRT_l_resp_reason(ctx, v, vrt_magic_string_end);
+		VCLV_L_STRING(VRT_l_resp_reason, ctx, v);
 		break;
 	default:
 		return (-1);
@@ -480,7 +502,11 @@ vclv_hash_data(VRT_CTX, const char *data)
 {
 	if (ctx->method != VCL_MET_HASH || ctx->specific == NULL)
 		return (-1);
+	#ifdef VARNISH_PLUS
 	VRT_hashdata(ctx, data, vrt_magic_string_end);
+#else
+	VRT_hashdata(ctx, TOSTRAND(data));
+#endif
 	return (0);
 }
 
@@ -488,6 +514,7 @@ int
 vclv_synth_body(VRT_CTX, int replace, const char *body)
 {
 	switch (ctx->method) {
+#ifdef VARNISH_PLUS
 	case VCL_MET_SYNTH:
 		if (replace)
 			VRT_l_resp_body(ctx, body, vrt_magic_string_end);
@@ -500,6 +527,16 @@ vclv_synth_body(VRT_CTX, int replace, const char *body)
 		else
 			VRT_synth_page(ctx, body, vrt_magic_string_end);
 		return (0);
+#else
+	case VCL_MET_SYNTH:
+		VRT_l_resp_body(ctx, replace ? LBODY_SET_STRING : LBODY_ADD_STRING,
+		    NULL, TOSTRAND(body));
+		return (0);
+	case VCL_MET_BACKEND_ERROR:
+		VRT_l_beresp_body(ctx, replace ? LBODY_SET_STRING : LBODY_ADD_STRING,
+		    NULL, TOSTRAND(body));
+		return (0);
+#endif
 	default:
 		return (-1);
 	}
@@ -511,7 +548,7 @@ vclv_log(VRT_CTX, const char *msg, size_t len)
 	if (ctx->vsl != NULL)
 		VSLb(ctx->vsl, SLT_VCL_Log, "%.*s", (int)len, msg);
 	else
-		VSL(SLT_VCL_Log, 0, "%.*s", (int)len, msg);
+		VSL(SLT_VCL_Log, VCLV_NO_VXID, "%.*s", (int)len, msg);
 }
 
 void *
@@ -537,23 +574,171 @@ vclv_regex_free(void *re)
 	VRE_free(&vre);
 }
 
+/* The backtracking limits of Varnish's own pcre_match_limit and
+   pcre_match_limit_recursion defaults, so a pattern costs a tenant what it
+   costs the VCL around it. Without them, a pattern like ^(a|aa)+$ runs PCRE
+   to its built-in limit of ten million steps, outside the instruction
+   budget. */
+static const struct vre_limits vclv_vre_limits = {
+	.match = VCLV_REGEX_MATCH_LIMIT,
+#ifdef VARNISH_PLUS
+	.match_recursion = VCLV_REGEX_DEPTH_LIMIT,
+#else
+	.depth = VCLV_REGEX_DEPTH_LIMIT,
+#endif
+};
+
+const struct vre_limits *
+vclv_regex_limits(void)
+{
+	return (&vclv_vre_limits);
+}
+
 int
 vclv_regex_match(const void *re, const char *subject, size_t len)
 {
+	int rc;
+
 	if (len > INT_MAX)
-		return (0);
+		return (-1);
 #ifdef VARNISH_PLUS
-	return (VRE_exec(re, subject, (int)len, 0, 0, NULL, 0, NULL) >= 0);
+	rc = VRE_exec(re, subject, (int)len, 0, 0, NULL, 0, &vclv_vre_limits);
 #else
-	return (VRE_match(re, subject, len, 0, NULL) >= 0);
+	rc = VRE_match(re, subject, len, 0, &vclv_vre_limits);
 #endif
+	if (rc >= 0)
+		return (1);
+	return (rc == VRE_ERROR_NOMATCH ? 0 : -1);
 }
 
-const char *
-vclv_regsub(VRT_CTX, int all, const char *subject, void *re,
-    const char *replacement)
+/* Append the replacement for one match: `\0`..`\9` name a capture, any
+   other escaped byte stands for itself, as in VRT_regsub. */
+static void
+vclv_regsub_expand(struct vsb *out, const char *subject,
+    const char *replacement, const int *groups, int ngroups)
 {
-	return (VRT_regsub(ctx, all, subject, re, replacement));
+	const char *r;
+	int g;
+
+	for (r = replacement; *r != '\0'; r++) {
+		if (*r != '\\' || r[1] == '\0') {
+			VSB_putc(out, *r);
+			continue;
+		}
+		r++;
+		if (*r < '0' || *r > '9') {
+			VSB_putc(out, *r);
+			continue;
+		}
+		g = *r - '0';
+		if (g < ngroups && groups[2 * g] >= 0 && groups[2 * g + 1] >= groups[2 * g])
+			VSB_bcat(out, subject + groups[2 * g],
+			    groups[2 * g + 1] - groups[2 * g]);
+	}
+}
+
+/* One match against `subject` from `start`, into groups[] as (begin, end)
+   offsets into the whole subject. Returns how many groups were set (at
+   least 1), 0 for no match, or -1 when PCRE gave up at its limits. */
+static int
+vclv_regsub_exec(const void *re, const char *subject, size_t len,
+    size_t start, int notempty, int *groups, int ngroups)
+{
+	int rc, g;
+
+#ifdef VARNISH_PLUS
+	int ovector[VCLV_REGSUB_GROUPS * 3];
+
+	memset(ovector, -1, sizeof ovector);
+	rc = VRE_exec(re, subject, (int)len, (int)start,
+	    notempty ? VRE_NOTEMPTY : 0, ovector, VCLV_REGSUB_GROUPS * 3,
+	    &vclv_vre_limits);
+	if (rc == VRE_ERROR_NOMATCH)
+		return (0);
+	if (rc < 0)
+		return (-1);
+	if (rc == 0 || rc > ngroups)
+		rc = ngroups;
+	for (g = 0; g < 2 * rc; g++)
+		groups[g] = ovector[g];
+#else
+	txt t[VCLV_REGSUB_GROUPS];
+	size_t count = VCLV_REGSUB_GROUPS;
+	/* VRE_capture takes a length of 0 to mean NUL-terminated, and the
+	   subject may not be, so an empty tail is matched as "". */
+	const char *base = start < len ? subject + start : "";
+
+	memset(t, 0, sizeof t);
+	/* VRE_capture has no start offset, so here a `^` can match again
+	   where the last replacement ended. */
+	rc = VRE_capture(re, base, len - start,
+	    notempty ? VRE_NOTEMPTY : 0, t, count, &vclv_vre_limits);
+	if (rc == VRE_ERROR_NOMATCH)
+		return (0);
+	if (rc < 0)
+		return (-1);
+	if (rc == 0 || rc > ngroups)
+		rc = ngroups;
+	for (g = 0; g < rc; g++) {
+		groups[2 * g] = t[g].b ? (int)(t[g].b - base + start) : -1;
+		groups[2 * g + 1] = t[g].e ? (int)(t[g].e - base + start) : -1;
+	}
+#endif
+	for (g = rc; g < ngroups; g++)
+		groups[2 * g] = groups[2 * g + 1] = -1;
+	return (rc);
+}
+
+int
+vclv_regsub(int all, const char *subject, size_t len, const void *re,
+    const char *replacement, size_t max_out, unsigned *execs, struct vsb **result)
+{
+	int groups[VCLV_REGSUB_GROUPS * 2];
+	struct vsb *out;
+	size_t at = 0;
+	unsigned budget = *execs;
+	int rc;
+
+	*result = NULL;
+	*execs = 0;
+	if (len > INT_MAX)
+		return (-1);
+	out = VSB_new_auto();
+	AN(out);
+	do {
+		/* Each exec is the unit the caller charges for. */
+		if (*execs >= budget) {
+			VSB_destroy(&out);
+			return (-1);
+		}
+		(*execs)++;
+		/* As VRT_regsub does: each exec starts where the last match
+		   ended, in the whole subject, so a `^` matches only once, and
+		   only the first match may be empty. */
+		rc = vclv_regsub_exec(re, subject, len, at, *execs > 1,
+		    groups, VCLV_REGSUB_GROUPS);
+		if (rc < 0) {
+			VSB_destroy(&out);
+			return (-1);
+		}
+		if (rc == 0)
+			break;
+		VSB_bcat(out, subject + at, groups[0] - (int)at);
+		vclv_regsub_expand(out, subject, replacement, groups,
+		    VCLV_REGSUB_GROUPS);
+		at = groups[1];
+		if (VSB_len(out) > (ssize_t)max_out) {
+			VSB_destroy(&out);
+			return (-1);
+		}
+	} while (all && at <= len);
+	VSB_bcat(out, subject + at, len - at);
+	if (VSB_finish(out) != 0 || VSB_len(out) > (ssize_t)max_out) {
+		VSB_destroy(&out);
+		return (-1);
+	}
+	*result = out;
+	return (0);
 }
 
 /* JSON string contents: a description is the author's text, so a quote, a
@@ -571,6 +756,22 @@ vclv_json_escape(struct vsb *vsb, const char *s)
 			VSB_putc(vsb, c);
 	}
 }
+
+#ifndef VARNISH_PLUS
+/* Varnish Cache only has the va_list form of VRT_VSC_Alloc(). */
+static void *
+vclv_vsc_alloc(const char *category, size_t size, const unsigned char *jp,
+    size_t sz_jp, const char *fmt, ...)
+{
+	va_list ap;
+	void *p;
+
+	va_start(ap, fmt);
+	p = VRT_VSC_Alloc(NULL, NULL, category, size, jp, sz_jp, fmt, ap);
+	va_end(ap);
+	return (p);
+}
+#endif
 
 uint64_t *
 vclv_stat_alloc(const char *tenant, const char *name, const char *help,
@@ -601,9 +802,15 @@ vclv_stat_alloc(const char *tenant, const char *name, const char *help,
 	VSB_cat(vsb, "\"}}}");
 	AZ(VSB_finish(vsb));
 
+#ifdef VARNISH_PLUS
 	word = VRT_VSC_Alloc(NULL, NULL, "RISCV", sizeof *word,
 	    (const unsigned char *)VSB_data(vsb), VSB_len(vsb) + 1,
 	    "%s", tenant);
+#else
+	word = vclv_vsc_alloc("RISCV", sizeof *word,
+	    (const unsigned char *)VSB_data(vsb), VSB_len(vsb) + 1,
+	    "%s", tenant);
+#endif
 	if (word == NULL)
 		VSB_destroy(&vsb);
 	return (word);

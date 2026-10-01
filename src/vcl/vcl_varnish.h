@@ -150,11 +150,26 @@ void vclv_log(const struct vrt_ctx *, const char *msg, size_t len);
    means in a compiled policy what it means in the VCL around it. */
 void *vclv_regex_compile(const char *pattern, const char **error);
 void vclv_regex_free(void *);
-/* 1 match, 0 no match. */
+/* 1 match, 0 no match, -1 when the match could not be decided: the
+   backtracking limits below were reached, or the subject is too long. A
+   caller must not read -1 as "no match", or a deny rule fails open. */
+#define VCLV_REGEX_MATCH_LIMIT	10000
+#define VCLV_REGEX_DEPTH_LIMIT	20
 int vclv_regex_match(const void *re, const char *subject, size_t len);
-/* NUL-terminated result on the workspace, or NULL. */
-const char *vclv_regsub(const struct vrt_ctx *, int all, const char *subject,
-    void *re, const char *replacement);
+/* The same limits, for the VMOD API's own regex calls. */
+struct vre_limits;
+const struct vre_limits *vclv_regex_limits(void);
+/* regsub() (all = 0) or regsuball() (all = 1), with VRT_regsub's
+   semantics but under the match limits above, and counted: *execs is the
+   most matches it may run on the way in, and how many it ran on the way
+   out, so the caller can charge each one. 0 with the result in *result
+   (the caller destroys it), or -1: a match was undecided, the budget ran
+   out, or the result would be longer than max_out. */
+#define VCLV_REGSUB_GROUPS	10
+struct vsb;
+int vclv_regsub(int all, const char *subject, size_t len, const void *re,
+    const char *replacement, size_t max_out, unsigned *execs,
+    struct vsb **result);
 
 /* A Varnish counter, RISCV.<tenant>.<name>, that lives for the rest of the
    process. `gauge` picks the VSC type varnishstat shows it as. Returns the
