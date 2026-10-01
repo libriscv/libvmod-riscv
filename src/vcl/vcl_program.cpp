@@ -41,21 +41,21 @@ std::unique_ptr<Program> Program::install(Script& master, MachineInstance& inst)
 	auto program = std::make_unique<Program>();
 	auto& machine = master.machine();
 	const auto& binary = inst.binary;
-	/* A section's bytes, or null when it is absent. Every offset is
+	/* A section's header, or false when it is absent. Every offset is
 	   checked: the loader has accepted the ELF, but these sections are not
 	   loaded, so nothing else has looked at them. */
-	auto section = [&] (const char* name, size_t& size) -> const uint8_t* {
-		using Elf = riscv::Elf<8>;
+	using Elf = riscv::Elf<8>;
+	auto find = [&] (const char* name, Elf::SectionHeader& found) -> bool {
 		auto fits = [&] (uint64_t off, uint64_t len) {
 			return off <= binary.size() && len <= binary.size() - off;
 		};
 		Elf::Header hdr;
 		if (!fits(0, sizeof(hdr)))
-			return nullptr;
+			return false;
 		memcpy(&hdr, binary.data(), sizeof(hdr));
 		if (hdr.e_shentsize != sizeof(Elf::SectionHeader) || hdr.e_shstrndx >= hdr.e_shnum
 			|| !fits(hdr.e_shoff, uint64_t(hdr.e_shnum) * sizeof(Elf::SectionHeader)))
-			return nullptr;
+			return false;
 		auto header = [&] (unsigned i) {
 			Elf::SectionHeader sh;
 			memcpy(&sh, binary.data() + hdr.e_shoff + i * sizeof(sh), sizeof(sh));
@@ -63,19 +63,27 @@ std::unique_ptr<Program> Program::install(Script& master, MachineInstance& inst)
 		};
 		const auto strtab = header(hdr.e_shstrndx);
 		if (!fits(strtab.sh_offset, strtab.sh_size))
-			return nullptr;
+			return false;
 		const size_t name_len = strlen(name) + 1;
 		for (unsigned i = 0; i < hdr.e_shnum; i++) {
 			const auto sh = header(i);
 			if (sh.sh_name >= strtab.sh_size || strtab.sh_size - sh.sh_name < name_len
 				|| memcmp(binary.data() + strtab.sh_offset + sh.sh_name, name, name_len) != 0)
 				continue;
-			if (!fits(sh.sh_offset, sh.sh_size))
-				throw std::runtime_error(std::string("VCL program: ") + name + " lies outside the ELF");
-			size = sh.sh_size;
-			return binary.data() + sh.sh_offset;
+			found = sh;
+			return true;
 		}
-		return nullptr;
+		return false;
+	};
+	/* A section's bytes, or null when it is absent. */
+	auto section = [&] (const char* name, size_t& size) -> const uint8_t* {
+		Elf::SectionHeader sh;
+		if (!find(name, sh))
+			return nullptr;
+		if (sh.sh_offset > binary.size() || sh.sh_size > binary.size() - sh.sh_offset)
+			throw std::runtime_error(std::string("VCL program: ") + name + " lies outside the ELF");
+		size = sh.sh_size;
+		return binary.data() + sh.sh_offset;
 	};
 
 	/* NUL-separated pattern literals. */
@@ -114,6 +122,13 @@ std::unique_ptr<Program> Program::install(Script& master, MachineInstance& inst)
 		/* Every fork starts from the master, so seeding it once is what
 		   gives each request its own copy of the initial values. */
 		machine.copy_to_guest(address, program->globals_image.data(), size);
+	}
+
+	if (const auto* rows = section(".carapace.stats", size)) {
+		Elf::SectionHeader bss;
+		if (!find(".bss", bss))
+			throw std::runtime_error("VCL program: .carapace.stats without a .bss");
+		program->stats = install_stats(master, rows, size, bss.sh_addr, bss.sh_size);
 	}
 
 	for (auto& [symbol, index] : HOOKS)

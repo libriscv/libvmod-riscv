@@ -59,6 +59,7 @@ libvmod_riscv_la_SOURCES = \
 	vmod_riscv_update.c \
 	vcl/compiler.cpp \
 	vcl/vcl_program.cpp \
+	vcl/vcl_stats.cpp \
 	vcl/vcl_syscalls.cpp \
 	vcl/vcl_varnish.c \
 	vcl/vclc_blob.c
@@ -92,6 +93,7 @@ noinst_HEADERS = \
 	vcl/abi.hpp \
 	vcl/compiler.hpp \
 	vcl/vcl_program.hpp \
+	vcl/vcl_stats.hpp \
 	vcl/vcl_varnish.h
 
 dist_man_MANS = vmod_riscv.3

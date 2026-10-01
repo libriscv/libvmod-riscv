@@ -698,7 +698,10 @@ sub vcl_recv {
         );
         assert_eq!(
             diagnostic.help.as_deref(),
-            Some("use a request global ('var NAME: TYPE;' at the top level) instead")
+            Some(
+                "use a request global ('var NAME: TYPE;' at the top level) instead, or annotate \
+                 it with 'stat' to count into a Varnish counter"
+            )
         );
         assert_eq!(
             &source[diagnostic.span.start..diagnostic.span.end],
@@ -720,19 +723,9 @@ sub vcl_recv {
     }
 
     #[test]
-    fn stat_is_an_ordinary_word() {
-        // Statistics are gone from the language, so `stat` names things again.
-        compile(
-            "vcl 4.1; sub stat { set req.http.x-stat = \"1\"; } \
-             sub vcl_recv { var stat: INT = 1; set var.stat = var.stat + 1; call stat; return (hash); }",
-            CompileOptions::default(),
-        )
-        .unwrap();
-
-        // The former declaration forms no longer compile.
+    fn dynamic_statistics_are_not_part_of_the_language() {
         for source in [
             "vcl 4.1; stat hits: counter {path} ttl 1h \"help\"; sub vcl_recv {}",
-            "vcl 4.1; static var hits: INT stat counter \"help\"; sub vcl_recv {}",
             "vcl 4.1; sub vcl_recv { set stat.hits{path = req.url} += 1; }",
             "vcl 4.1; sub vcl_recv { var h: STAT; }",
         ] {
@@ -741,6 +734,286 @@ sub vcl_recv {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn stat_writes_are_observable_and_survive_optimization() {
+        let source = "vcl 4.1; static var requests: INT stat; sub vcl_recv { set var.requests = var.requests + 1; return (hash); }";
+        let ir = dump_ir(source, CompileOptions::default()).unwrap();
+        assert!(ir.contains("store.static requests"), "{ir}");
+        let compiled = compile(source, CompileOptions::default()).unwrap();
+        assert!(section(&compiled.elf, ".carapace.statics").is_some());
+    }
+
+    /// One `.carapace.stats` row, with its guest strings resolved out of the
+    /// image — the test-side mirror of what the host does when the program
+    /// loads.
+    #[derive(Debug, PartialEq, Eq)]
+    struct StatRow {
+        addr: u64,
+        kind: u32,
+        flags: u32,
+        name: String,
+        help: String,
+    }
+
+    /// Bytes of a named section, by walking the section headers the writer
+    /// emitted.
+    fn section<'a>(elf: &'a [u8], want: &str) -> Option<&'a [u8]> {
+        let u16at = |at: usize| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap()) as usize;
+        let u32at = |at: usize| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap()) as usize;
+        let u64at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
+        let table = u64at(0x28);
+        let entry = u16at(0x3a);
+        let count = u16at(0x3c);
+        let names = u16at(0x3e);
+        let names_at = u64at(table + names * entry + 24);
+        for index in 0..count {
+            let at = table + index * entry;
+            let spelled = elf[names_at + u32at(at)..]
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap();
+            if spelled == want.as_bytes() {
+                let offset = u64at(at + 24);
+                return Some(&elf[offset..offset + u64at(at + 32)]);
+            }
+        }
+        None
+    }
+
+    /// Read `.carapace.stats`, resolving name and help against `.rodata`.
+    fn stat_rows(elf: &[u8]) -> Vec<StatRow> {
+        let Some(rows) = section(elf, ".carapace.stats") else {
+            return Vec::new();
+        };
+        assert_eq!(rows.len() % 32, 0, "a stats row is 32 bytes");
+        let text = section(elf, ".text").expect(".text");
+        let rodata = section(elf, ".rodata").expect(".rodata");
+        let rodata_base = codegen::BASE_ADDRESS + text.len() as u64;
+        let string_at = |address: u64| {
+            let offset = (address - rodata_base) as usize;
+            let bytes = rodata[offset..].split(|byte| *byte == 0).next().unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+        rows.chunks_exact(32)
+            .map(|row| {
+                let u32at = |at: usize| u32::from_le_bytes(row[at..at + 4].try_into().unwrap());
+                let u64at = |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap());
+                StatRow {
+                    addr: u64at(0),
+                    kind: u32at(8),
+                    flags: u32at(12),
+                    name: string_at(u64at(16)),
+                    help: string_at(u64at(24)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stat_annotations_publish_one_row_per_kind() {
+        let source = r#"vcl 4.1;
+static var blocked: INT stat;
+static var token_failures: INT stat counter "Requests whose signed token did not verify";
+static var inflight: INT stat gauge "Requests the policy has admitted";
+static var peak_header_bytes: INT stat max "Largest header block seen";
+static var fastest_decision_us: INT stat min "Fastest recv decision";
+sub vcl_recv {
+    set var.blocked = var.blocked + 1;
+    set var.token_failures = var.token_failures + 1;
+    set var.inflight = var.inflight + 1;
+    set var.peak_header_bytes = 8192;
+    set var.fastest_decision_us = 12;
+    return (hash);
+}"#;
+        let compiled = compile(source, CompileOptions::default()).unwrap();
+        let rows = stat_rows(&compiled.elf);
+        let named: Vec<(&str, u32, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.kind, row.help.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("blocked", 0, "VCL-declared counter blocked"),
+                (
+                    "token_failures",
+                    0,
+                    "Requests whose signed token did not verify"
+                ),
+                ("inflight", 1, "Requests the policy has admitted"),
+                ("peak_header_bytes", 2, "Largest header block seen"),
+                ("fastest_decision_us", 3, "Fastest recv decision"),
+            ]
+        );
+        // Rows are in declaration order, and every row's address is the
+        // word `.carapace.statics` gives it.
+        let statics = section(&compiled.elf, ".carapace.statics").expect("statics section");
+        let mut at = 0;
+        let mut addresses = Vec::new();
+        while at < statics.len() {
+            let address = u64::from_le_bytes(statics[at..at + 8].try_into().unwrap());
+            let name_len =
+                u32::from_le_bytes(statics[at + 12..at + 16].try_into().unwrap()) as usize;
+            let name = String::from_utf8(statics[at + 16..at + 16 + name_len].to_vec()).unwrap();
+            addresses.push((name, address));
+            at += 16 + name_len;
+        }
+        for row in &rows {
+            assert_eq!(row.flags, 0, "flags are reserved");
+            assert_eq!(row.addr % 8, 0, "a stat word is 8-byte aligned");
+            let expected = addresses
+                .iter()
+                .find(|(name, _)| *name == row.name)
+                .expect("declared static");
+            assert_eq!(row.addr, expected.1, "{} address", row.name);
+        }
+        assert_eq!(addresses.len(), 5, "every static is published");
+    }
+
+    #[test]
+    fn a_policy_with_no_stat_publishes_no_section() {
+        let compiled = compile(BASIC, CompileOptions::default()).unwrap();
+        assert!(section(&compiled.elf, ".carapace.stats").is_none());
+        assert!(!compiled
+            .elf
+            .windows(b".carapace.stats\0".len())
+            .any(|bytes| bytes == b".carapace.stats\0"));
+    }
+
+    #[test]
+    fn a_stat_annotation_does_not_move_the_generated_code() {
+        // The kind and the description are metadata: they change rodata and
+        // a section row, and must not change an instruction.
+        let plain =
+            "vcl 4.1; static var n: INT stat; sub vcl_recv { set var.n = var.n + 1; return (hash); }";
+        let described = "vcl 4.1; static var n: INT stat gauge \"a longer description\"; \
+                         sub vcl_recv { set var.n = var.n + 1; return (hash); }";
+        let plain = compile(plain, CompileOptions::default()).unwrap();
+        let described = compile(described, CompileOptions::default()).unwrap();
+        assert_eq!(
+            section(&plain.elf, ".text").unwrap(),
+            section(&described.elf, ".text").unwrap()
+        );
+    }
+
+    #[test]
+    fn compiling_a_stat_policy_is_deterministic() {
+        let source = r#"vcl 4.1;
+static var blocked: INT stat "help";
+sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
+        let first = compile(source, CompileOptions::default()).unwrap();
+        let second = compile(source, CompileOptions::default()).unwrap();
+        assert_eq!(first.elf, second.elf);
+    }
+
+    #[test]
+    fn stat_annotation_diagnostics() {
+        let cases = [
+            (
+                "vcl 4.1; static var b: BOOL stat; sub vcl_recv {}",
+                "a BOOL static cannot be a statistic",
+            ),
+            (
+                "vcl 4.1; static var t: TIME stat; sub vcl_recv {}",
+                "a TIME static cannot be a statistic",
+            ),
+            (
+                "vcl 4.1; static var d: DURATION stat; sub vcl_recv {}",
+                "a DURATION static cannot be a statistic yet",
+            ),
+            (
+                "vcl 4.1; static var f: INT = 1 stat min; sub vcl_recv {}",
+                "a 'min' statistic cannot have an initializer",
+            ),
+            (
+                "vcl 4.1; static var Blocked: INT stat; sub vcl_recv {}",
+                "a statistic name must match [a-z][a-z0-9_]*, not ending in '_'",
+            ),
+            (
+                "vcl 4.1; static var acme_: INT stat; sub vcl_recv {}",
+                "a statistic name must match [a-z][a-z0-9_]*, not ending in '_'",
+            ),
+            (
+                "vcl 4.1; static var a__b: INT stat; sub vcl_recv {}",
+                "a statistic name may not contain '__'",
+            ),
+            (
+                "vcl 4.1; static var s: STRING stat; sub vcl_recv {}",
+                "static cannot have type STRING",
+            ),
+            (
+                "vcl 4.1; static var n: INT stat median; sub vcl_recv {}",
+                "'median' is not a statistic kind",
+            ),
+            (
+                "vcl 4.1; static var n: INT = 1 + 2 stat; sub vcl_recv {}",
+                "runs before any request exists",
+            ),
+        ];
+        for (source, expected) in cases {
+            let error = compile(source, CompileOptions::default())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "expected {expected:?} in {error}");
+        }
+
+        // A refused STRING static is still declared, so its uses are not
+        // also reported as undeclared.
+        let error = compile(
+            "vcl 4.1; static var s: STRING stat; sub vcl_recv { set var.s = \"x\"; }",
+            CompileOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("static cannot have type STRING"), "{error}");
+        assert!(!error.contains("is not declared"), "{error}");
+
+        let long_name = format!(
+            "vcl 4.1; static var {}: INT stat; sub vcl_recv {{}}",
+            "a".repeat(65)
+        );
+        assert!(compile(&long_name, CompileOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("a statistic name is at most 64 bytes"));
+
+        let long_help = format!(
+            "vcl 4.1; static var n: INT stat \"{}\"; sub vcl_recv {{}}",
+            "x".repeat(201)
+        );
+        assert!(compile(&long_help, CompileOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("a statistic description is at most 200 bytes"));
+    }
+
+    #[test]
+    fn stat_is_a_contextual_keyword() {
+        // Nothing about `stat` is reserved: it still names a sub, a local
+        // and the statistic itself.
+        let source = "vcl 4.1; static var stat: INT stat; \
+                      sub vcl_recv { set var.stat = var.stat + 1; return (hash); }";
+        let compiled = compile(source, CompileOptions::default()).unwrap();
+        assert_eq!(stat_rows(&compiled.elf).len(), 1);
+        compile(
+            "vcl 4.1; sub stat { set req.http.x-stat = \"1\"; } \
+             sub vcl_recv { var stat: INT = 1; set var.stat = var.stat + 1; call stat; return (hash); }",
+            CompileOptions::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_typed_dump_shows_the_annotation() {
+        let dump = dump_ir(
+            "vcl 4.1; static var blocked: INT stat gauge \"why\"; sub vcl_recv { set var.blocked = 1; return (hash); }",
+            CompileOptions::default(),
+        )
+        .unwrap();
+        assert!(dump.contains("Gauge"), "{dump}");
+        assert!(dump.contains("why"), "{dump}");
     }
 
     #[test]

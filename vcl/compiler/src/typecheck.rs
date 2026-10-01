@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use crate::ast::SetOp;
 use crate::resolver::{ResolvedProgram, ResolvedUserSub, SubId, UserSubKind};
 use crate::types::{
-    global_slot_size, AclId, GlobalId, LocalId, Phase, StaticId, StringConversion, ValueType,
-    MAX_BLOCK_DEPTH, MAX_GLOBAL_STRING, MAX_REQUEST_GLOBALS,
+    global_slot_size, stat_name_ok, AclId, GlobalId, LocalId, Phase, StatKind, StatSpec, StaticId,
+    StringConversion, ValueType, MAX_BLOCK_DEPTH, MAX_GLOBAL_STRING, MAX_REQUEST_GLOBALS,
+    MAX_STAT_HELP, MAX_STAT_NAME,
 };
 use crate::vars::{self, Lowering, WriteConstraint};
 use crate::vmod::{Module, RecordSet, RegexSelect};
@@ -18,6 +19,10 @@ pub(crate) struct TypedStatic {
     pub name: String,
     pub value_type: ValueType,
     pub initial: i64,
+    /// The Varnish counter this static is. Every static has one: the
+    /// annotation is required, and only metadata — it reaches
+    /// `.carapace.stats` and changes nothing the static compiles to.
+    pub stat: Option<StatSpec>,
 }
 
 /// A request global: one slot of the region the host copies in and out at
@@ -392,16 +397,54 @@ pub(crate) fn check(
     let mut statics = Vec::new();
     let mut static_names = BTreeMap::new();
     for declaration in program.statics.iter() {
-        // Refused, but still declared, so a use of the name is not also
-        // reported as undeclared.
-        errors.push(static_refused(declaration.span));
         let value_type = ValueType::from(declaration.value_type);
+        // A static without `stat` is refused, but still declared, so a use
+        // of the name is not also reported as undeclared.
+        let Some(annotation) = declaration.stat.as_ref() else {
+            errors.push(static_refused(declaration.span));
+            let id = StaticId(statics.len() as u32);
+            static_names.insert(declaration.name.clone(), (value_type, id));
+            statics.push(TypedStatic {
+                name: declaration.name.clone(),
+                value_type,
+                initial: 0,
+                stat: None,
+            });
+            continue;
+        };
+        if value_type == ValueType::String {
+            errors.push(Diagnostic::error(
+                declaration.name_span,
+                "a static cannot have type STRING because strings live in the per-phase arena",
+            ));
+            let id = StaticId(statics.len() as u32);
+            static_names.insert(declaration.name.clone(), (value_type, id));
+            statics.push(TypedStatic {
+                name: declaration.name.clone(),
+                value_type,
+                initial: 0,
+                stat: None,
+            });
+            continue;
+        }
+        let initial = match declaration.init.as_ref() {
+            None => 0,
+            Some(expr) => match static_literal(expr, value_type) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(error);
+                    0
+                }
+            },
+        };
+        let stat = check_stat(declaration, annotation, value_type, &mut errors);
         let id = StaticId(statics.len() as u32);
         static_names.insert(declaration.name.clone(), (value_type, id));
         statics.push(TypedStatic {
             name: declaration.name.clone(),
             value_type,
-            initial: 0,
+            initial,
+            stat,
         });
     }
 
@@ -1071,17 +1114,140 @@ impl Storage {
     }
 }
 
-/// The refusal every `static var` declaration gets.
+/// Check a `stat` annotation and resolve it to what the ELF row carries.
 ///
-/// Varnish runs each request in a fresh fork of the VM, so a static could
-/// only ever hold its initialiser: a write would vanish with the request.
+/// Returns `None` when the annotation is rejected — the static itself still
+/// exists and still compiles; only the exported statistic is dropped, and the
+/// diagnostic that dropped it fails the compile anyway.
+fn check_stat(
+    declaration: &crate::resolver::ResolvedStatic,
+    annotation: &ast::StatAnnotation,
+    value_type: ValueType,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<StatSpec> {
+    // `INT` only. `BOOL` and `TIME` are not quantities; `DURATION` is one and
+    // is the named extension, waiting on `scalar_metric` learning `divisor`.
+    let refusal = match value_type {
+        ValueType::Integer => None,
+        // A quantity, and the obvious extension — it would set a divisor and
+        // name the family `_seconds` — but `divisor` is documented as
+        // ignored by every kind but a histogram, so it is not free.
+        ValueType::Duration => Some((
+            "a DURATION static cannot be a statistic yet",
+            "store nanoseconds in an INT static and annotate that",
+        )),
+        ValueType::Boolean => Some((
+            "a BOOL static cannot be a statistic",
+            "a statistic is a quantity, so it must be INT",
+        )),
+        ValueType::Time => Some((
+            "a TIME static cannot be a statistic",
+            "a statistic is a quantity, so it must be INT",
+        )),
+        // Already refused at the type: a static cannot be either of these.
+        ValueType::String | ValueType::Ip => Some((
+            "this static cannot be a statistic",
+            "a statistic is a quantity, so it must be INT",
+        )),
+    };
+    if let Some((what, help)) = refusal {
+        errors.push(Diagnostic::error(declaration.name_span, what).with_help(help));
+        return None;
+    }
+
+    // A min accumulator needs a sentinel start, and the host primes the word
+    // to `i64::MAX` after `main` so the sentinel stays out of the language.
+    // An initialiser would be overwritten, so it is refused rather than
+    // silently ignored.
+    if annotation.kind == StatKind::Min {
+        if let Some(init) = declaration.init.as_ref() {
+            errors.push(
+                Diagnostic::error(init.span, "a 'min' statistic cannot have an initializer")
+                    .with_help("the host primes a 'min' word to its sentinel after main() runs"),
+            );
+            return None;
+        }
+    }
+
+    // The name reaches a Varnish counter name, so it is held to a safe
+    // grammar and to a length. `__` is Carapace's separator between a tenant
+    // and a name, refused here too so a policy moves between the two
+    // unchanged.
+    if declaration.name.contains("__") {
+        errors.push(
+            Diagnostic::error(
+                declaration.name_span,
+                "a statistic name may not contain '__'",
+            )
+            .with_help("'__' is reserved as the separator between a tenant and a name"),
+        );
+        return None;
+    }
+    if !stat_name_ok(&declaration.name) {
+        errors.push(Diagnostic::error(
+            declaration.name_span,
+            "a statistic name must match [a-z][a-z0-9_]*, not ending in '_'",
+        ));
+        return None;
+    }
+    if declaration.name.len() > MAX_STAT_NAME {
+        errors.push(Diagnostic::error(
+            declaration.name_span,
+            format!("a statistic name is at most {MAX_STAT_NAME} bytes"),
+        ));
+        return None;
+    }
+
+    let help = match annotation.help.as_ref() {
+        Some(help) => {
+            if help.len() > MAX_STAT_HELP {
+                errors.push(Diagnostic::error(
+                    annotation.help_span,
+                    format!("a statistic description is at most {MAX_STAT_HELP} bytes"),
+                ));
+                return None;
+            }
+            if help.as_bytes().contains(&0) {
+                errors.push(Diagnostic::error(
+                    annotation.help_span,
+                    "a statistic description contains a NUL byte",
+                ));
+                return None;
+            }
+            help.clone()
+        }
+        // Derived from the declaration and nothing else. Never the source
+        // path: two programs of one tenant declaring one name from different
+        // files would then disagree about the help.
+        None => format!(
+            "VCL-declared {} {}",
+            annotation.kind.word(),
+            declaration.name
+        ),
+    };
+
+    Some(StatSpec {
+        kind: annotation.kind,
+        help,
+    })
+}
+
+/// The refusal a `static var` without `stat` gets.
+///
+/// Varnish runs each request in a fresh fork of the VM, so a plain static
+/// could only ever hold its initialiser: a write would vanish with the
+/// request. A statistic is the exception, because the host folds what the
+/// request did to it into a Varnish counter before the fork goes away.
 fn static_refused(span: Span) -> Diagnostic {
     Diagnostic::error(
         span,
         "static variables are not supported: every request runs in a fresh VM fork, so nothing \
          persists between requests",
     )
-    .with_help("use a request global ('var NAME: TYPE;' at the top level) instead")
+    .with_help(
+        "use a request global ('var NAME: TYPE;' at the top level) instead, or annotate it \
+         with 'stat' to count into a Varnish counter",
+    )
 }
 
 /// `set var.x += e` and `-=`: the read, add and store that `set var.x =

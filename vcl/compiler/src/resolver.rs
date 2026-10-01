@@ -52,6 +52,7 @@ pub(crate) struct ResolvedStatic {
     pub name_span: Span,
     pub value_type: ast::TypeName,
     pub init: Option<ast::Expr>,
+    pub stat: Option<ast::StatAnnotation>,
     pub span: Span,
 }
 
@@ -170,6 +171,7 @@ pub(crate) fn resolve(source: &str, program: ast::Program) -> Result<ResolvedPro
                 name_span,
                 value_type,
                 init,
+                stat,
                 span,
             } => {
                 if let Some((previous, kind)) = declarations.get(&name) {
@@ -185,6 +187,7 @@ pub(crate) fn resolve(source: &str, program: ast::Program) -> Result<ResolvedPro
                     name_span,
                     value_type,
                     init,
+                    stat,
                     span,
                 });
             }

@@ -1,3 +1,4 @@
+use crate::types::StatKind;
 use crate::Span;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,9 @@ pub(crate) enum Item {
         name_span: Span,
         value_type: TypeName,
         init: Option<Expr>,
+        /// The `stat` annotation. A static needs one: it is what the host
+        /// folds into a Varnish counter at the end of every phase.
+        stat: Option<StatAnnotation>,
         span: Span,
     },
     /// A top-level `var NAME: TYPE [= LITERAL];`: a request global, living
@@ -57,6 +61,20 @@ impl SetOp {
             Self::Subtract => "-=",
         }
     }
+}
+
+/// `stat [KIND] [STRING]` on a `static var`, as written.
+///
+/// The kind word is optional and defaults to `counter`; so is the
+/// description, which the type checker replaces with a derived default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatAnnotation {
+    pub kind: StatKind,
+    pub help: Option<String>,
+    /// The description literal, or — with no description — the last word the
+    /// annotation spelled. Where a diagnostic about the description points,
+    /// and where the declaration ends when it has no `;`.
+    pub help_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -182,6 +182,33 @@ fn build_inner(image: &Image) -> Result<Vec<u8>, String> {
         Some(offset)
     };
 
+    // One 32-byte row per `stat`-annotated static, in declaration order:
+    // the guest address of the 8-byte word, the kind, reserved flags, and
+    // the guest addresses of the NUL-terminated name and help. Fixed-size
+    // rows pointing at guest strings, because that is what lets a C or Rust
+    // guest emit one from a macro — the section is an ABI, not something the
+    // host learned about VCL. Unallocated: the host reads it from the ELF
+    // when the program loads (src/vcl/vcl_stats.cpp).
+    let mut stat_bytes = Vec::new();
+    for static_ in &image.statics {
+        let Some(stat) = static_.stat.as_ref() else {
+            continue;
+        };
+        push_u64(&mut stat_bytes, static_.address);
+        push_u32(&mut stat_bytes, stat.spec.kind as u32);
+        push_u32(&mut stat_bytes, 0); // flags: reserved
+        push_u64(&mut stat_bytes, stat.name_address);
+        push_u64(&mut stat_bytes, stat.help_address);
+    }
+    let stats_offset = if stat_bytes.is_empty() {
+        None
+    } else {
+        cursor = align(cursor, 8);
+        let offset = cursor;
+        cursor += stat_bytes.len();
+        Some(offset)
+    };
+
     // Every regular-expression literal the policy spells, NUL-terminated, in
     // first-use order. The engine compiles the set once when it warms, so a
     // VCL policy never builds a pattern on a request's own thread and never
@@ -239,6 +266,9 @@ fn build_inner(image: &Image) -> Result<Vec<u8>, String> {
     }
     if statics_offset.is_some() {
         section_names.push(".carapace.statics");
+    }
+    if stats_offset.is_some() {
+        section_names.push(".carapace.stats");
     }
     if regex_offset.is_some() {
         section_names.push(".carapace.regex");
@@ -416,6 +446,22 @@ fn build_inner(image: &Image) -> Result<Vec<u8>, String> {
         });
         sections.push(shstr);
     }
+    if let Some(stats_offset) = stats_offset {
+        let shstr = sections.pop().expect("shstr section");
+        sections.push(Section {
+            name: ".carapace.stats",
+            kind: 1, // SHT_PROGBITS: fixed-size rows
+            flags: 0,
+            address: 0,
+            offset: stats_offset as u64,
+            size: stat_bytes.len() as u64,
+            link: 0,
+            info: 0,
+            align: 8,
+            entry_size: 32,
+        });
+        sections.push(shstr);
+    }
 
     if let Some(regex_offset) = regex_offset {
         let shstr = sections.pop().expect("shstr section");
@@ -492,6 +538,10 @@ fn build_inner(image: &Image) -> Result<Vec<u8>, String> {
     if let Some(statics_offset) = statics_offset {
         resize_to(&mut elf, statics_offset);
         elf.extend_from_slice(&static_bytes);
+    }
+    if let Some(stats_offset) = stats_offset {
+        resize_to(&mut elf, stats_offset);
+        elf.extend_from_slice(&stat_bytes);
     }
     if let Some(regex_offset) = regex_offset {
         resize_to(&mut elf, regex_offset);
@@ -766,6 +816,7 @@ mod tests {
                 name: "requests".into(),
                 address,
                 value_type: ValueType::Integer,
+                stat: None,
             }],
             globals: Vec::new(),
             global_region: None,

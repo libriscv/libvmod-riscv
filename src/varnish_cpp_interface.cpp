@@ -80,7 +80,11 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* a
 		const auto addr = callbacks[info.idx];
 		if (addr == 0x0)
 			return 0;
-		return script->call(addr);
+		const long ret = script->call(addr);
+		// What the hook did to its statistics, even if it trapped: the
+		// writes before the trap happened.
+		rvs::vcl::fold_stats(*script);
+		return ret;
 	}
 	if (info.idx < callbacks.size())
 	{

@@ -334,3 +334,56 @@ vclv_regsub(VRT_CTX, int all, const char *subject, void *re,
 {
 	return (VRT_regsub(ctx, all, subject, re, replacement));
 }
+
+/* JSON string contents: a description is the author's text, so a quote, a
+   backslash or a control byte in it must not end the string early. */
+static void
+vclv_json_escape(struct vsb *vsb, const char *s)
+{
+	for (; *s != '\0'; s++) {
+		const unsigned char c = (unsigned char)*s;
+		if (c == '"' || c == '\\')
+			VSB_printf(vsb, "\\%c", c);
+		else if (c < 0x20)
+			VSB_printf(vsb, "\\u%04x", c);
+		else
+			VSB_putc(vsb, c);
+	}
+}
+
+uint64_t *
+vclv_stat_alloc(const char *tenant, const char *name, const char *help,
+    int gauge)
+{
+	struct vsb *vsb;
+	uint64_t *word;
+
+	AN(tenant);
+	AN(name);
+	AN(help);
+	/* Varnish keeps a pointer to the descriptor and reuses its documentation
+	   segment by address, so the bytes stay allocated for the life of the
+	   process, like the counter itself. */
+	vsb = VSB_new_auto();
+	AN(vsb);
+	VSB_cat(vsb, "{\"version\":\"1\",\"name\":\"riscv\",");
+	VSB_cat(vsb, "\"oneliner\":\"VCL tenant statistics\",\"order\":1000,");
+	VSB_cat(vsb, "\"docs\":\"Counters declared by a tenant's VCL\",");
+	VSB_printf(vsb, "\"elements\":1,\"elem\":{\"%s\":{", name);
+	VSB_printf(vsb, "\"type\":\"%s\",\"ctype\":\"uint64_t\",",
+	    gauge ? "gauge" : "counter");
+	VSB_cat(vsb, "\"level\":\"info\",\"oneliner\":\"");
+	vclv_json_escape(vsb, help);
+	VSB_printf(vsb, "\",\"format\":\"integer\",\"index\":0,\"name\":\"%s\",", name);
+	VSB_cat(vsb, "\"docs\":\"");
+	vclv_json_escape(vsb, help);
+	VSB_cat(vsb, "\"}}}");
+	AZ(VSB_finish(vsb));
+
+	word = VRT_VSC_Alloc(NULL, NULL, "RISCV", sizeof *word,
+	    (const unsigned char *)VSB_data(vsb), VSB_len(vsb) + 1,
+	    "%s", tenant);
+	if (word == NULL)
+		VSB_destroy(&vsb);
+	return (word);
+}

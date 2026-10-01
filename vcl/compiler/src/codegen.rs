@@ -10,8 +10,8 @@ use crate::riscv::Reg;
 use crate::runtime;
 use crate::typecheck::GlobalInit;
 use crate::types::{
-    global_slot_size, AclId, GlobalId, LocalId, Span, StaticId, StringConversion, ValueType,
-    MAX_GLOBAL_STRING,
+    global_slot_size, AclId, GlobalId, LocalId, Span, StatSpec, StaticId, StringConversion,
+    ValueType, MAX_GLOBAL_STRING,
 };
 use crate::vmod::{Module, Routines, Source};
 use crate::{PhaseSet, SourceUnit};
@@ -82,6 +82,10 @@ pub(crate) struct StaticSymbol {
     pub name: String,
     pub address: u64,
     pub value_type: ValueType,
+    /// The exported statistic, and where its name and help bytes were
+    /// placed in the guest image. `.carapace.stats` rows point at guest
+    /// strings, so the addresses are resolved here with the literals.
+    pub stat: Option<StatSymbol>,
 }
 
 /// A request global's slot, for the symbol table.
@@ -98,6 +102,16 @@ pub(crate) struct GlobalSymbol {
 pub(crate) struct GlobalRegion {
     pub address: u64,
     pub image: Vec<u8>,
+}
+
+/// A `stat`-annotated static, with its strings placed in the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatSymbol {
+    pub spec: StatSpec,
+    /// Guest address of the NUL-terminated name.
+    pub name_address: u64,
+    /// Guest address of the NUL-terminated help.
+    pub help_address: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +503,35 @@ fn generate_inner(program: &AllocatedProgram, unit: &SourceUnit) -> Result<Image
         literal_offsets.push(rodata.len());
         rodata.extend_from_slice(literal);
     }
+    // A `.carapace.stats` row points at guest strings rather than carrying
+    // inline lengths, so that a C guest can build one from a macro. The VCL
+    // backend owes the same rows the same strings: name and help, NUL
+    // terminated, beside the literals in rodata.
+    let rodata_base = BASE_ADDRESS
+        .checked_add(text_len as u64)
+        .ok_or_else(|| "VCL text address overflow".to_string())?;
+    let mut stat_symbols: Vec<Option<StatSymbol>> = Vec::with_capacity(program.statics.len());
+    for static_ in &program.statics {
+        let Some(spec) = static_.stat.as_ref() else {
+            stat_symbols.push(None);
+            continue;
+        };
+        let place = |rodata: &mut Vec<u8>, bytes: &[u8]| -> Result<u64, String> {
+            let address = rodata_base
+                .checked_add(rodata.len() as u64)
+                .ok_or_else(|| "VCL statistic string address overflow".to_string())?;
+            rodata.extend_from_slice(bytes);
+            rodata.push(0);
+            Ok(address)
+        };
+        let name_address = place(&mut rodata, static_.name.as_bytes())?;
+        let help_address = place(&mut rodata, spec.help.as_bytes())?;
+        stat_symbols.push(Some(StatSymbol {
+            spec: spec.clone(),
+            name_address,
+            help_address,
+        }));
+    }
     let loaded_end = BASE_ADDRESS
         .checked_add(text_len as u64)
         .and_then(|value| value.checked_add(rodata.len() as u64))
@@ -541,6 +584,7 @@ fn generate_inner(program: &AllocatedProgram, unit: &SourceUnit) -> Result<Image
             name: static_.name.clone(),
             address: static_address(index),
             value_type: static_.value_type,
+            stat: stat_symbols[index].clone(),
         })
         .collect();
     Ok(Image {

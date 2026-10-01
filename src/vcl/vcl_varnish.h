@@ -96,6 +96,12 @@ int vclv_regex_match(const void *re, const char *subject, size_t len);
 const char *vclv_regsub(const struct vrt_ctx *, int all, const char *subject,
     void *re, const char *replacement);
 
+/* A Varnish counter, RISCV.<tenant>.<name>, that lives for the rest of the
+   process. `gauge` picks the VSC type varnishstat shows it as. Returns the
+   counter word, or NULL when Varnish refuses the descriptor. */
+uint64_t *vclv_stat_alloc(const char *tenant, const char *name,
+    const char *help, int gauge);
+
 #ifdef __cplusplus
 }
 #endif

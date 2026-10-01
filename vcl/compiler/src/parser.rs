@@ -1,8 +1,9 @@
 use crate::ast::{
     AclEntry, BinaryOp, CallArgument, Expr, ExprKind, Item, Literal, Program, ReturnAction, SetOp,
-    Statement, Sub, TypeName,
+    StatAnnotation, Statement, Sub, TypeName,
 };
 use crate::lexer::{Kind, Token};
+use crate::types::StatKind;
 use crate::{Diagnostic, Diagnostics, Span};
 
 /// How deeply expressions and statement blocks may nest.
@@ -246,16 +247,24 @@ impl Parser<'_> {
         } else {
             None
         };
+        // Only `;` or `stat` can appear here, and an expression parse stops
+        // at a bare word that is not an infix operator — so `= 1 stat min;`
+        // needs no lookahead trickery. Checked explicitly all the same:
+        // relying on where the expression grammar happens to stop would make
+        // this a property of another function.
+        let stat = self.parse_stat_annotation();
         let end = self.expect(Kind::Semicolon, "';' after static declaration");
-        let fallback = init
+        let fallback = stat
             .as_ref()
-            .map(|expr| expr.span.end)
+            .map(|annotation| annotation.help_span.end)
+            .or_else(|| init.as_ref().map(|expr| expr.span.end))
             .unwrap_or(name_span.end);
         Some(Item::Static {
             name,
             name_span,
             value_type,
             init,
+            stat,
             span: Span::new(start.start, end.unwrap_or(fallback)),
         })
     }
@@ -288,6 +297,54 @@ impl Parser<'_> {
             value_type,
             init,
             span: Span::new(start.start, end.unwrap_or(fallback)),
+        })
+    }
+
+    /// `stat [counter|gauge|max|min] [STRING]`, or nothing.
+    ///
+    /// `stat` and the kind words are contextual keywords: they are ordinary
+    /// `Word` tokens everywhere else, so a policy that already has a static
+    /// or a sub called `stat` keeps compiling.
+    fn parse_stat_annotation(&mut self) -> Option<StatAnnotation> {
+        let (word, stat_span) = self.peek_word()?;
+        if word != "stat" {
+            return None;
+        }
+        self.at += 1;
+        let (kind, kind_span) = match self.peek_word() {
+            Some((word, span)) => match StatKind::from_word(word) {
+                Some(kind) => {
+                    self.at += 1;
+                    (kind, span)
+                }
+                None => {
+                    self.errors.push(
+                        Diagnostic::error(span, format!("'{word}' is not a statistic kind"))
+                            .with_help("the kinds are 'counter', 'gauge', 'max' and 'min'"),
+                    );
+                    self.at += 1;
+                    (StatKind::Counter, span)
+                }
+            },
+            // No kind word: `stat` alone is the short spelling of a counter.
+            None => (StatKind::Counter, stat_span),
+        };
+        let (help, help_span) = match self.tokens.get(self.at) {
+            Some(Token {
+                kind: Kind::String(value),
+                span,
+            }) => {
+                let value = value.clone();
+                let span = *span;
+                self.at += 1;
+                (Some(value), span)
+            }
+            _ => (None, kind_span),
+        };
+        Some(StatAnnotation {
+            kind,
+            help,
+            help_span,
         })
     }
 

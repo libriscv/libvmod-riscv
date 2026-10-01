@@ -19,7 +19,7 @@ use crate::typecheck::{
     VmodAction,
 };
 use crate::types::{
-    AclId, GlobalId, LocalId, Phase, StaticId, StringConversion, ValueType,
+    AclId, GlobalId, LocalId, Phase, StatSpec, StaticId, StringConversion, ValueType,
 };
 use crate::vars::Lowering;
 use crate::vmod::{Commit, Module, RegexSelect, Source};
@@ -731,6 +731,9 @@ pub(crate) struct StaticDef {
     pub class: ValueClass,
     pub value_type: ValueType,
     pub initial: i64,
+    /// Carried through untouched, like [`Program::patterns`]: metadata for
+    /// the host, not something any pass reads or rewrites.
+    pub stat: Option<StatSpec>,
 }
 
 /// One request global: a slot in the region the host copies in and out at
@@ -2370,6 +2373,7 @@ pub(crate) fn lower(typed: &TypedProgram) -> Program {
             class: value_class(static_.value_type),
             value_type: static_.value_type,
             initial: static_.initial,
+            stat: static_.stat.clone(),
         })
         .collect();
     let globals = typed

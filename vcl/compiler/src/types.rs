@@ -212,3 +212,68 @@ impl PhaseSet {
         )
     }
 }
+
+/// What a `stat`-annotated static means to the exposition.
+///
+/// The discriminants are the `kind` column of a `.carapace.stats` row, so
+/// they are the ABI (`src/vcl/vcl_stats.cpp` on the host side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatKind {
+    Counter = 0,
+    Gauge = 1,
+    Max = 2,
+    Min = 3,
+}
+
+impl StatKind {
+    /// The annotation word, for a diagnostic and for the default help.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Max => "max",
+            Self::Min => "min",
+        }
+    }
+
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "counter" => Some(Self::Counter),
+            "gauge" => Some(Self::Gauge),
+            "max" => Some(Self::Max),
+            "min" => Some(Self::Min),
+            _ => None,
+        }
+    }
+}
+
+/// A statistic declared by a `stat` annotation, resolved to what the ELF row
+/// carries: a kind and a help string. The help is never `None` past type
+/// checking — an annotation with no string gets the derived default, which
+/// must be reproducible from the declaration alone so two engines declaring
+/// one name do not disagree about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatSpec {
+    pub kind: StatKind,
+    pub help: String,
+}
+
+/// The longest a statistic name may be. Both caps exist because the name and
+/// the help reach a Varnish counter descriptor that lives for the process.
+pub(crate) const MAX_STAT_NAME: usize = 64;
+
+/// The longest a statistic description may be.
+pub(crate) const MAX_STAT_HELP: usize = 200;
+
+/// Whether `name` matches the statistic name grammar, `[a-z][a-z0-9_]*` not
+/// ending in `_`. Carapace's grammar, kept so a policy moves between the two
+/// unchanged.
+pub(crate) fn stat_name_ok(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && !name.ends_with('_')
+}

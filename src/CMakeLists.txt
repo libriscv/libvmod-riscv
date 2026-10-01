@@ -19,6 +19,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	vmod_riscv_update.c
 	vcl/compiler.cpp
 	vcl/vcl_program.cpp
+	vcl/vcl_stats.cpp
 	vcl/vcl_syscalls.cpp
 	vcl/vcl_varnish.c
 	vcl/vclc_blob.c

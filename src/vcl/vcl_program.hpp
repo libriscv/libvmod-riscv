@@ -1,4 +1,5 @@
 #pragma once
+#include "vcl_stats.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -38,6 +39,10 @@ struct Program
 	   after main(), so every fork starts from it. */
 	uint64_t globals_address = 0;
 	std::vector<uint8_t> globals_image;
+
+	/* The declared statistics (`.carapace.stats`), bound to their tenant
+	   counters. */
+	std::vector<Stat> stats;
 
 	const void* pattern(std::string_view) const;
 
@@ -88,6 +93,8 @@ struct StagedSynth
 struct TaskState
 {
 	StagedSynth synth;
+	/* Each statistic word as the host last read it (fold_stats). */
+	std::vector<uint64_t> stat_seen;
 };
 
 /* Apply a staged synthetic response in vcl_synth. */

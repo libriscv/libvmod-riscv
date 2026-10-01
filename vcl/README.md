@@ -16,7 +16,8 @@ The host side lives in `src/vcl/`:
 | File | What it does |
 |---|---|
 | `compiler.cpp` | Runs `vclc.elf` in a fresh machine per compile, answers its includes (confined to the policy's directory), and decodes the answer under hard caps. |
-| `vcl_program.cpp` | Loads a compiled policy: compiles its regex literals (`.carapace.regex`), seeds its request globals (`.carapace.globals`) into the master VM, maps its hooks to the VMOD callbacks, and stages a folded `vcl_synth`. |
+| `vcl_program.cpp` | Loads a compiled policy: compiles its regex literals (`.carapace.regex`), seeds its request globals (`.carapace.globals`) into the master VM, binds its statistics (`.carapace.stats`), maps its hooks to the VMOD callbacks, and stages a folded `vcl_synth`. |
+| `vcl_stats.cpp` | Statistics: the tenant counter registry, and the fold of each statistic word into its Varnish counter after every hook. |
 | `vcl_syscalls.cpp` | The policy ABI the generated code calls, at syscalls 540..=560 (`abi.hpp`). |
 | `vcl_varnish.c` | Everything that touches Varnish's own objects, in C against `cache/cache.h`. |
 
@@ -37,8 +38,11 @@ Differences from Carapace, all on the host side:
   applied when `riscv.run()` is called from `vcl_synth`.
 - Regular expressions are Varnish's (PCRE). The compiler still validates
   patterns against its own, stricter rules.
-- `static var` is refused, and declared and dynamic statistics are gone.
-  Each request runs in a fresh fork, so there is nothing to accumulate into.
+- A plain `static var` is refused, because each request runs in a fresh fork
+  and has nothing to accumulate into. A `stat`-annotated static is allowed.
+  The host folds each fork's changes to it into a Varnish counter,
+  `RISCV.<tenant>.<name>`, instead of a Prometheus family. Dynamic
+  statistics (`stat NAME: KIND {KEYS} ttl ...`) are not ported.
 
 ## Rebuilding the blobs
 
