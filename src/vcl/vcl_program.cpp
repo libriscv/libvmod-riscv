@@ -7,18 +7,23 @@
 #include <cstring>
 #include <libriscv/elf.hpp>
 #include <stdexcept>
-#include <strings.h>
 
 namespace rvs::vcl {
 
 /* The hooks a compiled policy exports, and the VMOD callback each one
-   answers (callback_names in machine_instance.hpp). vcl_synth has no hook:
-   the compiler folds it into on_recv and on_deliver. */
+   answers (callback_names in machine_instance.hpp), which is the one
+   riscv.run() picks for the Varnish subroutine it is called from. */
 static constexpr std::pair<const char*, size_t> HOOKS[] = {
 	{"on_recv", 1},              // ON_REQUEST
-	{"on_backend_request", 4},   // ON_BACKEND_FETCH
+	{"on_hash", 2},              // ON_HASH
+	{"on_synth", 3},             // ON_SYNTH
+	{"on_backend_fetch", 4},     // ON_BACKEND_FETCH
 	{"on_backend_response", 5},  // ON_BACKEND_RESPONSE
+	{"on_backend_error", 6},     // ON_BACKEND_ERROR
 	{"on_deliver", 7},           // ON_DELIVER
+	{"on_hit", 8},               // ON_HIT
+	{"on_miss", 9},              // ON_MISS
+	{"on_pass", 12},             // ON_PASS
 };
 /* Carapace's ceiling on the region, kept: a request global is at most 264
    bytes, and the region is copied into every fork. */
@@ -134,61 +139,6 @@ std::unique_ptr<Program> Program::install(Script& master, MachineInstance& inst)
 	for (auto& [symbol, index] : HOOKS)
 		inst.callback_entries.at(index) = machine.address_of(symbol);
 	return program;
-}
-
-/* ── Staged synthetic response ──────────────────────────────────────── */
-
-static bool same_name(std::string_view a, std::string_view b)
-{
-	return a.size() == b.size() && strncasecmp(a.data(), b.data(), a.size()) == 0;
-}
-
-const std::string* StagedSynth::get(std::string_view name) const
-{
-	for (auto& [n, v] : headers)
-		if (same_name(n, name)) return &v;
-	return nullptr;
-}
-
-void StagedSynth::set(std::string_view name, std::string_view value)
-{
-	unset(name);
-	add(name, value);
-}
-
-void StagedSynth::add(std::string_view name, std::string_view value)
-{
-	headers.emplace_back(std::string(name), std::string(value));
-}
-
-void StagedSynth::unset(std::string_view name)
-{
-	std::erase_if(headers, [&](auto& h) { return same_name(h.first, name); });
-	for (auto& r : removed)
-		if (same_name(r, name)) return;
-	removed.emplace_back(name);
-}
-
-void apply_synth(Script& script)
-{
-	auto& synth = script.vcl_task().synth;
-	const auto* ctx = script.ctx();
-	if (!synth.active || vclv_phase(ctx) != VCL_PHASE_SYNTH)
-		return;
-	auto* hp = vclv_http(ctx, VCL_SIDE_RESPONSE);
-	if (hp == nullptr)
-		return;
-	/* Varnish's synthetic response starts with defaults of its own. A name
-	   the policy removed or set replaces them; the rest stay. */
-	for (auto& name : synth.removed)
-		vclv_unset(hp, name.data(), name.size());
-	for (auto& [name, value] : synth.headers)
-		vclv_unset(hp, name.data(), name.size());
-	for (auto& [name, value] : synth.headers)
-		vclv_add(ctx, hp, name.data(), name.size(), value.data(), value.size());
-	vclv_set_reason(ctx, synth.reason.data(), synth.reason.size());
-	vclv_synth_body(ctx, synth.body.data(), synth.body.size());
-	synth = StagedSynth{};
 }
 
 bool is_vcl_source(std::string_view filename)

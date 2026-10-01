@@ -8,6 +8,9 @@ sub vcl_recv {
     if (req.url ~ "^/deny") {
         return (synth(403, "denied"));
     }
+    if (req.url == "/gone") {
+        return (synth(404));
+    }
     if (req.url ~ "^/api/") {
         set var.kind = "api";
     }
@@ -22,6 +25,7 @@ sub vcl_synth {
     set resp.http.Content-Type = "text/plain";
     set resp.http.X-Synth = "policy";
     synthetic("nope");
+    return (deliver);
 }
 
 sub vcl_backend_fetch {

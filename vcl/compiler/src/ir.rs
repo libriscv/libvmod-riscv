@@ -21,7 +21,7 @@ use crate::typecheck::{
 use crate::types::{
     AclId, GlobalId, LocalId, Phase, StatSpec, StaticId, StringConversion, ValueType,
 };
-use crate::vars::Lowering;
+use crate::vars::{HostVar, Lowering};
 use crate::vmod::{Commit, Module, RegexSelect, Source};
 use crate::Span;
 
@@ -107,11 +107,12 @@ fn cache_metadata_read(lowering: Lowering) -> (Syscall, i64) {
         | Lowering::ResponseHeader
         | Lowering::RequestUrl
         | Lowering::RequestMethod
-        | Lowering::ResponseStatus
         | Lowering::Now
         | Lowering::ClientIp
         | Lowering::Uncacheable
-        | Lowering::CacheHit => unreachable!("not a cache-metadata variable"),
+        | Lowering::CacheHit
+        | Lowering::Body
+        | Lowering::Host(_) => unreachable!("not a cache-metadata variable"),
     }
 }
 
@@ -129,7 +130,6 @@ define_syscalls! {
     RequestSetUrl => { number: 544, name: "req_set_url", command: None, args: Some(&[ValueClass::String]), result: None },
     ResponseGetHeader => { number: 545, name: "resp_get_header", command: None, args: Some(&[ValueClass::String]), result: Some(ValueClass::String) },
     ResponseHasHeader => { number: 545, name: "resp_has_header", command: None, args: Some(&[ValueClass::String]), result: Some(ValueClass::Scalar) },
-    ResponseGetStatus => { number: 547, name: "resp_get_status", command: None, args: Some(&[]), result: Some(ValueClass::Scalar) },
     ResponseSetHeader => { number: 546, name: "resp_set_header", command: None, args: Some(&[ValueClass::String, ValueClass::String]), result: None },
     RequestRemoveHeader => { number: 560, name: "req_remove_header", command: Some(19), args: Some(&[ValueClass::Scalar, ValueClass::String]), result: None },
     ResponseRemoveHeader => { number: 560, name: "resp_remove_header", command: Some(20), args: Some(&[ValueClass::Scalar, ValueClass::String]), result: None },
@@ -157,7 +157,16 @@ define_syscalls! {
     GetTtl => { number: 560, name: "get_ttl", command: Some(27), args: Some(&[ValueClass::Scalar, ValueClass::Scalar]), result: Some(ValueClass::Scalar) },
     GetStaleWhileRevalidate => { number: 560, name: "get_stale_while_revalidate", command: Some(27), args: Some(&[ValueClass::Scalar, ValueClass::Scalar]), result: Some(ValueClass::Scalar) },
     GetStaleIfError => { number: 560, name: "get_stale_if_error", command: Some(27), args: Some(&[ValueClass::Scalar, ValueClass::Scalar]), result: Some(ValueClass::Scalar) },
-    SetOutcome => { number: 560, name: "set_outcome", command: Some(21), args: Some(&[ValueClass::Scalar, ValueClass::Scalar, ValueClass::Scalar, ValueClass::String]), result: None },
+    // The generic variable calls: a `HostVar` number selects the variable,
+    // and the host gates it by the Varnish subroutine that is running.
+    VarGetString => { number: 560, name: "var_get_string", command: Some(32), args: Some(&[ValueClass::Scalar, ValueClass::Scalar]), result: Some(ValueClass::String) },
+    VarGetScalar => { number: 560, name: "var_get_scalar", command: Some(33), args: Some(&[ValueClass::Scalar, ValueClass::Scalar]), result: Some(ValueClass::Scalar) },
+    VarSetScalar => { number: 560, name: "var_set_scalar", command: Some(34), args: Some(&[ValueClass::Scalar, ValueClass::Scalar, ValueClass::Scalar]), result: None },
+    VarSetString => { number: 560, name: "var_set_string", command: Some(35), args: Some(&[ValueClass::Scalar, ValueClass::Scalar, ValueClass::String]), result: None },
+    HashData => { number: 560, name: "hash_data", command: Some(36), args: Some(&[ValueClass::Scalar, ValueClass::String]), result: None },
+    // `synthetic()` (selector 0, append) and `set resp.body` /
+    // `set beresp.body` (selector 1, replace).
+    SynthBody => { number: 560, name: "synth_body", command: Some(37), args: Some(&[ValueClass::Scalar, ValueClass::Scalar, ValueClass::String]), result: None },
     RegexMatchList => { number: 560, name: "regex_match_list", command: Some(24), args: None, result: None },
     Regsub => { number: 560, name: "regsub", command: Some(22), args: Some(&[ValueClass::Scalar, ValueClass::String, ValueClass::String, ValueClass::String, ValueClass::Scalar]), result: Some(ValueClass::String) },
     // How the delivered response came to be: a `CacheStatus` number, which
@@ -205,9 +214,16 @@ pub(crate) enum ActionCode {
     Deliver,
     Synth,
     Abandon,
+    Hash,
+    Lookup,
+    Fetch,
+    Miss,
+    Error,
+    Fail,
 }
 
 impl ActionCode {
+    /// The host's `ACTION_*` numbers in `src/vcl/abi.hpp`.
     pub(crate) fn abi_value(self) -> i64 {
         match self {
             Self::Next => 0,
@@ -215,13 +231,27 @@ impl ActionCode {
             Self::Deliver => 2,
             Self::Synth => 3,
             Self::Abandon => 4,
+            Self::Hash => 5,
+            Self::Lookup => 6,
+            Self::Fetch => 7,
+            Self::Miss => 8,
+            Self::Error => 9,
+            Self::Fail => 10,
         }
     }
 
     fn signature(self) -> &'static [ValueClass] {
         match self {
-            Self::Next | Self::Pass | Self::Deliver | Self::Abandon => &[],
-            Self::Synth => &[ValueClass::Scalar, ValueClass::String],
+            Self::Next
+            | Self::Pass
+            | Self::Deliver
+            | Self::Abandon
+            | Self::Hash
+            | Self::Lookup
+            | Self::Fetch
+            | Self::Miss
+            | Self::Fail => &[],
+            Self::Synth | Self::Error => &[ValueClass::Scalar, ValueClass::String],
         }
     }
 }
@@ -620,9 +650,6 @@ pub(crate) enum Op {
         args: Vec<ValueId>,
         span: Span,
     },
-    Return {
-        span: Span,
-    },
 }
 
 // Operand shape and shared effects have one owner. Adding an `Op` without a
@@ -669,7 +696,6 @@ define_op_metadata! {
     Jump { span, .. } span(span) => { pure: false, terminator: true, definition: None, uses: Vec::new(), remap: [], remap_vectors: [] },
     BranchZero { value, span, .. } span(span) => { pure: false, terminator: false, definition: None, uses: vec![*value], remap: [value], remap_vectors: [] },
     ReturnAction { args, span, .. } span(span) => { pure: false, terminator: true, definition: None, uses: args.clone(), remap: [], remap_vectors: [args] },
-    Return { span } span(span) => { pure: false, terminator: true, definition: None, uses: Vec::new(), remap: [], remap_vectors: [] },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,7 +790,6 @@ struct Builder {
     ops: Vec<Op>,
     next_value: u32,
     next_label: u32,
-    synth_status: Option<ValueId>,
     leave_labels: Vec<LabelId>,
     /// The local holding each module's per-hook state, for the modules this
     /// hook uses.  One map rather than a field per module: adding a module
@@ -778,7 +803,6 @@ impl Builder {
             ops: Vec::new(),
             next_value: 0,
             next_label: 0,
-            synth_status: None,
             leave_labels: Vec::new(),
             states,
         }
@@ -1104,7 +1128,20 @@ impl Builder {
                     ),
                     Lowering::RequestUrl => (Syscall::RequestGetUrl, Vec::new()),
                     Lowering::RequestMethod => (Syscall::RequestGetMethod, Vec::new()),
-                    Lowering::ResponseStatus => (Syscall::ResponseGetStatus, Vec::new()),
+                    Lowering::Host(var) => {
+                        let syscall = if expression.value_type == ValueType::String {
+                            Syscall::VarGetString
+                        } else {
+                            Syscall::VarGetScalar
+                        };
+                        let command = self.integer(
+                            syscall.typed_subcommand().expect("variable read uses typed ABI"),
+                            expression.span,
+                        );
+                        let id = self.integer(var.abi_id(), expression.span);
+                        (syscall, vec![command, id])
+                    }
+                    Lowering::Body => unreachable!("a synthetic body is write-only"),
                     Lowering::Now => {
                         let dst = self.value();
                         self.ops.push(Op::ReadNow {
@@ -1184,7 +1221,14 @@ impl Builder {
                         return dst;
                     }
                     Lowering::Uncacheable => {
-                        unreachable!("beresp.uncacheable is write-only")
+                        let command = self.integer(
+                            Syscall::VarGetScalar
+                                .typed_subcommand()
+                                .expect("variable read uses typed ABI"),
+                            expression.span,
+                        );
+                        let id = self.integer(HostVar::BerespUncacheable.abi_id(), expression.span);
+                        (Syscall::VarGetScalar, vec![command, id])
                     }
                 };
                 let dst = self.value();
@@ -1831,17 +1875,23 @@ impl Builder {
     fn action(&mut self, action: &TypedReturnAction, span: Span) {
         let (action, args) = match action {
             TypedReturnAction::Next => (ActionCode::Next, Vec::new()),
+            TypedReturnAction::Hash => (ActionCode::Hash, Vec::new()),
+            TypedReturnAction::Lookup => (ActionCode::Lookup, Vec::new()),
+            TypedReturnAction::Fetch => (ActionCode::Fetch, Vec::new()),
+            TypedReturnAction::Miss => (ActionCode::Miss, Vec::new()),
             TypedReturnAction::Pass => (ActionCode::Pass, Vec::new()),
             TypedReturnAction::Deliver => (ActionCode::Deliver, Vec::new()),
             TypedReturnAction::Abandon => (ActionCode::Abandon, Vec::new()),
+            TypedReturnAction::Fail => (ActionCode::Fail, Vec::new()),
             TypedReturnAction::Synth { status, reason } => {
                 let status = self.integer(i64::from(*status), span);
                 let reason = self.string(reason.clone(), span);
                 (ActionCode::Synth, vec![status, reason])
             }
-            TypedReturnAction::Preserve => {
-                self.ops.push(Op::Return { span });
-                return;
+            TypedReturnAction::Error { status, reason } => {
+                let status = self.integer(i64::from(*status), span);
+                let reason = self.string(reason.clone(), span);
+                (ActionCode::Error, vec![status, reason])
             }
             TypedReturnAction::Leave => {
                 self.ops.push(Op::Jump {
@@ -1855,6 +1905,16 @@ impl Builder {
             }
         };
         self.ops.push(Op::ReturnAction { action, args, span });
+    }
+
+    fn synth_body(&mut self, value: &TypedExpr, replace: bool, span: Span) {
+        let command = self.integer(
+            Syscall::SynthBody.typed_subcommand().expect("typed command"),
+            span,
+        );
+        let selector = self.integer(i64::from(replace), span);
+        let value = self.expr(value);
+        self.host(Syscall::SynthBody, vec![command, selector, value], span);
     }
 
     fn statements(&mut self, statements: &[TypedStatement]) {
@@ -1960,6 +2020,30 @@ impl Builder {
                     let value = self.expr(value);
                     self.host(Syscall::RequestSetUrl, vec![value], *span);
                 }
+                TypedStatement::SetVar { var, value, span } => {
+                    let syscall = if value.value_type == ValueType::String {
+                        Syscall::VarSetString
+                    } else {
+                        Syscall::VarSetScalar
+                    };
+                    let command = self.integer(
+                        syscall.typed_subcommand().expect("variable write uses typed ABI"),
+                        *span,
+                    );
+                    let id = self.integer(var.abi_id(), *span);
+                    let value = self.expr(value);
+                    self.host(syscall, vec![command, id, value], *span);
+                }
+                TypedStatement::HashData { value, span } => {
+                    let command = self.integer(
+                        Syscall::HashData.typed_subcommand().expect("typed command"),
+                        *span,
+                    );
+                    let value = self.expr(value);
+                    self.host(Syscall::HashData, vec![command, value], *span);
+                }
+                TypedStatement::SetBody { value, span } => self.synth_body(value, true, *span),
+                TypedStatement::Synthetic { value, span } => self.synth_body(value, false, *span),
                 // A cache duration the desugarer could not fold: the value
                 // is computed here, in nanoseconds, and truncated to the
                 // seconds the ABI speaks. A result outside the host's range
@@ -1992,11 +2076,12 @@ impl Builder {
                         | Lowering::ResponseHeader
                         | Lowering::RequestUrl
                         | Lowering::RequestMethod
-                        | Lowering::ResponseStatus
                         | Lowering::Now
                         | Lowering::ClientIp
                         | Lowering::Uncacheable
-                        | Lowering::CacheHit => {
+                        | Lowering::CacheHit
+                        | Lowering::Body
+                        | Lowering::Host(_) => {
                             unreachable!("type checking rejects other cache-duration targets")
                         }
                     }
@@ -2029,19 +2114,12 @@ impl Builder {
                 }
                 TypedStatement::SetUncacheable { span } => {
                     let command = self.integer(
-                        Syscall::SetOutcome
-                            .typed_subcommand()
-                            .expect("typed command"),
+                        Syscall::VarSetScalar.typed_subcommand().expect("typed command"),
                         *span,
                     );
-                    let action = self.integer(ActionCode::Pass.abi_value(), *span);
-                    let status = self.integer(0, *span);
-                    let body = self.string(String::new(), *span);
-                    self.host(
-                        Syscall::SetOutcome,
-                        vec![command, action, status, body],
-                        *span,
-                    );
+                    let id = self.integer(HostVar::BerespUncacheable.abi_id(), *span);
+                    let value = self.integer(1, *span);
+                    self.host(Syscall::VarSetScalar, vec![command, id, value], *span);
                 }
                 TypedStatement::Collect {
                     response,
@@ -2247,48 +2325,6 @@ impl Builder {
                     let value = self.expr(value);
                     self.host(Syscall::Log, vec![value], *span);
                 }
-                TypedStatement::Synthetic { value, span } => {
-                    let status = self
-                        .synth_status
-                        .expect("synthetic statement is lowered inside a synth dispatch");
-                    let command = self.integer(
-                        Syscall::SetOutcome
-                            .typed_subcommand()
-                            .expect("typed command"),
-                        *span,
-                    );
-                    let action = self.integer(ActionCode::Synth.abi_value(), *span);
-                    let body = self.expr(value);
-                    self.host(
-                        Syscall::SetOutcome,
-                        vec![command, action, status, body],
-                        *span,
-                    );
-                }
-                TypedStatement::SynthDispatch {
-                    status,
-                    initial_body,
-                    statements,
-                    span,
-                } => {
-                    let status = self.integer(i64::from(*status), *span);
-                    let command = self.integer(
-                        Syscall::SetOutcome
-                            .typed_subcommand()
-                            .expect("typed command"),
-                        *span,
-                    );
-                    let action = self.integer(ActionCode::Synth.abi_value(), *span);
-                    let body = self.string(initial_body.clone(), *span);
-                    self.host(
-                        Syscall::SetOutcome,
-                        vec![command, action, status, body],
-                        *span,
-                    );
-                    let previous = self.synth_status.replace(status);
-                    self.statements(statements);
-                    self.synth_status = previous;
-                }
                 TypedStatement::If {
                     branches,
                     otherwise,
@@ -2301,7 +2337,7 @@ impl Builder {
                         self.statements(body);
                         if !matches!(
                             self.ops.last(),
-                            Some(Op::ReturnAction { .. } | Op::Return { .. } | Op::Jump { .. })
+                            Some(Op::ReturnAction { .. } | Op::Jump { .. })
                         ) {
                             self.ops.push(Op::Jump {
                                 target: end,
@@ -2315,12 +2351,9 @@ impl Builder {
                 }
                 TypedStatement::Return { action, span } => self.action(action, *span),
             }
-            // Both end the block in a terminator: a synth dispatch closes
-            // with the synth sub's own return. Anything after is unreachable.
-            if matches!(
-                statement,
-                TypedStatement::Return { .. } | TypedStatement::SynthDispatch { .. }
-            ) {
+            // A return ends the block in a terminator. Anything after is
+            // unreachable.
+            if matches!(statement, TypedStatement::Return { .. }) {
                 break;
             }
         }
@@ -2546,8 +2579,7 @@ fn verify_function(
             | Op::Host { .. }
             | Op::Jump { .. }
             | Op::BranchZero { .. }
-            | Op::ReturnAction { .. }
-            | Op::Return { .. } => None,
+            | Op::ReturnAction { .. } => None,
         })
         .collect();
     let mut bool_slots = BTreeSet::new();
@@ -2974,7 +3006,6 @@ fn verify_function(
             Op::ReturnAction { action, args, .. } => {
                 verify_signature(function, "return_action", args, action.signature(), &values)?;
             }
-            Op::Return { .. } => {}
             Op::Label { .. } => {}
             Op::Jump { target, .. } => {
                 if !labels.contains(target) {
@@ -3188,7 +3219,11 @@ mod tests {
                 vec![
                     Op::Label { label, span },
                     Op::Label { label, span },
-                    Op::Return { span },
+                    Op::ReturnAction {
+                        action: ActionCode::Next,
+                        args: vec![],
+                        span,
+                    },
                 ],
                 0,
             )],
@@ -3232,7 +3267,11 @@ mod tests {
                         value: true,
                         span,
                     },
-                    Op::Return { span },
+                    Op::ReturnAction {
+                        action: ActionCode::Next,
+                        args: vec![],
+                        span,
+                    },
                 ],
                 1,
             )],

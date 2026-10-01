@@ -5,7 +5,7 @@ TypedProgram {
             phase: Recv,
             statements: [
                 Return {
-                    action: Next,
+                    action: Hash,
                     span: Span {
                         start: 24,
                         end: 38,
@@ -16,7 +16,6 @@ TypedProgram {
         },
     ],
     user_subs: {},
-    synth: None,
     statics: [],
     globals: [],
     acls: [],
@@ -30,7 +29,7 @@ TypedProgram {
             phase: Recv,
             statements: [
                 Return {
-                    action: Next,
+                    action: Hash,
                     span: Span {
                         start: 24,
                         end: 38,
@@ -41,7 +40,6 @@ TypedProgram {
         },
     ],
     user_subs: {},
-    synth: None,
     statics: [],
     globals: [],
     acls: [],
@@ -52,5 +50,5 @@ TypedProgram {
 functions: 1
 
 fn on_recv  phase=Recv values=0 ops=1
-  0000  ReturnAction Next abi=0 ()       ; bytes 24..38
+  0000  ReturnAction Hash abi=5 ()       ; bytes 24..38
 

@@ -38,7 +38,7 @@ sub vcl_backend_response {
     set beresp.keep = 1m;
     set beresp.http.X-Grace = beresp.grace;
     set beresp.http.X-Ttl = beresp.ttl;
-    if (req.url ~ "^/uncacheable") {
+    if (bereq.url ~ "^/uncacheable") {
         set beresp.uncacheable = true;
     }
 }

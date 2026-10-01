@@ -12,7 +12,6 @@ pub(crate) enum Lowering {
     ResponseHeader,
     RequestUrl,
     RequestMethod,
-    ResponseStatus,
     Now,
     ClientIp,
     Ttl,
@@ -20,6 +19,67 @@ pub(crate) enum Lowering {
     StaleIfError,
     Uncacheable,
     CacheHit,
+    /// `resp.body` in vcl_synth and `beresp.body` in vcl_backend_error: a
+    /// write replaces the synthetic body, as `synthetic()` appends to it.
+    Body,
+    /// A variable the host reads and writes through the generic variable
+    /// calls, by number. See [`HostVar`].
+    Host(HostVar),
+}
+
+/// A Varnish variable the host answers by number, through
+/// `TYPED_VAR_GET`/`TYPED_VAR_SET` (`src/vcl/abi.hpp`).
+///
+/// The numbers are ABI: the host's table in `src/vcl/vcl_varnish.c` uses
+/// the same ones, and also gates each by the Varnish subroutine running, so
+/// a variable is never read where Varnish's own accessor would assert. A
+/// `DURATION` crosses as nanoseconds and a `BOOL` as 0 or 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostVar {
+    /// The method of the request side's header map: `req.method` or
+    /// `bereq.method`. Only written through this; read with
+    /// `req_get_method`.
+    Method = 1,
+    /// `req.xid` or `bereq.xid`.
+    Xid = 2,
+    Restarts = 3,
+    EsiLevel = 4,
+    CanGzip = 5,
+    HashAlwaysMiss = 6,
+    HashIgnoreBusy = 7,
+    BereqRetries = 8,
+    BereqUncacheable = 9,
+    BereqIsBgfetch = 10,
+    BerespStatus = 11,
+    BerespReason = 12,
+    BerespDoStream = 13,
+    BerespDoGzip = 14,
+    BerespDoGunzip = 15,
+    BerespAge = 16,
+    BerespUncacheable = 17,
+    ObjStatus = 18,
+    ObjReason = 19,
+    ObjHits = 20,
+    ObjTtl = 21,
+    ObjGrace = 22,
+    ObjKeep = 23,
+    ObjAge = 24,
+    ObjUncacheable = 25,
+    RespStatus = 26,
+    RespReason = 27,
+    ServerHostname = 28,
+    ServerIdentity = 29,
+    /// `req.proto` or `bereq.proto`.
+    RequestProto = 30,
+    /// `resp.proto` or `beresp.proto`.
+    ResponseProto = 31,
+    ObjProto = 32,
+}
+
+impl HostVar {
+    pub(crate) fn abi_id(self) -> i64 {
+        self as i64
+    }
 }
 
 /// Identity-specific restrictions on writes to a variable family.
@@ -32,7 +92,9 @@ pub(crate) enum Lowering {
 pub(crate) enum WriteConstraint {
     None,
     Header,
-    RecvRequestHeader,
+    /// `req.http.*`: never `Host`, which picked the tenant, and in vcl_recv
+    /// never a route's variant header.
+    ClientRequestHeader,
     TrueOnly,
 }
 

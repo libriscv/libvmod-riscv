@@ -186,13 +186,6 @@ impl Pass for CoalesceConstants {
                         available.clear();
                         false
                     }
-                    Op::Return { .. } => {
-                        op.remap_values(&aliases).map_err(|message| {
-                            BackendError::at("optimizer", span, message)
-                        })?;
-                        available.clear();
-                        false
-                    }
                 };
                 if duplicate {
                     function_changed = true;
@@ -269,8 +262,7 @@ impl Pass for DeadStores {
                     | Op::Label { .. }
                     | Op::Jump { .. }
                     | Op::BranchZero { .. }
-                    | Op::ReturnAction { .. }
-                    | Op::Return { .. } => None,
+                    | Op::ReturnAction { .. } => None,
                 })
                 .collect();
             let before = function.ops.len();
@@ -331,8 +323,7 @@ impl Pass for DeadStores {
                     | Op::Label { .. }
                     | Op::Jump { .. }
                     | Op::BranchZero { .. }
-                    | Op::ReturnAction { .. }
-                    | Op::Return { .. } => {}
+                    | Op::ReturnAction { .. } => {}
                 }
             }
             function.locals = locals;

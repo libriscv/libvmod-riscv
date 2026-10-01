@@ -3,9 +3,8 @@
  *
  * Ported from Carapace's scripting host, with one structural difference:
  * Carapace records a phase's header edits and replays them afterwards,
- * while here the phase runs inside Varnish's own VCL subroutine, so edits
- * go straight to Varnish's header maps. The one exception is a synthetic
- * response, which is staged until vcl_synth (vcl_program.hpp).
+ * while here each hook runs inside the Varnish subroutine it is named for,
+ * so edits go straight to Varnish's header maps and variables.
  *
  * The compiler already refuses what a phase may not do, with a source
  * diagnostic. Every gate is checked again here, because the compiled ELF is
@@ -111,29 +110,26 @@ void refuse(machine_t& m, const char* what)
 	m.set_result(FAILED);
 }
 
-/* Which header map a write goes to, in this phase. */
-enum class Target { Refused, Http, Staged };
-
-Target request_target(const vrt_ctx* ctx, http*& hp, bool write)
+/* The header map a side means in this phase, or null when the phase has
+   none: a response before there is one, or the backend side's maps from
+   the client side. Varnish lets every subroutine that has a map write it. */
+http* side_http(const vrt_ctx* ctx, bool response)
 {
-	const auto phase = vclv_phase(ctx);
-	if (write && phase != VCL_PHASE_RECV && phase != VCL_PHASE_BACKEND_FETCH)
-		return Target::Refused;
-	hp = vclv_http(ctx, VCL_SIDE_REQUEST);
-	return hp ? Target::Http : Target::Refused;
+	return vclv_http(ctx, response ? VCL_SIDE_RESPONSE : VCL_SIDE_REQUEST);
 }
 
-Target response_target(Script& script, const vrt_ctx* ctx, http*& hp)
+bool backend_side(const vrt_ctx* ctx)
 {
-	/* Once a policy has returned synth(...), "resp" is the synthetic
-	   response it is building, in vcl_recv and vcl_deliver alike. */
-	if (script.vcl_task().synth.active)
-		return Target::Staged;
-	const auto phase = vclv_phase(ctx);
-	if (phase == VCL_PHASE_RECV || phase == VCL_PHASE_BACKEND_FETCH)
-		return Target::Refused;
-	hp = vclv_http(ctx, VCL_SIDE_RESPONSE);
-	return hp ? Target::Http : Target::Refused;
+	return (ctx->method & (VCL_MET_BACKEND_FETCH | VCL_MET_BACKEND_RESPONSE
+		| VCL_MET_BACKEND_ERROR)) != 0;
+}
+
+/* The client's Host picked the tenant (the Varnish VCL forks by it), so a
+   tenant may not change it: that would hand its request, and its backend
+   fetch, to another tenant. The origin's Host is bereq.http.Host. */
+bool routing_header(const vrt_ctx* ctx, bool response, std::string_view name)
+{
+	return !response && !backend_side(ctx) && iequals(name, "host");
 }
 
 /* ── Request line, headers, status ──────────────────────────────────── */
@@ -141,8 +137,8 @@ Target response_target(Script& script, const vrt_ctx* ctx, http*& hp)
 void sys_req_get_method(machine_t& m)
 {
 	const auto [buf, buflen] = m.sysargs<gaddr_t, gaddr_t>();
-	http* hp = nullptr;
-	if (request_target(ctx_of(m), hp, false) == Target::Refused) {
+	http* hp = side_http(ctx_of(m), false);
+	if (hp == nullptr) {
 		m.set_result(write_str(m, buf, buflen, ""));
 		return;
 	}
@@ -154,8 +150,8 @@ void sys_req_get_method(machine_t& m)
 void sys_req_get_url(machine_t& m)
 {
 	const auto [buf, buflen] = m.sysargs<gaddr_t, gaddr_t>();
-	http* hp = nullptr;
-	if (request_target(ctx_of(m), hp, false) == Target::Refused) {
+	http* hp = side_http(ctx_of(m), false);
+	if (hp == nullptr) {
 		m.set_result(write_str(m, buf, buflen, ""));
 		return;
 	}
@@ -172,19 +168,10 @@ void get_header(machine_t& m, bool response)
 		m.set_result(FAILED);
 		return;
 	}
-	auto& script = script_of(m);
-	http* hp = nullptr;
-	const auto target = response
-		? response_target(script, script.ctx(), hp)
-		: request_target(script.ctx(), hp, false);
-	if (target == Target::Staged) {
-		const auto* value = script.vcl_task().synth.get(name);
-		m.set_result(value ? write_str(m, buf, buflen, *value) : FAILED);
-		return;
-	}
+	http* hp = side_http(ctx_of(m), response);
 	const char* value;
 	size_t vlen;
-	if (target == Target::Refused || vclv_get(hp, name.data(), name.size(), &value, &vlen) < 0) {
+	if (hp == nullptr || vclv_get(hp, name.data(), name.size(), &value, &vlen) < 0) {
 		m.set_result(FAILED);
 		return;
 	}
@@ -200,28 +187,18 @@ void set_header(machine_t& m, bool response)
 		m.set_result(FAILED);
 		return;
 	}
-	if (is_framing_header(name)) {
-		refuse(m, "a framing header write");
+	const auto* ctx = ctx_of(m);
+	if (is_framing_header(name) || routing_header(ctx, response, name)) {
+		refuse(m, "a framing or routing header write");
 		return;
 	}
-	auto& script = script_of(m);
-	http* hp = nullptr;
-	const auto target = response
-		? response_target(script, script.ctx(), hp)
-		: request_target(script.ctx(), hp, true);
-	switch (target) {
-	case Target::Staged:
-		script.vcl_task().synth.set(name, value);
-		m.set_result(0);
-		return;
-	case Target::Http:
-		m.set_result(vclv_set(script.ctx(), hp, name.data(), name.size(),
-			value.data(), value.size()) == 0 ? 0 : FAILED);
-		return;
-	case Target::Refused:
+	http* hp = side_http(ctx, response);
+	if (hp == nullptr) {
 		refuse(m, response ? "a response header write" : "a request header write");
 		return;
 	}
+	m.set_result(vclv_set(ctx, hp, name.data(), name.size(),
+		value.data(), value.size()) == 0 ? 0 : FAILED);
 }
 
 void remove_header(machine_t& m, bool response)
@@ -233,28 +210,18 @@ void remove_header(machine_t& m, bool response)
 		m.set_result(FAILED);
 		return;
 	}
-	if (is_framing_header(name)) {
-		refuse(m, "a framing header removal");
+	const auto* ctx = ctx_of(m);
+	if (is_framing_header(name) || routing_header(ctx, response, name)) {
+		refuse(m, "a framing or routing header removal");
 		return;
 	}
-	auto& script = script_of(m);
-	http* hp = nullptr;
-	const auto target = response
-		? response_target(script, script.ctx(), hp)
-		: request_target(script.ctx(), hp, true);
-	switch (target) {
-	case Target::Staged:
-		script.vcl_task().synth.unset(name);
-		m.set_result(0);
-		return;
-	case Target::Http:
-		vclv_unset(hp, name.data(), name.size());
-		m.set_result(0);
-		return;
-	case Target::Refused:
+	http* hp = side_http(ctx, response);
+	if (hp == nullptr) {
 		refuse(m, response ? "a response header removal" : "a request header removal");
 		return;
 	}
+	vclv_unset(hp, name.data(), name.size());
+	m.set_result(0);
 }
 
 void sys_req_get_header(machine_t& m)  { get_header(m, false); }
@@ -271,24 +238,20 @@ void sys_req_set_url(machine_t& m)
 		m.set_result(FAILED);
 		return;
 	}
+	/* req.url on the client side, bereq.url on the backend side, as
+	   Varnish allows. */
 	const auto* ctx = ctx_of(m);
-	/* bereq.url only: the compiler has no writable req.url. */
-	if (vclv_phase(ctx) != VCL_PHASE_BACKEND_FETCH) {
+	http* hp = side_http(ctx, false);
+	if (hp == nullptr) {
 		refuse(m, "a URL write");
 		return;
 	}
-	m.set_result(vclv_set_url(ctx, vclv_http(ctx, VCL_SIDE_REQUEST),
-		url.data(), url.size()) == 0 ? 0 : FAILED);
+	m.set_result(vclv_set_url(ctx, hp, url.data(), url.size()) == 0 ? 0 : FAILED);
 }
 
 void sys_resp_get_status(machine_t& m)
 {
-	auto& script = script_of(m);
-	if (script.vcl_task().synth.active) {
-		m.set_result(script.vcl_task().synth.status);
-		return;
-	}
-	auto* hp = vclv_http(script.ctx(), VCL_SIDE_RESPONSE);
+	auto* hp = side_http(ctx_of(m), true);
 	m.set_result(hp ? vclv_status(hp) : 0u);
 }
 
@@ -306,79 +269,83 @@ void sys_log(machine_t& m)
 
 /* ── Outcomes ───────────────────────────────────────────────────────── */
 
-/* Record what a hook asked for, as want_result() reports it:
-   "" (carry on), "pass", "deliver", "synth" or "abandon". */
-void set_outcome(machine_t& m, int64_t code, uint16_t status, gaddr_t body, gaddr_t blen)
+/* What a hook asked for, as want_result() reports it, and the Varnish
+   subroutines that may ask for it: Varnish's own return table, less
+   restart, retry, pipe, purge and vcl. The compiler refuses the same. */
+struct Outcome { const char* result; unsigned methods; };
+constexpr unsigned ALL_METHODS = VCL_MET_RECV | VCL_MET_HASH | VCL_MET_HIT
+	| VCL_MET_MISS | VCL_MET_PASS | VCL_MET_DELIVER | VCL_MET_SYNTH
+	| VCL_MET_BACKEND_FETCH | VCL_MET_BACKEND_RESPONSE | VCL_MET_BACKEND_ERROR;
+constexpr Outcome OUTCOMES[] = {
+	/* ACTION_NEXT */    {"", ALL_METHODS},
+	/* ACTION_PASS */    {"pass", VCL_MET_RECV | VCL_MET_HIT | VCL_MET_MISS
+		| VCL_MET_BACKEND_RESPONSE},
+	/* ACTION_DELIVER */ {"deliver", VCL_MET_HIT | VCL_MET_DELIVER | VCL_MET_SYNTH
+		| VCL_MET_BACKEND_RESPONSE | VCL_MET_BACKEND_ERROR},
+	/* ACTION_SYNTH */   {"synth", VCL_MET_RECV | VCL_MET_HIT | VCL_MET_MISS
+		| VCL_MET_PASS | VCL_MET_DELIVER},
+	/* ACTION_ABANDON */ {"abandon", VCL_MET_BACKEND_FETCH | VCL_MET_BACKEND_RESPONSE
+		| VCL_MET_BACKEND_ERROR},
+	/* ACTION_HASH */    {"hash", VCL_MET_RECV},
+	/* ACTION_LOOKUP */  {"lookup", VCL_MET_HASH},
+	/* ACTION_FETCH */   {"fetch", VCL_MET_MISS | VCL_MET_PASS | VCL_MET_BACKEND_FETCH},
+	/* ACTION_MISS */    {"miss", VCL_MET_HIT},
+	/* ACTION_ERROR */   {"error", VCL_MET_BACKEND_FETCH | VCL_MET_BACKEND_RESPONSE},
+	/* ACTION_FAIL */    {"fail", ALL_METHODS},
+};
+static_assert(std::size(OUTCOMES) == ACTION_FAIL + 1, "one row per action code");
+
+
+void set_outcome(machine_t& m, int64_t code, uint64_t status, gaddr_t reason, gaddr_t rlen)
 {
 	auto& script = script_of(m);
 	const auto* ctx = script.ctx();
-	const auto phase = vclv_phase(ctx);
-	switch (code) {
-	case ACTION_PASS:
-		/* Pass in vcl_backend_response is "do not cache this". */
-		if (phase == VCL_PHASE_BACKEND_RESPONSE)
-			vclv_set_uncacheable(ctx);
-		script.set_result("pass", 0, false);
+	script.set_result("", 0, false);
+	if (code < 0 || code >= int64_t(std::size(OUTCOMES))
+		|| (OUTCOMES[code].methods & ctx->method) == 0) {
+		refuse(m, "a return action");
 		return;
-	case ACTION_DELIVER:
-		script.set_result("deliver", 0, false);
-		return;
-	case ACTION_ABANDON:
-		if (phase == VCL_PHASE_BACKEND_RESPONSE) {
-			script.set_result("abandon", 0, false);
+	}
+	if (code == ACTION_SYNTH || code == ACTION_ERROR) {
+		/* Three digits: Varnish's custom-reason encoding past 999 is not
+		   part of the policy ABI. A refused synth or error must still end
+		   the request: falling through would serve what the tenant denied. */
+		if (status < 100 || status > 999) {
+			refuse(m, "a synthetic response status");
+			vclv_fail(ctx, "VCL tenant returned an invalid synthetic status");
+			script.set_result(OUTCOMES[ACTION_FAIL].result, 0, false);
 			return;
 		}
-		refuse(m, "abandon");
-		script.set_result("", 0, false);
-		return;
-	case ACTION_SYNTH: {
-		/* A deliver synth abandons the response it was about to send, so
-		   it is an error path: a 2xx or 3xx would be a body rewrite or a
-		   scripted redirect. The compiler refuses the same statuses. */
-		const bool allowed = phase == VCL_PHASE_RECV
-			|| (phase == VCL_PHASE_DELIVER && status >= 400);
+		/* A reason that is too long or would end the status line is
+		   dropped for Varnish's default one, keeping the synth. */
 		std::string text;
-		if (!allowed || status < 100 || status > 999) {
-			refuse(m, "a synthetic response");
-			script.set_result("", 0, false);
-			return;
+		if (!read_str(m, reason, rlen, MAX_VALUE, text) || !valid_value(text)) {
+			if (ctx->vsl)
+				VSLb(ctx->vsl, SLT_VCL_Error, "[%s] vcl: synthetic reason dropped",
+					script.name().c_str());
+			text.clear();
 		}
-		/* A body past the cap is dropped, not truncated. */
-		read_str(m, body, blen, MAX_BODY, text);
-		auto& synth = script.vcl_task().synth;
-		if (!synth.active) {
-			/* The transition: a fresh response, with the synth reason as
-			   its reason and its default body. Nothing carries over from
-			   the response a deliver synth replaces. */
-			synth = StagedSynth{};
-			synth.active = true;
-			synth.reason = text;
-		}
-		synth.status = status;
-		synth.body = std::move(text);
-		script.set_result("synth", status, false);
-		return;
+		script.vcl_task().reason = std::move(text);
 	}
-	case ACTION_NEXT:
-	default:
-		script.set_result("", 0, false);
-		return;
-	}
+	if (code == ACTION_FAIL)
+		vclv_fail(ctx, "VCL tenant returned fail");
+	script.set_result(OUTCOMES[code].result,
+		(code == ACTION_SYNTH || code == ACTION_ERROR) ? status : 0, false);
 }
 
 void sys_return_action(machine_t& m)
 {
-	const auto [code, status, body, blen] = m.sysargs<int64_t, uint64_t, gaddr_t, gaddr_t>();
-	set_outcome(m, code, uint16_t(std::min<uint64_t>(status, UINT16_MAX)), body, blen);
+	const auto [code, status, reason, rlen] = m.sysargs<int64_t, uint64_t, gaddr_t, gaddr_t>();
+	set_outcome(m, code, status, reason, rlen);
 	m.stop();
 }
 
 void sys_set_outcome_plain(machine_t& m)
 {
-	const auto [cmd, code, status, body, blen] =
+	const auto [cmd, code, status, reason, rlen] =
 		m.sysargs<int64_t, int64_t, uint64_t, gaddr_t, gaddr_t>();
 	(void)cmd;
-	set_outcome(m, code, uint16_t(std::min<uint64_t>(status, UINT16_MAX)), body, blen);
+	set_outcome(m, code, status, reason, rlen);
 	m.set_result(0);
 }
 
@@ -392,7 +359,7 @@ bool valid_seconds(uint64_t raw)
 void set_duration(machine_t& m, vcl_duration which, uint64_t seconds)
 {
 	const auto* ctx = ctx_of(m);
-	if (vclv_phase(ctx) != VCL_PHASE_BACKEND_RESPONSE) {
+	if ((ctx->method & (VCL_MET_BACKEND_RESPONSE | VCL_MET_BACKEND_ERROR)) == 0) {
 		refuse(m, "a cache duration write");
 		return;
 	}
@@ -413,7 +380,7 @@ void sys_cache_duration(machine_t& m)
 {
 	const auto selector = m.sysarg<uint64_t>(1);
 	const auto* ctx = ctx_of(m);
-	if (vclv_phase(ctx) != VCL_PHASE_BACKEND_RESPONSE) {
+	if ((ctx->method & (VCL_MET_BACKEND_RESPONSE | VCL_MET_BACKEND_ERROR)) == 0) {
 		refuse(m, "a cache duration read");
 		return;
 	}
@@ -454,16 +421,11 @@ void sys_client_ip(machine_t& m)
 
 /* The header list a side holds now, as (name, value) pairs. */
 std::vector<std::pair<std::string_view, std::string_view>>
-header_list(Script& script, bool response, Target& target, http*& hp)
+header_list(const vrt_ctx* ctx, bool response, http*& hp)
 {
 	std::vector<std::pair<std::string_view, std::string_view>> out;
-	target = response
-		? response_target(script, script.ctx(), hp)
-		: request_target(script.ctx(), hp, false);
-	if (target == Target::Staged) {
-		for (auto& [name, value] : script.vcl_task().synth.headers)
-			out.emplace_back(name, value);
-	} else if (target == Target::Http) {
+	hp = side_http(ctx, response);
+	if (hp != nullptr) {
 		unsigned cursor = 0;
 		const char *name, *value;
 		size_t nlen, vlen;
@@ -490,9 +452,8 @@ void sys_headers_snapshot(machine_t& m)
 		m.set_result(FAILED);
 		return;
 	}
-	Target target;
 	http* hp = nullptr;
-	const auto list = header_list(script_of(m), map == 1, target, hp);
+	const auto list = header_list(ctx_of(m), map == 1, hp);
 	if (list.size() > MAX_HEADERS) {
 		m.set_result(FAILED);
 		return;
@@ -550,15 +511,12 @@ void headers_commit(machine_t& m, bool response)
 		entries.push_back(std::move(e));
 	}
 
-	Target target;
 	http* hp = nullptr;
 	/* Copies: applying edits to a Varnish header map moves its fields. */
 	std::vector<std::pair<std::string, std::string>> before;
-	for (auto& [n, v] : header_list(script, response, target, hp))
+	for (auto& [n, v] : header_list(script.ctx(), response, hp))
 		before.emplace_back(n, v);
-	if (target == Target::Refused
-		|| (!response && vclv_phase(script.ctx()) != VCL_PHASE_RECV
-			&& vclv_phase(script.ctx()) != VCL_PHASE_BACKEND_FETCH)) {
+	if (hp == nullptr) {
 		refuse(m, response ? "a response header commit" : "a request header commit");
 		return;
 	}
@@ -597,8 +555,8 @@ void headers_commit(machine_t& m, bool response)
 			edits.push_back({Edit::Remove, n, {}});
 		}
 	for (auto& edit : edits) {
-		if (is_framing_header(edit.name)) {
-			refuse(m, "a framing header write");
+		if (is_framing_header(edit.name) || routing_header(script.ctx(), response, edit.name)) {
+			refuse(m, "a framing or routing header write");
 			return;
 		}
 		if (!valid_name(edit.name) || !valid_value(edit.value)) {
@@ -607,17 +565,8 @@ void headers_commit(machine_t& m, bool response)
 		}
 	}
 
-	auto& synth = script.vcl_task().synth;
 	for (auto& edit : edits) {
 		int rc = 0;
-		if (target == Target::Staged) {
-			switch (edit.op) {
-			case Edit::Set:    synth.set(edit.name, edit.value); break;
-			case Edit::Add:    synth.add(edit.name, edit.value); break;
-			case Edit::Remove: synth.unset(edit.name); break;
-			}
-			continue;
-		}
 		switch (edit.op) {
 		case Edit::Set:
 			rc = vclv_set(script.ctx(), hp, edit.name.data(), edit.name.size(),
@@ -864,6 +813,105 @@ void sys_verify(machine_t& m)
 	m.set_result(CRYPTO_memcmp(mac, tag, maclen) == 0 ? 1 : 0);
 }
 
+/* ── Variables, hashing, synthetic bodies ───────────────────────────── */
+
+/* A guest string as a C string for a VRT setter, or false: NUL cannot be
+   in a header value, URL or reason, and the VRT setters take C strings. */
+bool read_cstr(machine_t& m, gaddr_t ptr, gaddr_t len, size_t max, std::string& out)
+{
+	return read_str(m, ptr, len, max, out) && out.find('\0') == std::string::npos;
+}
+
+void sys_var_get_string(machine_t& m)
+{
+	const auto id  = m.sysarg<int64_t>(1);
+	const auto buf = m.sysarg<gaddr_t>(2);
+	const auto cap = m.sysarg<gaddr_t>(3);
+	const char* value;
+	if (id <= 0 || id > INT32_MAX || vclv_var_get_string(ctx_of(m), int(id), &value) < 0) {
+		refuse(m, "a variable read");
+		return;
+	}
+	m.set_result(write_str(m, buf, cap, value));
+}
+
+void sys_var_get_scalar(machine_t& m)
+{
+	const auto id = m.sysarg<int64_t>(1);
+	int64_t value;
+	if (id <= 0 || id > INT32_MAX || vclv_var_get_int(ctx_of(m), int(id), &value) < 0) {
+		refuse(m, "a variable read");
+		return;
+	}
+	m.set_result(uint64_t(value));
+}
+
+void sys_var_set_scalar(machine_t& m)
+{
+	const auto id    = m.sysarg<int64_t>(1);
+	const auto value = m.sysarg<int64_t>(2);
+	if (id <= 0 || id > INT32_MAX || vclv_var_set_int(ctx_of(m), int(id), value) < 0) {
+		refuse(m, "a variable write");
+		return;
+	}
+	m.set_result(0);
+}
+
+void sys_var_set_string(machine_t& m)
+{
+	const auto id  = m.sysarg<int64_t>(1);
+	const auto ptr = m.sysarg<gaddr_t>(2);
+	const auto len = m.sysarg<gaddr_t>(3);
+	std::string value;
+	if (!read_cstr(m, ptr, len, MAX_VALUE, value) || !valid_value(value)) {
+		m.set_result(FAILED);
+		return;
+	}
+	/* A method is a token: no spaces, and never empty. */
+	if (id == VCLV_METHOD && (value.empty() || !valid_name(value))) {
+		m.set_result(FAILED);
+		return;
+	}
+	if (id <= 0 || id > INT32_MAX || vclv_var_set_string(ctx_of(m), int(id), value.c_str()) < 0) {
+		refuse(m, "a variable write");
+		return;
+	}
+	m.set_result(0);
+}
+
+void sys_hash_data(machine_t& m)
+{
+	const auto ptr = m.sysarg<gaddr_t>(1);
+	const auto len = m.sysarg<gaddr_t>(2);
+	std::string data;
+	if (!read_cstr(m, ptr, len, MAX_VALUE, data)) {
+		m.set_result(FAILED);
+		return;
+	}
+	if (vclv_hash_data(ctx_of(m), data.c_str()) < 0) {
+		refuse(m, "hash_data()");
+		return;
+	}
+	m.set_result(0);
+}
+
+void sys_synth_body(machine_t& m)
+{
+	const auto replace = m.sysarg<int64_t>(1);
+	const auto ptr = m.sysarg<gaddr_t>(2);
+	const auto len = m.sysarg<gaddr_t>(3);
+	std::string body;
+	if (!read_cstr(m, ptr, len, MAX_BODY, body)) {
+		m.set_result(FAILED);
+		return;
+	}
+	if (vclv_synth_body(ctx_of(m), replace != 0, body.c_str()) < 0) {
+		refuse(m, "a synthetic body");
+		return;
+	}
+	m.set_result(0);
+}
+
 /* ── The typed slot ─────────────────────────────────────────────────── */
 
 void sys_typed(machine_t& m)
@@ -886,6 +934,12 @@ void sys_typed(machine_t& m)
 	case TYPED_CACHE_DURATION:      return sys_cache_duration(m);
 	case TYPED_INCLUDE_READ:        return include_read(m);
 	case TYPED_CACHE_STATUS:        return sys_cache_status(m);
+	case TYPED_VAR_GET_STRING:      return sys_var_get_string(m);
+	case TYPED_VAR_GET_SCALAR:      return sys_var_get_scalar(m);
+	case TYPED_VAR_SET_SCALAR:      return sys_var_set_scalar(m);
+	case TYPED_VAR_SET_STRING:      return sys_var_set_string(m);
+	case TYPED_HASH_DATA:           return sys_hash_data(m);
+	case TYPED_SYNTH_BODY:          return sys_synth_body(m);
 	default:
 		m.set_result(FAILED);
 		return;

@@ -26,6 +26,10 @@ const MAX_NESTING: usize = 64;
 /// that so the bound is only ever reached by machine-generated source.
 const MAX_CHAIN_OPERANDS: usize = 1024;
 
+/// The longest `synth`/`error` reason the host keeps: `MAX_VALUE` in
+/// src/vcl/abi.hpp.
+const SYNTH_REASON_LIMIT: usize = 64 * 1024;
+
 pub(crate) fn parse(source: &str, tokens: &[Token]) -> Result<Program, Diagnostics> {
     let mut parser = Parser {
         source,
@@ -527,14 +531,7 @@ impl Parser<'_> {
             // as a variable name rather than as a string.
             "std.collect" => self.parse_builtin_call("std.collect".to_string(), start),
             "synthetic" => self.parse_synthetic(start),
-            "hash_data" => {
-                self.errors.push(
-                    Diagnostic::error(start, "hash_data() is not supported").with_help(
-                        "the cache key belongs to the Varnish VCL that forks this tenant",
-                    ),
-                );
-                None
-            }
+            "hash_data" => self.parse_hash_data(start),
             "elsif" | "elseif" | "elif" | "else" => {
                 self.errors.push(Diagnostic::error(
                     start,
@@ -857,6 +854,61 @@ impl Parser<'_> {
         })
     }
 
+    fn parse_hash_data(&mut self, start: Span) -> Option<Statement> {
+        self.expect(Kind::LParen, "'(' after hash_data");
+        let value = self.parse_expr()?;
+        self.expect(Kind::RParen, "')' after hash_data argument");
+        let end = self.expect(Kind::Semicolon, "';' after hash_data");
+        let value_end = value.span.end;
+        Some(Statement::HashData {
+            value,
+            span: Span::new(start.start, end.unwrap_or(value_end)),
+        })
+    }
+
+    /// `(status [, "reason"])` after `synth` or `error`.
+    fn parse_status_reason(&mut self, action: &str) -> Option<(u16, String)> {
+        self.expect(Kind::LParen, &format!("'(' after {action}"));
+        let (raw_status, status_span) = self.take_word()?;
+        let status = raw_status
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (100..=999).contains(n));
+        let Some(status) = status else {
+            self.errors.push(Diagnostic::error(
+                status_span,
+                format!("{action} status must be an integer from 100 through 999"),
+            ));
+            return None;
+        };
+        let reason = if self.check(&Kind::Comma) {
+            self.at += 1;
+            let (text, span) = self.take_string()?;
+            // The host drops a reason it would refuse (src/vcl/abi.hpp's
+            // MAX_VALUE, or a byte that ends the status line), so refuse it
+            // here rather than send Varnish's default reason instead.
+            if text.len() > SYNTH_REASON_LIMIT {
+                self.errors.push(Diagnostic::error(
+                    span,
+                    format!("{action} reason is longer than {SYNTH_REASON_LIMIT} bytes"),
+                ));
+                return None;
+            }
+            if let Some(byte) = text.bytes().find(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+                self.errors.push(Diagnostic::error(
+                    span,
+                    format!("{action} reason cannot contain the byte 0x{byte:02x}"),
+                ));
+                return None;
+            }
+            text
+        } else {
+            String::new()
+        };
+        self.expect(Kind::RParen, &format!("')' after {action} arguments"));
+        Some((status, reason))
+    }
+
     fn parse_return(&mut self, start: Span) -> Option<Statement> {
         let action = if self.check(&Kind::Semicolon) {
             ReturnAction::Bare
@@ -865,32 +917,20 @@ impl Parser<'_> {
             let (name, span) = self.take_word()?;
             let action = match name.as_str() {
                 "hash" => ReturnAction::Hash,
+                "lookup" => ReturnAction::Lookup,
                 "fetch" => ReturnAction::Fetch,
+                "miss" => ReturnAction::Miss,
                 "pass" => ReturnAction::Pass,
                 "abandon" => ReturnAction::Abandon,
                 "deliver" => ReturnAction::Deliver,
+                "fail" => ReturnAction::Fail,
                 "synth" => {
-                    self.expect(Kind::LParen, "'(' after synth");
-                    let (raw_status, status_span) = self.take_word()?;
-                    let status = raw_status
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|n| (200..=599).contains(n));
-                    let Some(status) = status else {
-                        self.errors.push(Diagnostic::error(
-                            status_span,
-                            "synth status must be a deliverable integer from 200 through 599",
-                        ));
-                        return None;
-                    };
-                    let reason = if self.check(&Kind::Comma) {
-                        self.at += 1;
-                        self.take_string().map(|(text, _)| text)?
-                    } else {
-                        String::new()
-                    };
-                    self.expect(Kind::RParen, "')' after synth arguments");
+                    let (status, reason) = self.parse_status_reason("synth")?;
                     ReturnAction::Synth { status, reason }
+                }
+                "error" => {
+                    let (status, reason) = self.parse_status_reason("error")?;
+                    ReturnAction::Error { status, reason }
                 }
                 // Varnish's remaining return actions. Naming them here keeps
                 // the diagnostic about the action the user wrote; the fallback
@@ -911,21 +951,16 @@ impl Parser<'_> {
                     );
                     return None;
                 }
-                "restart" | "retry" | "pipe" | "purge" | "lookup" | "miss" | "hit" | "error"
-                | "fail" | "upgrade" | "none" => {
+                "restart" | "retry" | "pipe" | "purge" | "connect" | "hit" | "upgrade"
+                | "none" | "ok" => {
                     let help = match name.as_str() {
                         "purge" => "purging belongs to the Varnish VCL that forks this tenant",
-                        "restart" | "retry" | "pipe" => {
-                            "origin failover and routing are host-controlled"
+                        "restart" | "retry" | "pipe" | "connect" => {
+                            "restarts, retries and piping are host-controlled"
                         }
-                        "lookup" | "miss" | "hit" => {
-                            "return (hash) performs the cache lookup; there is no vcl_hit or \
-                             vcl_miss"
-                        }
-                        "error" | "fail" => {
-                            "return (synth(status, \"reason\")) delivers a synthetic response"
-                        }
-                        _ => "the actions are hash, fetch, pass, abandon, deliver and synth",
+                        _ => "the actions are hash, lookup, miss, fetch, pass, deliver, \
+                              abandon, synth, error and fail, each in the subroutines \
+                              Varnish allows it",
                     };
                     self.errors.push(
                         Diagnostic::error(span, format!("return ({name}) is not supported"))
@@ -1474,11 +1509,9 @@ fn unsupported_module_call_help(function: &str) -> Option<&'static str> {
     // it gets the same answer rather than a bare "unsupported statement".
     if let Some(help) = match function {
         "ban" => Some("bans and purges belong to the Varnish VCL that forks this tenant"),
-        "restart" | "retry" | "pipe" => Some("origin failover and routing are host-controlled"),
+        "restart" | "retry" | "pipe" => Some("restarts, retries and piping are host-controlled"),
         "purge" => Some("purging belongs to the Varnish VCL that forks this tenant"),
-        "error" | "fail" => {
-            Some("return (synth(status, \"reason\")) delivers a synthetic response")
-        }
+        "error" | "fail" => Some("write return (synth(...)), return (error(...)) or return (fail)"),
         "rollback" | "std.rollback" => {
             Some("a request's headers are not snapshotted, so there is nothing to roll back")
         }
@@ -1602,11 +1635,11 @@ mod tests {
     #[test]
     fn varnish_return_actions_name_the_action_not_a_subroutine() {
         for (action, help) in [
-            ("lookup", "return (hash) performs the cache lookup"),
-            ("miss", "return (hash) performs the cache lookup"),
-            ("hit", "return (hash) performs the cache lookup"),
-            ("error", "delivers a synthetic response"),
-            ("fail", "delivers a synthetic response"),
+            ("restart", "host-controlled"),
+            ("retry", "host-controlled"),
+            ("pipe", "host-controlled"),
+            ("purge", "purging belongs to the Varnish VCL"),
+            ("hit", "the actions are"),
         ] {
             let source = format!("vcl 4.1; sub vcl_recv {{ return ({action}); }}");
             let error = parse(&source, &crate::lexer::lex(&source).unwrap())
@@ -1715,11 +1748,10 @@ mod tests {
             assert!(error.contains("backends and directors belong to the Varnish VCL"), "{error}");
         }
 
-        let source = "vcl 4.1; sub vcl_recv { hash_data(req.url); }";
-        let error = parse(source, &lexer::lex(source).unwrap())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("the cache key belongs to the Varnish VCL"), "{error}");
+        // hash_data() is a statement of its own; the type checker confines
+        // it to vcl_hash.
+        let source = "vcl 4.1; sub vcl_hash { hash_data(req.url); }";
+        assert!(parse(source, &lexer::lex(source).unwrap()).is_ok());
 
         // A `probe` used to be reported as "expected 'sub'", which says
         // nothing about where health checks actually live.
@@ -1803,12 +1835,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_informational_synth_status() {
-        let source = "vcl 4.1; sub vcl_recv { return (synth(100, \"continue\")); }";
-        let error = parse(source, &lexer::lex(source).unwrap())
+    fn rejects_a_synth_reason_that_would_end_the_status_line() {
+        for action in ["synth", "error"] {
+            let source = format!("vcl 4.1; sub vcl_recv {{ return ({action}(403, {{\"No\r\n\"}})); }}");
+            let error = parse(&source, &lexer::lex(&source).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reason cannot contain the byte 0x0d"), "{error}");
+        }
+        let long = "x".repeat(SYNTH_REASON_LIMIT + 1);
+        let source = format!("vcl 4.1; sub vcl_recv {{ return (synth(403, \"{long}\")); }}");
+        let error = parse(&source, &lexer::lex(&source).unwrap())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("from 200 through 599"), "{error}");
+        assert!(error.contains("reason is longer than"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_synth_status_outside_three_digits() {
+        for status in ["99", "1000"] {
+            let source = format!("vcl 4.1; sub vcl_recv {{ return (synth({status}, \"x\")); }}");
+            let error = parse(&source, &lexer::lex(&source).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("from 100 through 999"), "{error}");
+        }
+        // The custom-status idiom: vcl_synth turns 750 into a redirect.
+        let source = "vcl 4.1; sub vcl_recv { return (synth(750, \"/elsewhere\")); }";
+        assert!(parse(source, &lexer::lex(source).unwrap()).is_ok());
     }
 
     #[test]

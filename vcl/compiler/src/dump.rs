@@ -488,9 +488,6 @@ pub(crate) fn write_ir_stage(output: &mut String, stage: &str, program: &Program
                     span.start,
                     span.end
                 ),
-                Op::Return { span } => {
-                    write!(output, "preserve ; bytes {}..{}", span.start, span.end)
-                }
             }
             .expect("write to String");
             output.push('\n');

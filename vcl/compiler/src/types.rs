@@ -32,60 +32,106 @@ pub(crate) enum Phase {
     BackendResponse,
     Deliver,
     Synth,
+    Hash,
+    Hit,
+    Miss,
+    Pass,
+    BackendError,
 }
 
 impl Phase {
+    /// The client-side subroutines Varnish's tables call `client`. A tenant
+    /// cannot reach `vcl_purge`, `vcl_pipe` or `vcl_connect`, so they are not
+    /// phases at all.
+    pub(crate) const CLIENT: &'static [Self] = &[
+        Self::Recv,
+        Self::Hash,
+        Self::Hit,
+        Self::Miss,
+        Self::Pass,
+        Self::Deliver,
+        Self::Synth,
+    ];
+
+    /// The backend-side subroutines, Varnish's `backend`.
+    pub(crate) const BACKEND: &'static [Self] = &[
+        Self::BackendRequest,
+        Self::BackendResponse,
+        Self::BackendError,
+    ];
+
+    /// Every phase.
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Recv,
+        Self::Hash,
+        Self::Hit,
+        Self::Miss,
+        Self::Pass,
+        Self::Deliver,
+        Self::Synth,
+        Self::BackendRequest,
+        Self::BackendResponse,
+        Self::BackendError,
+    ];
+
     /// Whether the phase's writable header map is the response's.
     ///
     /// This is the header map `headerplus` reads and commits, which is why
     /// its scope needs no state carried between statements: the phase decides
     /// it, and `init(scope)` is checked against it.
     pub(crate) fn writes_response_headers(self) -> bool {
-        matches!(self, Self::BackendResponse | Self::Deliver | Self::Synth)
+        matches!(
+            self,
+            Self::BackendResponse | Self::BackendError | Self::Deliver | Self::Synth
+        )
     }
 
-    pub(crate) const EXPORTED: [Self; 4] = [
-        Self::Recv,
-        Self::BackendRequest,
-        Self::BackendResponse,
-        Self::Deliver,
-    ];
+    pub(crate) fn is_backend(self) -> bool {
+        Self::BACKEND.contains(&self)
+    }
 
+    /// The symbol the compiled policy exports for the phase. The host maps
+    /// each one to the VMOD callback `riscv.run()` invokes from the matching
+    /// Varnish subroutine (`src/vcl/vcl_program.cpp`).
     pub(crate) fn hook(self) -> &'static str {
         match self {
             Self::Recv => "on_recv",
-            Self::BackendRequest => "on_backend_request",
-            Self::BackendResponse => "on_backend_response",
+            Self::Hash => "on_hash",
+            Self::Hit => "on_hit",
+            Self::Miss => "on_miss",
+            Self::Pass => "on_pass",
             Self::Deliver => "on_deliver",
-            Self::Synth => unreachable!("vcl_synth is not an exported hook"),
+            Self::Synth => "on_synth",
+            Self::BackendRequest => "on_backend_fetch",
+            Self::BackendResponse => "on_backend_response",
+            Self::BackendError => "on_backend_error",
         }
     }
 
     pub(crate) fn vcl_name(self) -> &'static str {
         match self {
             Self::Recv => "vcl_recv",
-            Self::BackendRequest => "vcl_backend_fetch",
-            Self::BackendResponse => "vcl_backend_response",
+            Self::Hash => "vcl_hash",
+            Self::Hit => "vcl_hit",
+            Self::Miss => "vcl_miss",
+            Self::Pass => "vcl_pass",
             Self::Deliver => "vcl_deliver",
             Self::Synth => "vcl_synth",
+            Self::BackendRequest => "vcl_backend_fetch",
+            Self::BackendResponse => "vcl_backend_response",
+            Self::BackendError => "vcl_backend_error",
         }
     }
 
     pub(crate) fn from_vcl_name(name: &str) -> Option<Self> {
-        match name {
-            "vcl_recv" => Some(Self::Recv),
-            "vcl_backend_fetch" => Some(Self::BackendRequest),
-            "vcl_backend_response" => Some(Self::BackendResponse),
-            "vcl_deliver" => Some(Self::Deliver),
-            "vcl_synth" => Some(Self::Synth),
-            _ => None,
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|phase| phase.vcl_name() == name)
     }
 
     fn from_hook(name: &str) -> Option<Self> {
-        Self::EXPORTED
-            .into_iter()
-            .find(|phase| phase.hook() == name)
+        Self::ALL.iter().copied().find(|phase| phase.hook() == name)
     }
 }
 
@@ -181,17 +227,22 @@ impl PhaseSet {
     /// Every phase, in the order [`PhaseSet::bits`] numbers them. The values
     /// are wire ABI between a sandboxed compiler guest and its host, so the
     /// order is fixed: append, never reorder.
-    const ALL: [Phase; 5] = [
+    const ORDER: [Phase; 10] = [
         Phase::Recv,
         Phase::BackendRequest,
         Phase::BackendResponse,
         Phase::Deliver,
         Phase::Synth,
+        Phase::Hash,
+        Phase::Hit,
+        Phase::Miss,
+        Phase::Pass,
+        Phase::BackendError,
     ];
 
     /// The set as a bitmask, for [`crate::wire`].
-    pub fn bits(&self) -> u8 {
-        Self::ALL
+    pub fn bits(&self) -> u16 {
+        Self::ORDER
             .iter()
             .enumerate()
             .filter(|(_, phase)| self.0.contains(phase))
@@ -201,9 +252,9 @@ impl PhaseSet {
     /// Inverse of [`PhaseSet::bits`]. Bits above the known phases are
     /// ignored: a host decoding a guest's answer must not be able to panic on
     /// one, and there is nothing for an unknown phase to mean.
-    pub fn from_bits(bits: u8) -> Self {
+    pub fn from_bits(bits: u16) -> Self {
         Self(
-            Self::ALL
+            Self::ORDER
                 .into_iter()
                 .enumerate()
                 .filter(|(index, _)| bits & 1 << index != 0)

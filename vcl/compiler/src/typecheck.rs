@@ -9,7 +9,7 @@ use crate::types::{
     StringConversion, ValueType, MAX_BLOCK_DEPTH, MAX_GLOBAL_STRING, MAX_REQUEST_GLOBALS,
     MAX_STAT_HELP, MAX_STAT_NAME,
 };
-use crate::vars::{self, Lowering, WriteConstraint};
+use crate::vars::{self, HostVar, Lowering, WriteConstraint};
 use crate::vmod::{Module, RecordSet, RegexSelect};
 use crate::{CompileOptions, Diagnostic, Diagnostics, Span};
 use vcl_rt::OpCode;
@@ -47,7 +47,6 @@ pub(crate) enum GlobalInit {
 pub(crate) struct TypedProgram {
     pub subs: Vec<TypedSub>,
     pub user_subs: BTreeMap<(Phase, SubId), TypedUserSub>,
-    pub synth: Option<TypedSub>,
     pub statics: Vec<TypedStatic>,
     pub globals: Vec<TypedGlobal>,
     /// Packed ACL entry tables, indexed by [`AclId`].
@@ -127,6 +126,22 @@ pub(crate) enum TypedStatement {
         value: TypedExpr,
         span: Span,
     },
+    /// A write through the generic host variable call.
+    SetVar {
+        var: HostVar,
+        value: TypedExpr,
+        span: Span,
+    },
+    /// `set resp.body` in vcl_synth, `set beresp.body` in vcl_backend_error.
+    SetBody {
+        value: TypedExpr,
+        span: Span,
+    },
+    /// `hash_data()` in vcl_hash.
+    HashData {
+        value: TypedExpr,
+        span: Span,
+    },
     /// A typed cache-duration assignment. Desugaring owns evaluating this
     /// constant expression and selecting the concrete ABI operation.
     SetCacheDuration {
@@ -174,12 +189,6 @@ pub(crate) enum TypedStatement {
     },
     Synthetic {
         value: TypedExpr,
-        span: Span,
-    },
-    SynthDispatch {
-        status: u16,
-        initial_body: String,
-        statements: Vec<TypedStatement>,
         span: Span,
     },
     If {
@@ -368,19 +377,25 @@ pub(crate) enum VmodAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypedReturnAction {
+    /// The hook ended without a return: the Varnish VCL around the tenant
+    /// carries on, which is where Varnish's built-in VCL runs.
     Next,
+    Hash,
+    Lookup,
+    Fetch,
+    Miss,
     Pass,
-    /// Varnish's `return (abandon)`: discard the origin response and treat
-    /// the fetch as failed. Lowered to the host's own `Abandon`, not to
-    /// `Pass` — "deliver but do not store" would send the 5xx the policy
-    /// asked to discard, and stale-if-error would never run.
     Abandon,
     Deliver,
+    Fail,
     Synth {
         status: u16,
         reason: String,
     },
-    Preserve,
+    Error {
+        status: u16,
+        reason: String,
+    },
     Leave,
 }
 
@@ -450,60 +465,7 @@ pub(crate) fn check(
 
     let (globals, global_names) = check_globals(&program, &mut errors);
 
-    let synth_source = program
-        .hooks
-        .iter()
-        .find(|sub| sub.phase == Phase::Synth)
-        .map(|sub| (sub.name_span, sub.statements.clone()));
-    if let Some((span, _)) = synth_source.as_ref().filter(|_| {
-        !program
-            .hooks
-            .iter()
-            .any(|sub| matches!(sub.phase, Phase::Recv | Phase::Deliver))
-    }) {
-        errors.push(Diagnostic::error(
-            *span,
-            "sub vcl_synth requires sub vcl_recv or sub vcl_deliver to dispatch a synthetic \
-             response",
-        ));
-    }
     let reachable = reachable_user_subs(&program);
-    // A `vcl_synth` nothing returns `synth(...)` to is dead code. Not an
-    // error — an operator may be staging one — but silently unreachable
-    // policy is the shape a migration produces and nobody notices.
-    //
-    // Only `vcl_recv` and `vcl_deliver` may `return (synth(...))`, so only
-    // those two and the user subroutines *they* reach can dispatch one.
-    // Scanning every declared sub instead reads a dead one as a live
-    // dispatch: a sub in an *included* library that nothing calls is not the
-    // error it is in the main file (`resolver.rs`, `!sub.included`) and is
-    // never type checked, so a stale `return (synth(...))` in a shared
-    // library would silence the warning for the half-migrated policy it
-    // exists to catch.
-    if let Some((span, _)) = synth_source.as_ref() {
-        let dispatches = |phase: &Phase| matches!(phase, Phase::Recv | Phase::Deliver);
-        let dispatched = program
-            .hooks
-            .iter()
-            .filter(|sub| dispatches(&sub.phase))
-            .map(|sub| sub.statements.as_slice())
-            .chain(
-                reachable
-                    .keys()
-                    .filter(|(phase, _)| dispatches(phase))
-                    .filter_map(|(_, id)| program.subs.get(id))
-                    .map(|sub| sub.statements.as_slice()),
-            )
-            .any(dispatches_synth);
-        if !dispatched {
-            collected.warnings.push(
-                Diagnostic::warning(*span, "sub vcl_synth is never reached").with_help(
-                    "a synthetic response is dispatched by \
-                         'return (synth(status, \"reason\"))' in vcl_recv or vcl_deliver",
-                ),
-            );
-        }
-    }
     let shared = Shared {
         syntax: program.syntax,
         options,
@@ -514,25 +476,8 @@ pub(crate) fn check(
         acls: &program.acl_names,
         collected: &collected,
     };
-    let synth = synth_source.map(|(span, statements)| {
-        let mut checker = Checker::new(Phase::Synth, shared);
-        let mut statements = checker.check_block(statements, false);
-        errors.append(&mut checker.errors);
-        if !matches!(statements.last(), Some(TypedStatement::Return { .. })) {
-            statements.push(TypedStatement::Return {
-                action: TypedReturnAction::Preserve,
-                span,
-            });
-        }
-        TypedSub {
-            phase: Phase::Synth,
-            statements,
-            locals: checker.locals,
-        }
-    });
-
     let mut subs = Vec::new();
-    for sub in program.hooks.iter().filter(|sub| sub.phase != Phase::Synth) {
+    for sub in program.hooks.iter() {
         let phase = sub.phase;
         let mut checker = Checker::new(phase, shared);
         let mut statements = checker.check_block(sub.statements.clone(), false);
@@ -577,7 +522,6 @@ pub(crate) fn check(
         Ok(TypedProgram {
             subs,
             user_subs,
-            synth,
             statics,
             globals,
             acls: program.acls.iter().map(|acl| acl.table.clone()).collect(),
@@ -587,43 +531,6 @@ pub(crate) fn check(
     } else {
         Err(Diagnostics::new(source, errors))
     }
-}
-
-/// Whether one body can hand control to `vcl_synth`.
-///
-/// Iterative rather than recursive: this walks a tree the parser bounds, but
-/// so does every other walk that used to be fine until a flat chain was not.
-fn dispatches_synth(statements: &[ast::Statement]) -> bool {
-    let mut blocks = vec![statements];
-    while let Some(block) = blocks.pop() {
-        for statement in block {
-            match statement {
-                ast::Statement::Return {
-                    action: ReturnAction::Synth { .. },
-                    ..
-                } => return true,
-                ast::Statement::If {
-                    branches,
-                    otherwise,
-                    ..
-                } => {
-                    blocks.push(otherwise);
-                    for (_, body) in branches {
-                        blocks.push(body);
-                    }
-                }
-                ast::Statement::Declare { .. }
-                | ast::Statement::Call { .. }
-                | ast::Statement::BuiltinCall { .. }
-                | ast::Statement::Set { .. }
-                | ast::Statement::Unset { .. }
-                | ast::Statement::Log { .. }
-                | ast::Statement::Synthetic { .. }
-                | ast::Statement::Return { .. } => {}
-            }
-        }
-    }
-    false
 }
 
 /// The calls one block makes, in source order, nested blocks included.
@@ -660,6 +567,7 @@ fn block_calls(statements: &[ast::Statement]) -> Vec<(&str, Span)> {
             | ast::Statement::Unset { .. }
             | ast::Statement::Log { .. }
             | ast::Statement::Synthetic { .. }
+            | ast::Statement::HashData { .. }
             | ast::Statement::BuiltinCall { .. }
             | ast::Statement::Return { .. } => {}
         }
@@ -1058,6 +966,7 @@ impl<'a> Checker<'a> {
             | ast::Statement::Unset { .. }
             | ast::Statement::Log { .. }
             | ast::Statement::Synthetic { .. }
+            | ast::Statement::HashData { .. }
             | ast::Statement::Return { .. }) => {
                 check_host_statement(self.phase, other, self.options, &self.env())
             }
@@ -1494,6 +1403,7 @@ fn statement_span(statement: &ast::Statement) -> Span {
         | ast::Statement::If { span, .. }
         | ast::Statement::Log { span, .. }
         | ast::Statement::Synthetic { span, .. }
+        | ast::Statement::HashData { span, .. }
         | ast::Statement::Return { span, .. } => *span,
     }
 }
@@ -1506,22 +1416,22 @@ fn undeclared_storage(name: &str, span: Span) -> Diagnostic {
 
 /// The refusal a read of a variable this phase does not own gets.
 ///
-/// Two of these are common enough in migrated VCL to be worth naming. Varnish
-/// keeps the backend request alive through `vcl_backend_response`; Carapace
-/// runs that phase against the *client* request (`SessionRequestRef` in
-/// `carapace/src/proxy.rs`), so `bereq.*` has nothing to read there and `req.*`
-/// is the variable that does. And `beresp.uncacheable` is a write-only signal
-/// to the host, not a flag the policy can read back.
+/// The common one in migrated VCL is the client request read from a backend
+/// subroutine, or the other way round: Varnish's backend side has its own
+/// copy, `bereq`, and the client side never sees it.
 fn not_readable(name: &str, phase: Phase, span: Span) -> Diagnostic {
-    let help = if phase == Phase::BackendResponse && name.starts_with("bereq.") {
+    let help = if phase.is_backend() && name.starts_with("req.") {
+        let equivalent = name.replacen("req.", "bereq.", 1);
+        format!(
+            "{} runs on the backend request; read {equivalent} instead",
+            phase.vcl_name()
+        )
+    } else if !phase.is_backend() && name.starts_with("bereq.") {
         let equivalent = name.replacen("bereq.", "req.", 1);
         format!(
-            "vcl_backend_response sees the client request, not the backend one; \
-             read {equivalent} instead"
+            "{} runs on the client request; read {equivalent} instead",
+            phase.vcl_name()
         )
-    } else if name == "beresp.uncacheable" {
-        "beresp.uncacheable only tells the host to stop caching; it reports nothing back"
-            .to_string()
     } else {
         "move this expression to the VCL sub that owns the variable".to_string()
     };
@@ -1535,16 +1445,13 @@ fn not_readable(name: &str, phase: Phase, span: Span) -> Diagnostic {
 /// The refusal a write to a variable this phase does not own gets.
 ///
 /// "Move it to the owning sub" is only useful advice when a sub owns it. For
-/// a variable no phase may write — the two statuses, `obj.*` — it is a wrong
-/// answer that sends a migrating author looking for a sub that does not
-/// exist, so those name what to write instead.
+/// a variable no phase may write, it is a wrong answer that sends a migrating
+/// author looking for a sub that does not exist, so those name what to write
+/// instead.
 fn not_writable(target: &str, phase: Phase, target_span: Span) -> Diagnostic {
     let owned_somewhere = vars::resolve(target).is_some_and(|(spec, _)| !spec.writable.is_empty());
-    let help = if target == "req.url" && phase == Phase::BackendRequest {
-        // The origin request has its own URL, and it is writable here.
-        "the origin request's URL is bereq.url, which vcl_backend_fetch may set"
-    } else if target == "req.url" || target.eq_ignore_ascii_case("req.http.Host") {
-        "rewriting req.url and Host belongs to the Varnish VCL that forks this tenant"
+    let help = if phase.is_backend() && target.starts_with("req.") {
+        "the backend side writes its own copy of the request, bereq"
     } else if target == "req.backend_hint" || target == "bereq.backend" {
         "backends and directors belong to the Varnish VCL that forks this tenant"
     } else if let Some(help) = absent_variable_help(target) {
@@ -1552,7 +1459,7 @@ fn not_writable(target: &str, phase: Phase, target_span: Span) -> Diagnostic {
     } else if owned_somewhere {
         "move this assignment to the VCL sub that owns the variable"
     } else {
-        "no VCL sub may write this variable in a tenant policy"
+        "no VCL sub may write this variable"
     };
     Diagnostic::error(
         target_span,
@@ -1564,9 +1471,9 @@ fn not_writable(target: &str, phase: Phase, target_span: Span) -> Diagnostic {
 /// The identity rules a header write answers to, whatever spells it.
 ///
 /// `set req.http.X` and `std.collect(req.http.X)` reach the same map through
-/// the same syscall, so they are refused by the same three rules. One owner
-/// is what stops a second spelling from quietly acquiring a header the first
-/// one may not touch.
+/// the same syscall, so they are refused by the same rules. One owner is what
+/// stops a second spelling from quietly acquiring a header the first one may
+/// not touch.
 fn check_header_identity(
     phase: Phase,
     spec: &vars::VariableSpec,
@@ -1579,24 +1486,41 @@ fn check_header_identity(
             target_span,
             format!("{header} is a framing or hop-by-hop header and cannot be set"),
         )
-        .with_help("framing is transport-owned because response bodies are immutable"));
+        .with_help("framing belongs to Varnish"));
     }
-    if spec.write_constraint != WriteConstraint::RecvRequestHeader || phase != Phase::Recv {
+    if spec.write_constraint != WriteConstraint::ClientRequestHeader {
         return Ok(());
     }
     if header.eq_ignore_ascii_case("Host") {
         return Err(Diagnostic::error(
             target_span,
-            "req.http.Host is routing-owned and cannot be set in vcl_recv",
+            "req.http.Host picked this tenant and cannot be changed",
         )
-        .with_help("rewriting req.url and Host belongs to the Varnish VCL that forks this tenant"));
+        .with_help(
+            "the Varnish VCL that forks this tenant routes by Host; rewrite the origin's \
+             Host as bereq.http.Host in vcl_backend_fetch",
+        ));
     }
-    if options.forbids_recv_header(header) {
+    if phase == Phase::Recv && options.forbids_recv_header(header) {
         return Err(Diagnostic::error(
             target_span,
             format!("req.http.{header} is a hash input and cannot be set in vcl_recv"),
         )
         .with_help("remove the assignment; the header is part of the cache key"));
+    }
+    Ok(())
+}
+
+/// A URL or method write: a literal that could never be one is refused
+/// here, as the host refuses the same bytes at run time.
+fn check_request_line(value: &TypedExpr, target: &str) -> Result<(), Diagnostic> {
+    if let TypedExprKind::String(text) = &value.kind {
+        if text.is_empty() || text.bytes().any(|b| b <= b' ' || b == 0x7f) {
+            return Err(Diagnostic::error(
+                value.span,
+                format!("{target} cannot be empty or contain spaces or control characters"),
+            ));
+        }
     }
     Ok(())
 }
@@ -1669,7 +1593,7 @@ fn check_host_statement(
                 return Err(not_writable(&target, phase, target_span));
             }
             match spec.write_constraint {
-                WriteConstraint::Header | WriteConstraint::RecvRequestHeader => {
+                WriteConstraint::Header | WriteConstraint::ClientRequestHeader => {
                     let header = suffix.expect("header constraint belongs to a header family");
                     check_header_identity(phase, spec, header, target_span, options)?;
                 }
@@ -1711,7 +1635,25 @@ fn check_host_statement(
                         span,
                     })
                 }
-                Lowering::RequestUrl => Ok(TypedStatement::SetUrl { value, span }),
+                Lowering::RequestUrl => {
+                    check_request_line(&value, &target)?;
+                    Ok(TypedStatement::SetUrl { value, span })
+                }
+                Lowering::RequestMethod => {
+                    check_request_line(&value, &target)?;
+                    Ok(TypedStatement::SetVar {
+                        var: HostVar::Method,
+                        value,
+                        span,
+                    })
+                }
+                Lowering::Host(var) => {
+                    if spec.value_type == ValueType::String {
+                        check_header_value(&value)?;
+                    }
+                    Ok(TypedStatement::SetVar { var, value, span })
+                }
+                Lowering::Body => Ok(TypedStatement::SetBody { value, span }),
                 Lowering::Ttl | Lowering::StaleWhileRevalidate | Lowering::StaleIfError => {
                     note_stale_cap(&target, spec.lowering, &value, options, env);
                     Ok(TypedStatement::SetCacheDuration {
@@ -1722,13 +1664,11 @@ fn check_host_statement(
                         span,
                     })
                 }
-                Lowering::RequestMethod
-                | Lowering::ResponseStatus
-                | Lowering::Now
+                Lowering::Now
                 | Lowering::ClientIp
                 | Lowering::Uncacheable
                 | Lowering::CacheHit => {
-                    unreachable!()
+                    unreachable!("{target} has no writable phase")
                 }
             }
         }
@@ -1756,16 +1696,24 @@ fn check_host_statement(
                 ));
             }
             match spec.write_constraint {
-                WriteConstraint::Header | WriteConstraint::RecvRequestHeader => {
+                WriteConstraint::Header | WriteConstraint::ClientRequestHeader => {
                     if vars::is_framing_header(name) {
                         return Err(Diagnostic::error(
                             target_span,
                             format!("{name} is a framing or hop-by-hop header and cannot be unset"),
                         ));
                     }
-                    if spec.write_constraint == WriteConstraint::RecvRequestHeader
+                    if spec.write_constraint == WriteConstraint::ClientRequestHeader
+                        && name.eq_ignore_ascii_case("Host")
+                    {
+                        return Err(Diagnostic::error(
+                            target_span,
+                            "req.http.Host picked this tenant and cannot be unset",
+                        ));
+                    }
+                    if spec.write_constraint == WriteConstraint::ClientRequestHeader
                         && phase == Phase::Recv
-                        && (name.eq_ignore_ascii_case("Host") || options.forbids_recv_header(name))
+                        && options.forbids_recv_header(name)
                     {
                         return Err(Diagnostic::error(
                             target_span,
@@ -1793,13 +1741,25 @@ fn check_host_statement(
             span,
         }),
         ast::Statement::Synthetic { value, span } => {
-            if phase != Phase::Synth {
+            if !matches!(phase, Phase::Synth | Phase::BackendError) {
                 return Err(Diagnostic::error(
                     span,
-                    "synthetic() is only valid in vcl_synth",
+                    "synthetic() is only valid in vcl_synth and vcl_backend_error",
                 ));
             }
             Ok(TypedStatement::Synthetic {
+                value: coerce_string(check_expr(phase, value, env)?),
+                span,
+            })
+        }
+        ast::Statement::HashData { value, span } => {
+            if phase != Phase::Hash {
+                return Err(Diagnostic::error(
+                    span,
+                    "hash_data() is only valid in vcl_hash",
+                ));
+            }
+            Ok(TypedStatement::HashData {
                 value: coerce_string(check_expr(phase, value, env)?),
                 span,
             })
@@ -2509,15 +2469,23 @@ struct VmodSpec {
     select: Option<RecordSet>,
 }
 
-const REQUEST_PHASES: &[Phase] = &[Phase::Recv, Phase::BackendRequest];
-const RESPONSE_PHASES: &[Phase] = &[Phase::BackendResponse, Phase::Deliver, Phase::Synth];
-const HEADER_PHASES: &[Phase] = &[
+/// The phases whose writable header map is the request's.
+const REQUEST_PHASES: &[Phase] = &[
     Phase::Recv,
+    Phase::Hash,
+    Phase::Hit,
+    Phase::Miss,
+    Phase::Pass,
     Phase::BackendRequest,
+];
+/// The phases whose writable header map is the response's.
+const RESPONSE_PHASES: &[Phase] = &[
     Phase::BackendResponse,
+    Phase::BackendError,
     Phase::Deliver,
     Phase::Synth,
 ];
+const HEADER_PHASES: &[Phase] = Phase::ALL;
 
 /// Every phase the module allows, which for `uri` is every phase there is:
 /// its state is parsed from strings the guest already holds.
@@ -3121,8 +3089,8 @@ const URI_DECODE_STRAND_PARAMS: &[ParameterSpec] = &[
     },
 ];
 
-const KEY_OWNED_BY_TOML: &str = "a urlplus write outside vcl_backend_fetch would move the cache \
-     key, which a tenant policy may not do; the cache key belongs to the Varnish VCL that forks this tenant";
+const URL_WRITE_HELP: &str = "urlplus.write replaces the request URL, which the client \
+     subroutines up to vcl_pass and vcl_backend_fetch may do";
 
 const VMODS: &[VmodSpec] = &[
     // ── cookieplus ──────────────────────────────────────────────────────
@@ -3418,8 +3386,8 @@ const VMODS: &[VmodSpec] = &[
         shape: Shape::Write(vcl_rt::UrlRead::AsString as u8),
         params: URL_RENDER_PARAMS,
         binds: URL_RENDER_BINDS,
-        phases: &[Phase::BackendRequest],
-        phase_help: KEY_OWNED_BY_TOML,
+        phases: REQUEST_PHASES,
+        phase_help: URL_WRITE_HELP,
         flags: 0,
         select: None,
     },
@@ -4099,8 +4067,8 @@ const SETCOOKIE_PHASE_HELP: &str =
      available in vcl_backend_response, vcl_deliver and vcl_synth";
 const URI_PHASE_HELP: &str =
     "uri parses a URI into its RFC 3986 components; the parse itself is available in every phase";
-const URI_KEY_OWNED_BY_TOML: &str = "a uri write outside vcl_backend_fetch would move the cache \
-     key, which a tenant policy may not do; the cache key belongs to the Varnish VCL that forks this tenant";
+const URI_KEY_OWNED_BY_TOML: &str = "uri.write replaces Host as well as the URL, and the client's \
+     Host picked this tenant; use urlplus.write on the client side, or uri.write in vcl_backend_fetch";
 const HEADER_PHASE_HELP: &str =
     "headerplus works on the header map the phase can write: req or bereq while shaping the \
      request, beresp or resp while shaping the response";
@@ -4394,9 +4362,9 @@ fn bind_arguments(
 /// `set req.http.X` there already is.
 fn header_scope(phase: Phase) -> (bool, &'static str) {
     match phase {
-        Phase::Recv => (false, "req"),
+        Phase::Recv | Phase::Hash | Phase::Hit | Phase::Miss | Phase::Pass => (false, "req"),
         Phase::BackendRequest => (false, "bereq"),
-        Phase::BackendResponse => (true, "beresp"),
+        Phase::BackendResponse | Phase::BackendError => (true, "beresp"),
         Phase::Deliver | Phase::Synth => (true, "resp"),
     }
 }
@@ -5299,6 +5267,9 @@ pub(crate) fn statement_expressions(statement: &TypedStatement) -> Vec<&TypedExp
         | TypedStatement::SetHeader { value, .. }
         | TypedStatement::SetUrl { value, .. }
         | TypedStatement::SetCacheDuration { value, .. }
+        | TypedStatement::SetVar { value, .. }
+        | TypedStatement::SetBody { value, .. }
+        | TypedStatement::HashData { value, .. }
         | TypedStatement::Log { value, .. }
         | TypedStatement::Synthetic { value, .. } => vec![value],
         TypedStatement::Collect { separator, .. } => vec![separator],
@@ -5316,7 +5287,6 @@ pub(crate) fn statement_expressions(statement: &TypedStatement) -> Vec<&TypedExp
         | TypedStatement::SetStaleWhileRevalidate { .. }
         | TypedStatement::SetStaleIfError { .. }
         | TypedStatement::SetUncacheable { .. }
-        | TypedStatement::SynthDispatch { .. }
         | TypedStatement::Return { .. } => Vec::new(),
     }
 }
@@ -5334,7 +5304,6 @@ pub(crate) fn statement_bodies(statement: &TypedStatement) -> Vec<&[TypedStateme
             .chain(std::iter::once(otherwise.as_slice()))
             .collect(),
         TypedStatement::Inlined { body, .. } => vec![body.as_slice()],
-        TypedStatement::SynthDispatch { statements, .. } => vec![statements.as_slice()],
         TypedStatement::Declare { .. }
         | TypedStatement::SetLocal { .. }
         | TypedStatement::SetStatic { .. }
@@ -5350,6 +5319,9 @@ pub(crate) fn statement_bodies(statement: &TypedStatement) -> Vec<&[TypedStateme
         | TypedStatement::SetUncacheable { .. }
         | TypedStatement::Collect { .. }
         | TypedStatement::Vmod { .. }
+        | TypedStatement::SetVar { .. }
+        | TypedStatement::SetBody { .. }
+        | TypedStatement::HashData { .. }
         | TypedStatement::Log { .. }
         | TypedStatement::Synthetic { .. }
         | TypedStatement::Return { .. } => Vec::new(),
@@ -5494,12 +5466,13 @@ fn coerce_boolean(expression: TypedExpr) -> Option<TypedExpr> {
             Lowering::ResponseHeader => Some(true),
             Lowering::RequestUrl
             | Lowering::RequestMethod
-            | Lowering::ResponseStatus
             | Lowering::Now
             | Lowering::ClientIp
             | Lowering::Ttl
             | Lowering::StaleWhileRevalidate
-            | Lowering::StaleIfError => None,
+            | Lowering::StaleIfError
+            | Lowering::Body
+            | Lowering::Host(_) => None,
             Lowering::Uncacheable | Lowering::CacheHit => None,
         };
         if let Some(response) = response {
@@ -5633,72 +5606,67 @@ fn check_return_action(
     action: ReturnAction,
     span: Span,
 ) -> Result<TypedReturnAction, Diagnostic> {
-    let valid = match (phase, action) {
-        (Phase::Recv, ReturnAction::Hash) => Some(TypedReturnAction::Next),
-        (Phase::Recv, ReturnAction::Pass) => Some(TypedReturnAction::Pass),
-        (Phase::Recv, ReturnAction::Synth { status, reason }) => {
-            Some(TypedReturnAction::Synth { status, reason })
-        }
-        (Phase::BackendRequest, ReturnAction::Fetch) => Some(TypedReturnAction::Next),
-        (Phase::BackendResponse, ReturnAction::Deliver) => Some(TypedReturnAction::Deliver),
-        (Phase::BackendResponse, ReturnAction::Abandon) => Some(TypedReturnAction::Abandon),
-        (Phase::Deliver, ReturnAction::Deliver) => Some(TypedReturnAction::Deliver),
-        // A deliver synth abandons the response the listener was about to
-        // send and replaces it with an error page, discarding every header
-        // the old response carried — see `docs/plans/vcl-deliver-synth.md`
-        // D1/D2. Below 400 that is not an error path: a 3xx would be a
-        // scripted redirect, which is a routing decision and declarative, and
-        // a 2xx over a discarded header set is a body rewrite. The host
-        // refuses the same statuses at runtime, for a C or Rust guest calling
-        // the syscall directly; that gate is the rule and this is the
-        // diagnostic.
-        (Phase::Deliver, ReturnAction::Synth { status, reason }) if status >= 400 => {
-            Some(TypedReturnAction::Synth { status, reason })
-        }
-        (Phase::Deliver, ReturnAction::Synth { status, .. }) => {
-            return Err(Diagnostic::error(
-                span,
-                format!(
-                    "return (synth({status})) in vcl_deliver must name a status of 400 or more"
-                ),
-            )
-            .with_help(
-                "a synth from vcl_deliver replaces the response with an error page and \
-                 discards every header it carried, so a 2xx would be a body rewrite; a \
-                 redirect is a routing decision that belongs to the Varnish VCL that forks this tenant",
-            ));
-        }
-        (Phase::Synth, ReturnAction::Deliver) => Some(TypedReturnAction::Preserve),
-        (_, ReturnAction::Bare) => {
+    use Phase::*;
+    // Varnish's own table (`lib/libvcc/generate.py`), less restart, retry,
+    // pipe, purge and vcl, which the parser already refused.
+    let allowed: &[Phase] = match &action {
+        ReturnAction::Bare => {
             return Err(Diagnostic::error(
                 span,
                 "a bare return is only valid in a user subroutine",
             )
             .with_help("return the normal action for this VCL hook explicitly"));
         }
-        (_, invalid) => {
-            return Err(Diagnostic::error(
-                span,
-                format!(
-                    "return ({}) is not valid in {}",
-                    return_action_name(&invalid),
-                    phase.vcl_name()
-                ),
-            ));
-        }
+        ReturnAction::Sub(_, _) => unreachable!("the checker inlines deciding subroutines"),
+        ReturnAction::Hash => &[Recv],
+        ReturnAction::Lookup => &[Hash],
+        ReturnAction::Fetch => &[Miss, Pass, BackendRequest],
+        ReturnAction::Miss => &[Hit],
+        ReturnAction::Pass => &[Recv, Hit, Miss, BackendResponse],
+        ReturnAction::Abandon => &[BackendRequest, BackendResponse, BackendError],
+        ReturnAction::Deliver => &[Hit, Deliver, Synth, BackendResponse, BackendError],
+        ReturnAction::Fail => Phase::ALL,
+        ReturnAction::Synth { .. } => &[Recv, Hit, Miss, Pass, Deliver],
+        ReturnAction::Error { .. } => &[BackendRequest, BackendResponse],
     };
-    Ok(valid.expect("every valid return produces a typed action"))
+    if !allowed.contains(&phase) {
+        return Err(Diagnostic::error(
+            span,
+            format!(
+                "return ({}) is not valid in {}",
+                return_action_name(&action),
+                phase.vcl_name()
+            ),
+        ));
+    }
+    Ok(match action {
+        ReturnAction::Hash => TypedReturnAction::Hash,
+        ReturnAction::Lookup => TypedReturnAction::Lookup,
+        ReturnAction::Fetch => TypedReturnAction::Fetch,
+        ReturnAction::Miss => TypedReturnAction::Miss,
+        ReturnAction::Pass => TypedReturnAction::Pass,
+        ReturnAction::Abandon => TypedReturnAction::Abandon,
+        ReturnAction::Deliver => TypedReturnAction::Deliver,
+        ReturnAction::Fail => TypedReturnAction::Fail,
+        ReturnAction::Synth { status, reason } => TypedReturnAction::Synth { status, reason },
+        ReturnAction::Error { status, reason } => TypedReturnAction::Error { status, reason },
+        ReturnAction::Bare | ReturnAction::Sub(_, _) => unreachable!("handled above"),
+    })
 }
 
 fn return_action_name(action: &ReturnAction) -> &'static str {
     match action {
         ReturnAction::Bare => "bare return",
         ReturnAction::Hash => "hash",
+        ReturnAction::Lookup => "lookup",
         ReturnAction::Fetch => "fetch",
+        ReturnAction::Miss => "miss",
         ReturnAction::Pass => "pass",
         ReturnAction::Abandon => "abandon",
         ReturnAction::Deliver => "deliver",
+        ReturnAction::Fail => "fail",
         ReturnAction::Synth { .. } => "synth",
+        ReturnAction::Error { .. } => "error",
         ReturnAction::Sub(_, _) => "subroutine",
     }
 }
@@ -5752,6 +5720,10 @@ const ABSENT_VARIABLES: &[(&str, &str)] = &[
         "backends and directors belong to the Varnish VCL that forks this tenant",
     ),
     (
+        "beresp.backend",
+        "backends and directors belong to the Varnish VCL that forks this tenant",
+    ),
+    (
         "bereq.connect_timeout",
         "timeouts belong to the Varnish VCL that forks this tenant",
     ),
@@ -5764,68 +5736,50 @@ const ABSENT_VARIABLES: &[(&str, &str)] = &[
         "timeouts belong to the Varnish VCL that forks this tenant",
     ),
     (
-        "req.hash_always_miss",
-        "a request cannot force origin work for a fresh object (#96); use return (pass)",
+        "bereq.last_byte_timeout",
+        "timeouts belong to the Varnish VCL that forks this tenant",
     ),
     (
-        "req.hash_ignore_busy",
-        "a miss synchronizes once behind the cache lock; there is no way to skip it",
-    ),
-    // No host data: the capability does not exist, under any spelling.
-    (
-        "req.restarts",
-        "no host data: a script cannot restart a request, so nothing counts restarts",
+        "sess.timeout_idle",
+        "timeouts belong to the Varnish VCL that forks this tenant",
     ),
     (
-        "bereq.retries",
-        "no host data: origin failover is host-controlled and not reported to a script",
+        "resp.send_timeout",
+        "timeouts belong to the Varnish VCL that forks this tenant",
     ),
     (
-        "req.xid",
-        "no host data: there is no transaction id in the guest ABI",
+        "req.storage",
+        "storage selection belongs to the Varnish VCL that forks this tenant",
     ),
     (
-        "bereq.xid",
-        "no host data: there is no transaction id in the guest ABI",
+        "beresp.storage",
+        "storage selection belongs to the Varnish VCL that forks this tenant",
     ),
     (
-        "obj.hits",
-        "no host data: MSE4 does not carry a per-object hit count; to ask whether this \
-         response was a hit, read req.cache_hit in vcl_deliver",
+        "beresp.do_esi",
+        "ESI processing belongs to the Varnish VCL that forks this tenant: an include \
+         may name another tenant's site",
     ),
     (
-        "server.",
-        "no host data: the guest ABI exposes no server identity or port",
+        "bereq.body",
+        "request bodies are not exposed to a tenant policy",
+    ),
+    (
+        "req.hash",
+        "the digest is Varnish's; build the key with hash_data() in vcl_hash",
+    ),
+    (
+        "server.ip",
+        "the listening address is not exposed; server.hostname and server.identity are",
     ),
     (
         "local.",
-        "no host data: the guest ABI exposes no local socket address",
-    ),
-    (
-        "beresp.backend.name",
-        "no host data: the peer a fetch used is not reported to a script",
-    ),
-    (
-        "req.esi",
-        "no host data: response bodies are immutable, so there is no ESI processor",
-    ),
-    // Use X instead.
-    (
-        "resp.status",
-        "use return (synth(status, \"reason\")) in vcl_recv to answer with a status",
-    ),
-    (
-        "beresp.status",
-        "a script cannot change an origin status; return (synth(...)) answers instead",
+        "the local socket address is not exposed",
     ),
     (
         "req.ttl",
         "Varnish's req.ttl is a lookup-side age limit, not the stored TTL; \
          set beresp.ttl in vcl_backend_response",
-    ),
-    (
-        "obj.uncacheable",
-        "write beresp.uncacheable = true in vcl_backend_response",
     ),
     ("client.port", "use client.ip; the port is not carried"),
     ("remote.port", "use remote.ip; the port is not carried"),
@@ -5845,13 +5799,6 @@ fn unknown_variable(name: &str, span: Span) -> Diagnostic {
     if name.starts_with("backend.") {
         return Diagnostic::error(span, format!("{name} is not available in a tenant policy"))
             .with_help("backends and directors belong to the Varnish VCL that forks this tenant");
-    }
-    if name.starts_with("beresp.do_") {
-        return Diagnostic::error(
-            span,
-            format!("{name} would mutate an immutable response body"),
-        )
-        .with_help("store a separate representation instead");
     }
     let diagnostic = Diagnostic::error(
         span,
@@ -6092,14 +6039,26 @@ mod tests {
         checked(&source).expect("a hook with no calls is not an inlining budget");
     }
 
-    /// A synth dispatch ends in the synth sub's own return, so no
-    /// fall-through return is appended after it.
+    /// vcl_synth is a hook of its own, run from Varnish's vcl_synth, rather
+    /// than a body copied into the hooks that return synth(...).
     #[test]
-    fn synth_dispatch_terminates_its_hook() {
-        let source = "vcl 4.1; sub vcl_synth { set resp.http.X = \"1\"; } \
+    fn vcl_synth_is_its_own_hook() {
+        let source = "vcl 4.1; sub vcl_synth { set resp.http.X = \"1\"; return (deliver); } \
                       sub vcl_recv { return (synth(503, \"x\")); }";
         let typed = checked(source).unwrap();
         let typed = crate::desugar::desugar(source, typed).unwrap();
+        let synth = typed
+            .subs
+            .iter()
+            .find(|sub| sub.phase == Phase::Synth)
+            .expect("vcl_synth is checked");
+        assert!(matches!(
+            synth.statements.last(),
+            Some(TypedStatement::Return {
+                action: TypedReturnAction::Deliver,
+                ..
+            })
+        ));
         let recv = typed
             .subs
             .iter()
@@ -6107,15 +6066,19 @@ mod tests {
             .expect("vcl_recv is checked");
         assert!(matches!(
             recv.statements.last(),
-            Some(TypedStatement::SynthDispatch { .. })
+            Some(TypedStatement::Return {
+                action: TypedReturnAction::Synth { status: 503, .. },
+                ..
+            })
         ));
     }
 
     #[test]
     fn phase_table_refuses_cross_phase_write() {
-        let source = "vcl 4.1; sub vcl_deliver { set req.http.X = \"no\"; }";
+        let source = "vcl 4.1; sub vcl_backend_fetch { set req.http.X = \"no\"; }";
         let error = checked(source).unwrap_err().to_string();
-        assert!(error.contains("not writable in vcl_deliver"), "{error}");
+        assert!(error.contains("not writable in vcl_backend_fetch"), "{error}");
+        assert!(error.contains("bereq"), "{error}");
     }
 
     #[test]
@@ -6162,10 +6125,12 @@ mod tests {
     }
 
     #[test]
-    fn body_mutation_names_the_invariant() {
-        let source = "vcl 4.1; sub vcl_backend_response { set beresp.do_gzip = 1; }";
+    fn esi_names_its_owner() {
+        let source = "vcl 4.1; sub vcl_backend_response { set beresp.do_esi = true; }";
         let error = checked(source).unwrap_err().to_string();
-        assert!(error.contains("immutable response body"), "{error}");
+        assert!(error.contains("ESI processing belongs to the Varnish VCL"), "{error}");
+        checked("vcl 4.1; sub vcl_backend_response { set beresp.do_gzip = true; }")
+            .expect("gzip is Varnish's work, on the tenant's say-so");
     }
 
     #[test]
@@ -6176,8 +6141,20 @@ mod tests {
                 "return (deliver) is not valid in vcl_recv",
             ),
             (
-                "vcl 4.1; sub vcl_backend_fetch { return (abandon); }",
-                "return (abandon) is not valid in vcl_backend_fetch",
+                "vcl 4.1; sub vcl_backend_error { return (pass); }",
+                "return (pass) is not valid in vcl_backend_error",
+            ),
+            (
+                "vcl 4.1; sub vcl_hash { return (hash); }",
+                "return (hash) is not valid in vcl_hash",
+            ),
+            (
+                "vcl 4.1; sub vcl_synth { return (synth(500)); }",
+                "return (synth) is not valid in vcl_synth",
+            ),
+            (
+                "vcl 4.1; sub vcl_deliver { return (error(503)); }",
+                "return (error) is not valid in vcl_deliver",
             ),
             (
                 "vcl 4.1; sub vcl_deliver { return (pass); }",
@@ -6304,7 +6281,7 @@ mod tests {
     fn header_write_constraints_live_in_the_variable_table() {
         assert_eq!(
             vars::resolve("req.http.Host").unwrap().0.write_constraint,
-            WriteConstraint::RecvRequestHeader
+            WriteConstraint::ClientRequestHeader
         );
         assert_eq!(
             vars::resolve("beresp.http.Content-Length")
@@ -6450,15 +6427,17 @@ mod tests {
             .to_string();
         assert!(error.contains("only valid in vcl_synth"), "{error}");
 
-        let error = checked("vcl 4.1; sub vcl_deliver { unset req.http.X; }")
+        let error = checked("vcl 4.1; sub vcl_backend_fetch { unset req.http.X; }")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not writable in vcl_deliver"), "{error}");
+        assert!(error.contains("not writable in vcl_backend_fetch"), "{error}");
 
-        let error = checked("vcl 4.1; sub vcl_synth { synthetic(\"orphan\"); }")
+        let error = checked("vcl 4.1; sub vcl_deliver { synthetic(\"orphan\"); }")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("requires sub vcl_recv"), "{error}");
+        assert!(error.contains("only valid in vcl_synth"), "{error}");
+        checked("vcl 4.1; sub vcl_backend_error { synthetic(\"down\"); return (deliver); }")
+            .expect("vcl_backend_error writes a synthetic body");
     }
 
     #[test]
@@ -6470,33 +6449,26 @@ mod tests {
 
     #[test]
     fn variable_table_is_the_exhaustive_phase_permission_matrix() {
-        const PHASES: [Phase; 5] = [
-            Phase::Recv,
-            Phase::BackendRequest,
-            Phase::BackendResponse,
-            Phase::Deliver,
-            Phase::Synth,
-        ];
-
         fn source_for(phase: Phase, statement: &str) -> String {
-            let (sub, action) = match phase {
-                Phase::Recv => ("vcl_recv", "hash"),
-                Phase::BackendRequest => ("vcl_backend_fetch", "fetch"),
-                Phase::BackendResponse => ("vcl_backend_response", "deliver"),
-                Phase::Deliver => ("vcl_deliver", "deliver"),
-                Phase::Synth => {
-                    return format!(
-                        "vcl 4.1; sub vcl_recv {{ return (synth(200)); }} \
-                         sub vcl_synth {{ {statement} return (deliver); }}"
-                    )
-                }
+            let action = match phase {
+                Phase::Recv => "hash",
+                Phase::Hash => "lookup",
+                Phase::Miss | Phase::Pass | Phase::BackendRequest => "fetch",
+                Phase::Hit
+                | Phase::Deliver
+                | Phase::Synth
+                | Phase::BackendResponse
+                | Phase::BackendError => "deliver",
             };
-            format!("vcl 4.1; sub {sub} {{ {statement} return ({action}); }}")
+            format!(
+                "vcl 4.1; sub {} {{ {statement} return ({action}); }}",
+                phase.vcl_name()
+            )
         }
 
         for spec in vars::VARIABLES {
             let variable = spec.pattern.replace('*', "X-Parity");
-            for phase in PHASES {
+            for &phase in Phase::ALL {
                 let probe = match spec.value_type {
                     ValueType::String => format!("if ({variable} == \"\") {{}}"),
                     ValueType::Integer => format!("if ({variable} == 0) {{}}"),

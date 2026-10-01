@@ -11,11 +11,14 @@
  * A `side` is which header map a phase means by "request" and "response":
  *
  *   method                request      response
- *   vcl_recv              req          -          (synth response is staged)
+ *   vcl_recv              req          -
+ *   vcl_hash, vcl_hit,    req          -
+ *   vcl_miss, vcl_pass
  *   vcl_deliver           req          resp
  *   vcl_synth             req          resp
  *   vcl_backend_fetch     bereq        -
  *   vcl_backend_response  bereq        beresp
+ *   vcl_backend_error     bereq        beresp
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -35,6 +38,11 @@ enum vcl_phase {
 	VCL_PHASE_BACKEND_RESPONSE,
 	VCL_PHASE_DELIVER,
 	VCL_PHASE_SYNTH,
+	VCL_PHASE_HASH,
+	VCL_PHASE_HIT,
+	VCL_PHASE_MISS,
+	VCL_PHASE_PASS,
+	VCL_PHASE_BACKEND_ERROR,
 };
 enum vcl_phase vclv_phase(const struct vrt_ctx *);
 
@@ -68,7 +76,6 @@ unsigned vclv_status(const struct http *);
 enum vcl_duration { VCL_TTL = 0, VCL_GRACE = 1, VCL_KEEP = 2 };
 double vclv_get_duration(const struct vrt_ctx *, enum vcl_duration);
 void vclv_set_duration(const struct vrt_ctx *, enum vcl_duration, double);
-void vclv_set_uncacheable(const struct vrt_ctx *);
 
 /* The client address as 16 bytes, IPv4 mapped into ::ffff:0:0/96.
    Returns 4 or 6 (the original family), or -1. */
@@ -79,10 +86,63 @@ int vclv_client_ip(const struct vrt_ctx *, unsigned char out[16]);
    vcl_deliver. The numbers are the policy ABI's cache status. */
 int vclv_cache_status(const struct vrt_ctx *);
 
-/* Set the response reason phrase. vcl_synth only. */
-int vclv_set_reason(const struct vrt_ctx *, const char *reason, size_t len);
-/* Replace the synthetic response body. vcl_synth only. */
-int vclv_synth_body(const struct vrt_ctx *, const char *body, size_t len);
+/* Varnish variables by number: the policy ABI's TYPED_VAR_GET/SET. The
+   numbers are the compiler's `HostVar` (vcl/compiler/src/vars.rs). Each is
+   gated by the subroutine running, and -1 is a refusal: a variable this
+   subroutine has no access to, or a value Varnish would not take. A
+   DURATION is nanoseconds, a BOOL 0 or 1. A string read is valid until the
+   task's workspace is reset. */
+enum vclv_var {
+	VCLV_METHOD = 1,
+	VCLV_XID,
+	VCLV_RESTARTS,
+	VCLV_ESI_LEVEL,
+	VCLV_CAN_GZIP,
+	VCLV_HASH_ALWAYS_MISS,
+	VCLV_HASH_IGNORE_BUSY,
+	VCLV_BEREQ_RETRIES,
+	VCLV_BEREQ_UNCACHEABLE,
+	VCLV_BEREQ_IS_BGFETCH,
+	VCLV_BERESP_STATUS,
+	VCLV_BERESP_REASON,
+	VCLV_BERESP_DO_STREAM,
+	VCLV_BERESP_DO_GZIP,
+	VCLV_BERESP_DO_GUNZIP,
+	VCLV_BERESP_AGE,
+	VCLV_BERESP_UNCACHEABLE,
+	VCLV_OBJ_STATUS,
+	VCLV_OBJ_REASON,
+	VCLV_OBJ_HITS,
+	VCLV_OBJ_TTL,
+	VCLV_OBJ_GRACE,
+	VCLV_OBJ_KEEP,
+	VCLV_OBJ_AGE,
+	VCLV_OBJ_UNCACHEABLE,
+	VCLV_RESP_STATUS,
+	VCLV_RESP_REASON,
+	VCLV_SERVER_HOSTNAME,
+	VCLV_SERVER_IDENTITY,
+	VCLV_REQUEST_PROTO,
+	VCLV_RESPONSE_PROTO,
+	VCLV_OBJ_PROTO,
+};
+int vclv_var_is_string(int id);
+int vclv_var_get_int(const struct vrt_ctx *, int id, int64_t *out);
+int vclv_var_get_string(const struct vrt_ctx *, int id, const char **out);
+int vclv_var_set_int(const struct vrt_ctx *, int id, int64_t value);
+/* value is NUL-terminated. */
+int vclv_var_set_string(const struct vrt_ctx *, int id, const char *value);
+
+/* hash_data(): feed a string to the cache key. vcl_hash only. */
+int vclv_hash_data(const struct vrt_ctx *, const char *data);
+
+/* synthetic() (replace = 0) or `set resp.body` / `set beresp.body`
+   (replace = 1), in vcl_synth and vcl_backend_error. Both append to the
+   synthetic body, as they do in Varnish Enterprise's own VCL. */
+int vclv_synth_body(const struct vrt_ctx *, int replace, const char *body);
+
+/* return (fail): fail the running VCL subroutine with a message. */
+void vclv_fail(const struct vrt_ctx *, const char *msg);
 
 void vclv_log(const struct vrt_ctx *, const char *msg, size_t len);
 

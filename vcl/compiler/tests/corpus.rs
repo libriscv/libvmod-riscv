@@ -113,8 +113,8 @@ fn controller_root_template_is_a_pinned_migration_guide() {
     );
 }
 
-/// The two things the Controller template asks of `urlplus` and `headerplus`
-/// that carapace will not do, and what each diagnostic has to name.
+/// What the Controller template asks of `urlplus` and `headerplus` that a
+/// tenant cannot do, and what the diagnostic has to name.
 ///
 /// These live apart from the template because the parser refuses that file
 /// before the type checker ever sees a `vcl_recv` body: a rejection that
@@ -145,54 +145,35 @@ sub vcl_recv {
         })
         .collect();
 
-    // Mutating the state and reading it back is fine anywhere; it is the
-    // *write* that would move the cache key, so that is what is refused, and
-    // the diagnostic names the declarative owner.
-    assert_eq!(reported.len(), 2, "{reported:?}");
-    assert_eq!(reported[0].0, "urlplus.write is not valid in vcl_recv");
-    assert!(
-        reported[0].1.contains("the cache key belongs to the Varnish VCL"),
-        "the diagnostic must name the owner: {}",
-        reported[0].1
-    );
+    // vcl_recv may rewrite the URL, as in Varnish, so only the workspace
+    // rollback is refused.
+    assert_eq!(reported.len(), 1, "{reported:?}");
     assert_eq!(
-        reported[1].0,
+        reported[0].0,
         "unsupported headerplus function 'headerplus.write_req0'"
     );
     assert!(
-        reported[1].1.starts_with("supported: "),
+        reported[0].1.starts_with("supported: "),
         "an unsupported function lists the ones that are: {}",
-        reported[1].1
+        reported[0].1
     );
 }
 
-/// Every Varnish variable the checker knows the name of gets a line saying
-/// *which kind* of absence it is: a decision Carapace made declaratively, a
-/// host capability that does not exist, or a spelling that does exist under
-/// another name. "unknown or unsupported VCL variable" on its own tells a
+/// Every Varnish variable a tenant cannot reach gets a line saying who owns
+/// it instead. "unknown or unsupported VCL variable" on its own tells a
 /// migrating author nothing, and they meet these one at a time.
 #[test]
 fn absent_variables_name_which_kind_of_absence_they_are() {
     for (variable, needle) in [
-        // Declarative: the answer is the Varnish VCL.
         ("req.backend_hint", "backends and directors belong"),
         ("bereq.backend", "backends and directors belong"),
         ("bereq.first_byte_timeout", "timeouts belong to the Varnish VCL"),
-        ("req.hash_always_miss", "return (pass)"),
-        // No host data, under any spelling.
-        ("req.restarts", "no host data"),
-        ("bereq.retries", "no host data"),
-        ("req.xid", "no host data"),
-        ("obj.hits", "no host data"),
-        ("server.hostname", "no host data"),
-        ("local.ip", "no host data"),
-        ("beresp.backend.name", "no host data"),
-        // Use X instead.
+        ("req.storage", "storage selection belongs"),
+        ("local.ip", "local socket address is not exposed"),
+        ("server.ip", "server.hostname and server.identity are"),
         ("req.ttl", "set beresp.ttl"),
-        ("obj.uncacheable", "beresp.uncacheable"),
         ("client.port", "use client.ip"),
-        // Body mutation crosses a line the whole design draws.
-        ("beresp.do_gzip", "immutable response body"),
+        ("req.hash", "hash_data() in vcl_hash"),
     ] {
         let source =
             format!("vcl 4.1; sub vcl_recv {{ set req.http.X = {variable}; return (hash); }}");
@@ -205,52 +186,36 @@ fn absent_variables_name_which_kind_of_absence_they_are() {
         );
     }
 
-    // A write to a variable no sub owns must not be answered with "move it to
-    // the sub that owns it": there is not one.
-    for (statement, needle) in [
-        ("set resp.status = 503;", "return (synth("),
-        ("set beresp.status = 503;", "return (synth("),
-        ("set req.url = \"/x\";", "rewriting req.url and Host belongs"),
+    // The variables Varnish has and a tenant now reads.
+    for (phase, variable) in [
+        ("vcl_recv", "req.xid"),
+        ("vcl_recv", "req.restarts"),
+        ("vcl_recv", "server.hostname"),
+        ("vcl_hit", "obj.hits"),
+        ("vcl_deliver", "obj.uncacheable"),
+        ("vcl_backend_fetch", "bereq.retries"),
     ] {
-        let phase = if statement.contains("beresp") {
-            "vcl_backend_response"
-        } else if statement.contains("resp.status") {
-            "vcl_deliver"
-        } else {
-            "vcl_recv"
-        };
-        let source = format!("vcl 4.1; sub {phase} {{ {statement} }}");
-        let diagnostics = compile(&source, CompileOptions::default())
-            .unwrap_err()
-            .render("absent.vcl");
-        assert!(
-            diagnostics.contains(needle),
-            "{statement} must be refused with {needle:?}:\n{diagnostics}"
-        );
-        assert!(
-            !diagnostics.contains("move this assignment to the VCL sub"),
-            "{statement} names a sub that does not own it:\n{diagnostics}"
-        );
+        let source = format!("vcl 4.1; sub {phase} {{ std.log({variable}); }}");
+        let source = source.replace("vcl 4.1;", "vcl 4.1; import std;");
+        compile(&source, CompileOptions::default())
+            .unwrap_or_else(|error| panic!("{variable} in {phase}: {error}"));
     }
 
-    // And `set req.url` in vcl_backend_fetch has a real answer.
+    // A client-side write from the backend side names the backend's copy.
     let source = "vcl 4.1; sub vcl_backend_fetch { set req.url = \"/x\"; }";
     let diagnostics = compile(source, CompileOptions::default())
         .unwrap_err()
         .render("absent.vcl");
-    assert!(diagnostics.contains("bereq.url"), "{diagnostics}");
+    assert!(diagnostics.contains("bereq"), "{diagnostics}");
 }
 
 /// The Controller template's health include, pinned.
 ///
 /// It is a *library* — no version marker — so it only reaches the compiler
 /// through an `include`, which is why nothing compiled it before and its
-/// verdicts drifted unpinned. Two things it asks for and one of them is
-/// refused: `beresp.do_gzip` would mutate an immutable body, and
-/// `beresp.ttl = 0.1s` is truncated to whole seconds with a warning rather
-/// than refused — `Cache-Control: max-age` is `delta-seconds`, so `0.1s` can
-/// only ever mean `0s` here, and refusing the file over it buys nothing the
-/// warning does not.
+/// verdicts drifted unpinned. `beresp.ttl = 0.1s` is truncated to whole
+/// seconds with a warning rather than refused: `Cache-Control: max-age` is
+/// `delta-seconds`, so `0.1s` can only ever mean `0s` here.
 #[test]
 fn the_controller_health_include_is_pinned() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/policies/controller/upstream");
@@ -260,25 +225,7 @@ fn the_controller_health_include_is_pinned() {
                 sub vcl_backend_response { return (health_backend_response); }\n";
 
     let options = CompileOptions::default().with_include_resolver(directory(&root));
-    let messages: Vec<String> = compile(main, options)
-        .unwrap_err()
-        .diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.message.clone())
-        .collect();
-    assert_eq!(
-        messages,
-        ["beresp.do_gzip would mutate an immutable response body"]
-    );
-
-    // Without the body filter, the file compiles and says what it truncated.
-    let patched = std::fs::read_to_string(root.join("traffic_router_health.vcl"))
-        .expect("read the include")
-        .replace("set beresp.do_gzip = true;", "");
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    std::fs::write(temp.path().join("traffic_router_health.vcl"), patched).expect("write include");
-    let options = CompileOptions::default().with_include_resolver(directory(temp.path()));
-    let compiled = compile(main, options).expect("the rest of the include compiles");
+    let compiled = compile(main, options).expect("the include compiles");
     let warnings = compiled.warnings.render("traffic_router_health.vcl");
     assert!(
         warnings.contains("beresp.ttl is truncated to 0s"),
@@ -286,12 +233,12 @@ fn the_controller_health_include_is_pinned() {
     );
 }
 
-/// `return (synth(...))` from `vcl_deliver`, the Varnish shape a migrated
-/// policy writes. `sub vcl_synth` is folded into *both* dispatching hooks
-/// (`docs/plans/vcl-deliver-synth.md` D3), so the decoration a 503 needs — a
-/// `Content-Type`, a `Retry-After` — is reachable from either one.
+/// `sub vcl_synth` is a hook of its own: Varnish runs it after any
+/// subroutine returns `synth(...)`, so the policy's copy runs there too,
+/// against the real synthetic response, instead of being folded into the
+/// hooks that dispatch it.
 #[test]
-fn vcl_deliver_dispatches_the_folded_vcl_synth() {
+fn vcl_synth_is_exported_as_its_own_hook() {
     let source = r#"
 vcl 4.1;
 
@@ -316,10 +263,12 @@ sub vcl_synth {
     return (deliver);
 }
 "#;
-    compile(source, CompileOptions::default()).expect("a deliver synth compiles");
+    let compiled = compile(source, CompileOptions::default()).expect("a deliver synth compiles");
+    for hook in ["on_recv", "on_deliver", "on_synth"] {
+        assert!(compiled.exports.contains(hook), "{hook}");
+    }
 
     let ir = vcl_compiler::dump_ir(source, CompileOptions::default()).expect("dump");
-    // The unoptimized section only: the later passes repeat both hooks.
     let hooks = ir
         .split_once("== lowered (O0) ==")
         .expect("lowered section")
@@ -327,120 +276,34 @@ sub vcl_synth {
         .split("\n== ")
         .next()
         .expect("section body");
-    let (recv, deliver) = hooks
-        .split_once("fn on_deliver")
-        .expect("both hooks are lowered");
-    // The fold is in each: the dispatch's own `set_outcome`, then the
-    // `vcl_synth` body's header writes, then `synthetic()`'s second outcome.
-    // That order is what lets the host discard the delivered response's
-    // headers on the transition and keep `vcl_synth`'s own.
-    for (name, body) in [("on_recv", recv), ("on_deliver", deliver)] {
-        assert_eq!(
-            body.matches("set_outcome").count(),
-            2,
-            "{name} should carry the dispatch and the folded synthetic:\n{body}"
-        );
-        assert!(
-            body.contains("\"Retry-After\""),
-            "{name} is missing the folded vcl_synth body:\n{body}"
-        );
+    let (dispatchers, synth) = hooks.split_once("fn on_synth").expect("vcl_synth is lowered");
+    assert!(!dispatchers.contains("\"Retry-After\""), "{dispatchers}");
+    assert!(synth.contains("\"Retry-After\""), "{synth}");
+    assert!(synth.contains("synth_body"), "{synth}");
+}
+
+/// The custom-status redirect idiom: any subroutine that may return
+/// `synth(...)` may name any three-digit status, and vcl_synth turns it into
+/// the response.
+#[test]
+fn a_synth_redirect_compiles() {
+    let source = r#"
+vcl 4.1;
+sub vcl_deliver {
+    if (resp.status == 404) {
+        return (synth(750, "/not-found"));
     }
 }
-
-/// The status floor, as a diagnostic. The host refuses the same statuses at
-/// runtime — that gate is the rule — but a migrated policy should hear about
-/// it at compile time, and hear *why*.
-#[test]
-fn a_deliver_synth_below_400_names_the_routing_owner() {
-    for source in [
-        "vcl 4.1; sub vcl_deliver { return (synth(301, \"moved\")); }",
-        "vcl 4.1; sub vcl_deliver { return (synth(200, \"fine\")); }",
-    ] {
-        let error = compile(source, CompileOptions::default())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("must name a status of 400 or more"),
-            "{error}"
-        );
-        assert!(error.contains("routing decision that belongs to the Varnish VCL"), "{error}");
+sub vcl_synth {
+    if (resp.status == 750) {
+        set resp.http.Location = resp.reason;
+        set resp.status = 302;
+        set resp.reason = "Found";
+        return (deliver);
     }
 }
-
-/// `sub vcl_synth` now has two hooks that can dispatch it, so it is reachable
-/// from either one — and unreachable only when neither is present.
-#[test]
-fn vcl_synth_reachability_counts_vcl_deliver() {
-    let deliver_only = "vcl 4.1; \
-         sub vcl_deliver { return (synth(503, \"nope\")); } \
-         sub vcl_synth { set resp.http.X = \"1\"; }";
-    let compiled = compile(deliver_only, CompileOptions::default())
-        .expect("vcl_deliver alone dispatches a synth");
-    assert!(
-        compiled.warnings.render("policy.vcl").is_empty(),
-        "{}",
-        compiled.warnings.render("policy.vcl")
-    );
-
-    // Neither hook present: the sub cannot be dispatched at all.
-    let orphan = "vcl 4.1; sub vcl_backend_response { return (deliver); } \
-                  sub vcl_synth { set resp.http.X = \"1\"; }";
-    let error = compile(orphan, CompileOptions::default())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("requires sub vcl_recv or sub vcl_deliver"),
-        "{error}"
-    );
-
-    // Present but never returning a synth: a warning, not an error.
-    let staged = "vcl 4.1; sub vcl_deliver { return (deliver); } \
-                  sub vcl_synth { set resp.http.X = \"1\"; }";
-    let compiled = compile(staged, CompileOptions::default()).expect("staged policy compiles");
-    let warnings = compiled.warnings.render("policy.vcl");
-    assert!(
-        warnings.contains("sub vcl_synth is never reached"),
-        "{warnings}"
-    );
-    assert!(warnings.contains("vcl_recv or vcl_deliver"), "{warnings}");
-}
-
-/// The fold is charged against the inline budget, across the whole program.
-///
-/// `attach_synth` clones the `vcl_synth` body into every `return (synth)`
-/// site and used to charge nothing for it; with the body folded into two
-/// hooks the worst case doubles, so the copies have to be budgeted rather
-/// than counted after the fact.
-#[test]
-fn an_oversized_synth_fold_is_refused() {
-    let body: String = (0..400)
-        .map(|i| format!("    set resp.http.X-{i} = \"{i}\";\n"))
-        .collect();
-    let sites: String = (0..40)
-        .map(|i| {
-            format!(
-                "    if (resp.status == {}) {{ return (synth(503)); }}\n",
-                500 + i % 60
-            )
-        })
-        .collect();
-    let source =
-        format!("vcl 4.1;\nsub vcl_deliver {{\n{sites}    return (deliver);\n}}\nsub vcl_synth {{\n{body}}}\n");
-
-    let error = compile(&source, CompileOptions::default())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("the folded sub vcl_synth exceeds the limit"),
-        "{error}"
-    );
-
-    // One site's worth of the same body is still legal, so the ceiling is the
-    // multiplier and not the body.
-    let single = format!(
-        "vcl 4.1;\nsub vcl_deliver {{\n    if (resp.status == 500) {{ return (synth(503)); }}\n    return (deliver);\n}}\nsub vcl_synth {{\n{body}}}\n"
-    );
-    compile(&single, CompileOptions::default()).expect("one dispatch site fits");
+"#;
+    compile(source, CompileOptions::default()).expect("the redirect idiom compiles");
 }
 
 /// A resolver that reads a test tree. The confinement the host applies lives

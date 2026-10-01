@@ -421,10 +421,6 @@ fn emit_op(emitter: &mut Emitter, function: &AllocatedFunction, op: &Op) -> Resu
             emitter.emit_branch_zero(function, *value, *target)?
         }
         Op::ReturnAction { action, args, .. } => emitter.emit_action(function, *action, args)?,
-        Op::Return { .. } => {
-            emitter.emit_frame_adjust(function.frame_size, true)?;
-            emitter.emit_ret();
-        }
     }
     Ok(())
 }
@@ -2018,6 +2014,7 @@ impl Emitter {
                 | Syscall::RequestGetUrl
                 | Syscall::RequestGetHeader
                 | Syscall::ResponseGetHeader
+                | Syscall::VarGetString
         ) {
             return Err(format!("{} is not a string getter", syscall.name()));
         }

@@ -151,6 +151,11 @@ pub(crate) enum Statement {
         value: Expr,
         span: Span,
     },
+    /// `hash_data(expr)`, vcl_hash only.
+    HashData {
+        value: Expr,
+        span: Span,
+    },
     Return {
         action: ReturnAction,
         span: Span,
@@ -235,10 +240,16 @@ pub(crate) enum Literal {
 pub(crate) enum ReturnAction {
     Bare,
     Hash,
+    Lookup,
     Fetch,
+    Miss,
     Pass,
     Abandon,
     Deliver,
+    Fail,
     Synth { status: u16, reason: String },
+    /// `error(status, reason)`, which hands a backend fetch to
+    /// vcl_backend_error.
+    Error { status: u16, reason: String },
     Sub(String, Span),
 }

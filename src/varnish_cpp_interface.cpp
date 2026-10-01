@@ -2,6 +2,7 @@
 #include "varnish.hpp"
 extern "C" {
 #include "update_result.h"
+#include "vcl/vcl_varnish.h"
 }
 struct CallResults {
 	long results[3];
@@ -68,12 +69,10 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* a
 	{
 		// VRT ctx can easily change even on the same request due to waitlist
 		script->set_ctx(ctx);
-		// vcl_synth has no hook of its own: the compiler folded it into the
-		// hook that returned synth(...), which staged the response.
-		if (info.idx == 3) { // ON_SYNTH
-			rvs::vcl::apply_synth(*script);
-			return 0;
-		}
+		// The tenant's name goes into every cache key it builds, so no
+		// hash_data() can collide with another tenant's objects.
+		if (info.idx == 2) // ON_HASH
+			vclv_hash_data(ctx, script->name().c_str());
 		// Each hook states its own outcome; one it does not define (a
 		// policy without vcl_deliver) is a no-op, not an error.
 		script->set_result("", 0, false);

@@ -38,7 +38,7 @@ use crate::{
 /// to prevent; it is reported rather than assumed away.
 const REQUEST_MAGIC: [u8; 4] = *b"VCLQ";
 const RESPONSE_MAGIC: [u8; 4] = *b"VCLR";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_ERR: u8 = 1;
@@ -355,7 +355,7 @@ pub enum Response {
         /// `(address, line, file)` per line-table entry.
         lines: Vec<(u64, u32, u32)>,
         files: Vec<String>,
-        exports: u8,
+        exports: u16,
         /// Compiler warnings, already rendered. Rendering quotes the tenant's
         /// source, so it happens in the guest and the host passes the strings
         /// through — the same reason a failed compile carries a rendered
@@ -408,7 +408,7 @@ impl Response {
                     put_u32(&mut out, *file);
                 }
                 put_strs(&mut out, files.iter());
-                put_u8(&mut out, *exports);
+                put_u32(&mut out, u32::from(*exports));
                 put_strs(&mut out, warnings.iter());
             }
             Self::Err { rendered } => {
@@ -438,7 +438,9 @@ impl Response {
                 for _ in 0..count {
                     files.push(reader.string("file name", Limits::MAX_NAME)?);
                 }
-                let exports = reader.u8("exports")?;
+                // Bits past the known phases are ignored, so truncating the
+                // word to them loses nothing.
+                let exports = reader.u32("exports")? as u16;
                 let count = reader.count("warnings", Limits::MAX_FILES, 4)?;
                 let mut warnings = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -771,7 +773,7 @@ mod tests {
         assert_eq!(PhaseSet::from_bits(bits), compiled.exports);
         for hook in [
             "on_recv",
-            "on_backend_request",
+            "on_backend_fetch",
             "on_backend_response",
             "on_deliver",
         ] {
@@ -781,6 +783,9 @@ mod tests {
 
     #[test]
     fn unknown_export_bits_are_ignored_rather_than_panicking() {
-        assert_eq!(PhaseSet::from_bits(0xff), PhaseSet::from_bits(0b1_1111));
+        assert_eq!(
+            PhaseSet::from_bits(0xffff),
+            PhaseSet::from_bits(0b11_1111_1111)
+        );
     }
 }

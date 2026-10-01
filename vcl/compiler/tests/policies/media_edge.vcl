@@ -17,10 +17,10 @@ sub vcl_recv {
         return (hash);
     }
     if (req.url ~ "\\?") {
-        return (synth(400, "query strings are not supported\n"));
+        return (synth(400, "query strings are not supported"));
     }
     if (req.url !~ "^/vod/[^/]+/.+\\.(m3u8|mpd|m4s|mp4|m4a|ts)$") {
-        return (synth(404, "not found\n"));
+        return (synth(404, "not found"));
     }
 
     if (req.method == "OPTIONS") {
@@ -29,12 +29,12 @@ sub vcl_recv {
              req.http.Access-Control-Request-Method != "HEAD") ||
             req.http.Access-Control-Request-Headers !~
                 "^(|[Xx]-[Pp]lay-[Tt]oken|[Rr]ange|[Xx]-[Pp]lay-[Tt]oken, ?[Rr]ange|[Rr]ange, ?[Xx]-[Pp]lay-[Tt]oken)$") {
-            return (synth(403, "forbidden\n"));
+            return (synth(403, "forbidden"));
         }
         return (pass);
     }
     if (req.method != "GET" && req.method != "HEAD") {
-        return (synth(405, "method not allowed\n"));
+        return (synth(405, "method not allowed"));
     }
 
     var token_is_valid: bool =
@@ -47,7 +47,7 @@ sub vcl_recv {
             req.url,
             req.http.X-Play-Token);
     if (!var.token_is_valid) {
-        return (synth(403, "forbidden\n"));
+        return (synth(403, "forbidden"));
     }
     set var.is_manifest = req.url ~ "\\.(m3u8|mpd)$";
     if (req.http.Range != "") {
@@ -73,7 +73,7 @@ sub vcl_backend_response {
     # discards the response the client is waiting for and answers from the
     # stale-if-error path instead. What this route means is "this one is not
     # cacheable", which is `beresp.uncacheable`.
-    if (req.method == "OPTIONS" ||
+    if (bereq.method == "OPTIONS" ||
         beresp.http.Set-Cookie != "" ||
         beresp.http.Vary != "") {
         set beresp.uncacheable = true;
@@ -87,7 +87,7 @@ sub vcl_backend_response {
                 set beresp.ttl = 1d;
             }
         }
-        var url_digest: string = digest.hash_sha256(req.url);
+        var url_digest: string = digest.hash_sha256(bereq.url);
         set beresp.http.Y-Key = var.url_digest;
         if (!var.is_manifest && beresp.http.ETag == "") {
             # Origin validators are preserved; only an undated asset gets a

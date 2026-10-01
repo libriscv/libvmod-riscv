@@ -31,7 +31,6 @@ pub(crate) fn desugar(source: &str, checked: TypedProgram) -> Result<TypedProgra
     let TypedProgram {
         subs,
         user_subs,
-        synth,
         statics,
         globals,
         acls,
@@ -40,14 +39,9 @@ pub(crate) fn desugar(source: &str, checked: TypedProgram) -> Result<TypedProgra
     } = checked;
 
     let mut warnings = warnings;
-    let synth = synth
-        .map(|sub| expand_sub(source, sub, &user_subs, &mut warnings))
-        .transpose()?;
-    let mut synth_budget =
-        SynthBudget::for_body(synth.as_ref().map(|sub| sub.statements.as_slice()));
     let mut desugared = Vec::with_capacity(subs.len());
     for sub in subs {
-        let mut sub = expand_sub(source, sub, &user_subs, &mut warnings)?;
+        let sub = expand_sub(source, sub, &user_subs, &mut warnings)?;
         if let Some((second, module)) = second_header_commit(&sub.statements) {
             return Err(Diagnostics::single(
                 source,
@@ -67,27 +61,11 @@ pub(crate) fn desugar(source: &str, checked: TypedProgram) -> Result<TypedProgra
                 ),
             ));
         }
-        // Both hooks that may `return (synth(...))` get the body folded in:
-        // `vcl_recv`, and — since `docs/plans/vcl-deliver-synth.md` D3 —
-        // `vcl_deliver`. D1 is what keeps one `sub vcl_synth` meaning one
-        // thing across the two: a deliver synth discards the response it
-        // replaces, so the sub decorates a fresh response either way.
-        if matches!(sub.phase, Phase::Recv | Phase::Deliver) {
-            if let Some(synth) = &synth {
-                let base = sub.locals.len() as u32;
-                let mut statements = synth.statements.clone();
-                shift_locals(&mut statements, base);
-                sub.locals.extend(synth.locals.iter().copied());
-                attach_synth(&mut sub.statements, &statements, &mut synth_budget)
-                    .map_err(|error| Diagnostics::single(source, error))?;
-            }
-        }
         desugared.push(sub);
     }
     let program = TypedProgram {
         subs: desugared,
         user_subs: BTreeMap::new(),
-        synth: None,
         statics,
         globals,
         acls,
@@ -145,15 +123,6 @@ fn second_header_commit(statements: &[TypedStatement]) -> Option<(Span, Module)>
                     }
                     *seen = joined;
                 }
-                // A synth dispatch ends the hook, so its body is the last
-                // thing that runs on the path that reaches it and nothing
-                // after it can be a second write.
-                TypedStatement::SynthDispatch { statements, .. } => {
-                    let mut branch = *seen;
-                    if let Some(span) = walk(statements, &mut branch) {
-                        return Some(span);
-                    }
-                }
                 TypedStatement::Inlined { body, .. } => {
                     if let Some(span) = walk(body, seen) {
                         return Some(span);
@@ -173,6 +142,9 @@ fn second_header_commit(statements: &[TypedStatement]) -> Option<(Span, Module)>
                 | TypedStatement::SetHeader { .. }
                 | TypedStatement::UnsetHeader { .. }
                 | TypedStatement::SetUrl { .. }
+                | TypedStatement::SetVar { .. }
+                | TypedStatement::SetBody { .. }
+                | TypedStatement::HashData { .. }
                 | TypedStatement::SetCacheDuration { .. }
                 | TypedStatement::SetTtl { .. }
                 | TypedStatement::SetStaleWhileRevalidate { .. }
@@ -354,6 +326,9 @@ impl Expander<'_> {
             | TypedStatement::SetHeader { .. }
             | TypedStatement::UnsetHeader { .. }
             | TypedStatement::SetUrl { .. }
+            | TypedStatement::SetVar { .. }
+            | TypedStatement::SetBody { .. }
+            | TypedStatement::HashData { .. }
             | TypedStatement::SetTtl { .. }
             | TypedStatement::SetStaleWhileRevalidate { .. }
             | TypedStatement::SetStaleIfError { .. }
@@ -362,7 +337,6 @@ impl Expander<'_> {
             | TypedStatement::Collect { .. }
             | TypedStatement::Log { .. }
             | TypedStatement::Synthetic { .. }
-            | TypedStatement::SynthDispatch { .. }
             | TypedStatement::Return { .. }) => other,
         })
     }
@@ -506,6 +480,9 @@ fn shift_locals(statements: &mut [TypedStatement], amount: u32) {
             | TypedStatement::SetGlobal { value, .. }
             | TypedStatement::SetHeader { value, .. }
             | TypedStatement::SetUrl { value, .. }
+            | TypedStatement::SetVar { value, .. }
+            | TypedStatement::SetBody { value, .. }
+            | TypedStatement::HashData { value, .. }
             | TypedStatement::SetCacheDuration { value, .. }
             | TypedStatement::Collect {
                 separator: value, ..
@@ -531,7 +508,6 @@ fn shift_locals(statements: &mut [TypedStatement], amount: u32) {
                 }
                 shift_locals(otherwise, amount);
             }
-            TypedStatement::SynthDispatch { statements, .. } => shift_locals(statements, amount),
             TypedStatement::Call { .. }
             | TypedStatement::UnsetHeader { .. }
             | TypedStatement::SetTtl { .. }
@@ -541,165 +517,16 @@ fn shift_locals(statements: &mut [TypedStatement], amount: u32) {
             | TypedStatement::Return { .. } => {}
         }
     }
-}
-
-/// The budget the `vcl_synth` fold spends, summed across the whole program.
-///
-/// [`attach_synth`] runs *after* [`expand_sub`] and clones the whole
-/// `vcl_synth` body into **every** `return (synth)` site, so the multiplier
-/// is (synth sites x synth body) — and folding the body into two hooks
-/// rather than one doubles the worst case. It is charged against the same
-/// [`MAX_INLINED_NODES`] ceiling `expand_sub` charges call-contributed
-/// statements against, in the same units, and summed over every hook rather
-/// than per sub: the copies are one program's worth of growth, and a
-/// per-sub counter would let `vcl_recv` and `vcl_deliver` each spend the
-/// whole budget.
-struct SynthBudget {
-    /// Node cost of one copy of the folded body, computed once.
-    per_site: usize,
-    spent: usize,
-}
-
-impl SynthBudget {
-    fn for_body(statements: Option<&[TypedStatement]>) -> Self {
-        SynthBudget {
-            per_site: statements.map_or(0, node_cost),
-            spent: 0,
-        }
-    }
-
-    fn charge(&mut self, span: Span) -> Result<(), Diagnostic> {
-        self.spent = self.spent.saturating_add(self.per_site);
-        if self.spent > MAX_INLINED_NODES {
-            return Err(Diagnostic::error(
-                span,
-                format!(
-                    "the folded sub vcl_synth exceeds the limit of {MAX_INLINED_NODES} \
-                     statements and expression nodes"
-                ),
-            )
-            .with_help(
-                "vcl_synth is copied into every 'return (synth(...))' site, in vcl_recv and \
-                 vcl_deliver alike; shorten it or reduce the number of dispatch sites",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// The node cost of a statement list, in the units [`Expander::block`]
-/// charges: one per statement plus its expression nodes, nested blocks
-/// included.
-fn node_cost(statements: &[TypedStatement]) -> usize {
-    statements
-        .iter()
-        .map(|statement| {
-            let nested = match statement {
-                TypedStatement::If {
-                    branches,
-                    otherwise,
-                    ..
-                } => {
-                    branches
-                        .iter()
-                        .map(|(_, body)| node_cost(body))
-                        .sum::<usize>()
-                        + node_cost(otherwise)
-                }
-                TypedStatement::Inlined { body, .. } => node_cost(body),
-                TypedStatement::SynthDispatch { statements, .. } => node_cost(statements),
-                TypedStatement::Declare { .. }
-                | TypedStatement::SetLocal { .. }
-                | TypedStatement::SetStatic { .. }
-                | TypedStatement::SetGlobal { .. }
-                | TypedStatement::Call { .. }
-                | TypedStatement::SetHeader { .. }
-                | TypedStatement::UnsetHeader { .. }
-                | TypedStatement::SetUrl { .. }
-                | TypedStatement::SetCacheDuration { .. }
-                | TypedStatement::SetTtl { .. }
-                | TypedStatement::SetStaleWhileRevalidate { .. }
-                | TypedStatement::SetStaleIfError { .. }
-                | TypedStatement::SetUncacheable { .. }
-                | TypedStatement::Collect { .. }
-                | TypedStatement::Vmod { .. }
-                | TypedStatement::Log { .. }
-                | TypedStatement::Synthetic { .. }
-                | TypedStatement::Return { .. } => 0,
-            };
-            1 + expression_nodes(statement) + nested
-        })
-        .sum()
-}
-
-fn attach_synth(
-    statements: &mut [TypedStatement],
-    synth: &[TypedStatement],
-    budget: &mut SynthBudget,
-) -> Result<(), Diagnostic> {
-    for statement in statements {
-        match statement {
-            TypedStatement::If {
-                branches,
-                otherwise,
-                ..
-            } => {
-                for (_, body) in branches {
-                    attach_synth(body, synth, budget)?;
-                }
-                attach_synth(otherwise, synth, budget)?;
-            }
-            TypedStatement::Inlined { body, .. } => attach_synth(body, synth, budget)?,
-            TypedStatement::Return {
-                action: crate::typecheck::TypedReturnAction::Synth { status, reason },
-                span,
-            } => {
-                budget.charge(*span)?;
-                *statement = TypedStatement::SynthDispatch {
-                    status: *status,
-                    initial_body: reason.clone(),
-                    statements: synth.to_vec(),
-                    span: *span,
-                };
-            }
-            TypedStatement::Call { .. }
-            | TypedStatement::Declare { .. }
-            | TypedStatement::SetLocal { .. }
-            | TypedStatement::SetStatic { .. }
-            | TypedStatement::SetGlobal { .. }
-            | TypedStatement::SetHeader { .. }
-            | TypedStatement::UnsetHeader { .. }
-            | TypedStatement::SetUrl { .. }
-            | TypedStatement::SetCacheDuration { .. }
-            | TypedStatement::SetTtl { .. }
-            | TypedStatement::SetStaleWhileRevalidate { .. }
-            | TypedStatement::SetStaleIfError { .. }
-            | TypedStatement::SetUncacheable { .. }
-            | TypedStatement::Vmod { .. }
-            | TypedStatement::Collect { .. }
-            | TypedStatement::Log { .. }
-            | TypedStatement::Synthetic { .. }
-            | TypedStatement::SynthDispatch { .. }
-            | TypedStatement::Return { .. } => {}
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn verify(program: &TypedProgram) -> Result<(), BackendError> {
-    if program.synth.is_some() || !program.user_subs.is_empty() {
+    if !program.user_subs.is_empty() {
         return Err(BackendError::without_span(
             "desugar verifier",
             "language-shaped subroutines survived desugaring",
         ));
     }
     for sub in &program.subs {
-        if sub.phase == Phase::Synth {
-            return Err(BackendError::without_span(
-                "desugar verifier",
-                "vcl_synth survived as an exported hook",
-            ));
-        }
         verify_block(&sub.statements, sub.locals.len(), program.statics.len())?;
     }
     Ok(())
@@ -885,6 +712,9 @@ fn verify_block(
             TypedStatement::SetGlobal { value, .. }
             | TypedStatement::SetHeader { value, .. }
             | TypedStatement::SetUrl { value, .. }
+            | TypedStatement::SetVar { value, .. }
+            | TypedStatement::SetBody { value, .. }
+            | TypedStatement::HashData { value, .. }
             | TypedStatement::Collect {
                 separator: value, ..
             }
@@ -908,10 +738,7 @@ fn verify_block(
                 }
                 verify_block(otherwise, locals, statics)?;
             }
-            TypedStatement::Inlined { body, .. }
-            | TypedStatement::SynthDispatch {
-                statements: body, ..
-            } => {
+            TypedStatement::Inlined { body, .. } => {
                 verify_block(body, locals, statics)?;
             }
             TypedStatement::UnsetHeader { .. }
@@ -948,6 +775,9 @@ fn statement_span(statement: &TypedStatement) -> Span {
         | TypedStatement::SetHeader { span, .. }
         | TypedStatement::UnsetHeader { span, .. }
         | TypedStatement::SetUrl { span, .. }
+        | TypedStatement::SetVar { span, .. }
+        | TypedStatement::SetBody { span, .. }
+        | TypedStatement::HashData { span, .. }
         | TypedStatement::SetCacheDuration { span, .. }
         | TypedStatement::SetTtl { span, .. }
         | TypedStatement::SetStaleWhileRevalidate { span, .. }
@@ -957,7 +787,6 @@ fn statement_span(statement: &TypedStatement) -> Span {
         | TypedStatement::Collect { span, .. }
         | TypedStatement::Log { span, .. }
         | TypedStatement::Synthetic { span, .. }
-        | TypedStatement::SynthDispatch { span, .. }
         | TypedStatement::If { span, .. }
         | TypedStatement::Return { span, .. } => *span,
     }
@@ -1024,11 +853,12 @@ fn fold_cache_duration(
         | Lowering::ResponseHeader
         | Lowering::RequestUrl
         | Lowering::RequestMethod
-        | Lowering::ResponseStatus
         | Lowering::Now
         | Lowering::ClientIp
         | Lowering::Uncacheable
-        | Lowering::CacheHit => {
+        | Lowering::CacheHit
+        | Lowering::Body
+        | Lowering::Host(_) => {
             return Err(Diagnostic::error(
                 target_span,
                 "non-duration variable reached cache-duration desugaring",

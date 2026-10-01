@@ -21,8 +21,13 @@ vclv_phase(VRT_CTX)
 {
 	switch (ctx->method) {
 	case VCL_MET_RECV:             return (VCL_PHASE_RECV);
+	case VCL_MET_HASH:             return (VCL_PHASE_HASH);
+	case VCL_MET_HIT:              return (VCL_PHASE_HIT);
+	case VCL_MET_MISS:             return (VCL_PHASE_MISS);
+	case VCL_MET_PASS:             return (VCL_PHASE_PASS);
 	case VCL_MET_BACKEND_FETCH:    return (VCL_PHASE_BACKEND_FETCH);
 	case VCL_MET_BACKEND_RESPONSE: return (VCL_PHASE_BACKEND_RESPONSE);
+	case VCL_MET_BACKEND_ERROR:    return (VCL_PHASE_BACKEND_ERROR);
 	case VCL_MET_DELIVER:          return (VCL_PHASE_DELIVER);
 	case VCL_MET_SYNTH:            return (VCL_PHASE_SYNTH);
 	default:                       return (VCL_PHASE_NONE);
@@ -34,6 +39,10 @@ vclv_http(VRT_CTX, enum vcl_side side)
 {
 	switch (vclv_phase(ctx)) {
 	case VCL_PHASE_RECV:
+	case VCL_PHASE_HASH:
+	case VCL_PHASE_HIT:
+	case VCL_PHASE_MISS:
+	case VCL_PHASE_PASS:
 		return (side == VCL_SIDE_REQUEST ? ctx->http_req : NULL);
 	case VCL_PHASE_DELIVER:
 	case VCL_PHASE_SYNTH:
@@ -41,6 +50,7 @@ vclv_http(VRT_CTX, enum vcl_side side)
 	case VCL_PHASE_BACKEND_FETCH:
 		return (side == VCL_SIDE_REQUEST ? ctx->http_bereq : NULL);
 	case VCL_PHASE_BACKEND_RESPONSE:
+	case VCL_PHASE_BACKEND_ERROR:
 		return (side == VCL_SIDE_REQUEST ? ctx->http_bereq : ctx->http_beresp);
 	case VCL_PHASE_NONE:
 		break;
@@ -212,12 +222,6 @@ vclv_set_duration(VRT_CTX, enum vcl_duration which, double seconds)
 	}
 }
 
-void
-vclv_set_uncacheable(VRT_CTX)
-{
-	VRT_l_beresp_uncacheable(ctx, 1);
-}
-
 int
 vclv_client_ip(VRT_CTX, unsigned char out[16])
 {
@@ -254,34 +258,251 @@ vclv_cache_status(VRT_CTX)
 	return (VRT_r_obj_ttl(ctx) <= 0 ? 2 : 0);
 }
 
-int
-vclv_set_reason(VRT_CTX, const char *reason, size_t len)
-{
-	char *copy;
+/* ── Variables by number ──────────────────────────────────────────── */
 
-	if (ctx->method != VCL_MET_SYNTH || len > INT_MAX)
+#define MET_CLIENT	(VCL_MET_RECV | VCL_MET_HASH | VCL_MET_HIT | \
+			 VCL_MET_MISS | VCL_MET_PASS | VCL_MET_DELIVER | \
+			 VCL_MET_SYNTH)
+#define MET_BACKEND	(VCL_MET_BACKEND_FETCH | VCL_MET_BACKEND_RESPONSE | \
+			 VCL_MET_BACKEND_ERROR)
+#define MET_BERESP	(VCL_MET_BACKEND_RESPONSE | VCL_MET_BACKEND_ERROR)
+#define MET_RESP	(VCL_MET_DELIVER | VCL_MET_SYNTH)
+#define MET_HIT_DELIVER	(VCL_MET_HIT | VCL_MET_DELIVER)
+
+enum vclv_type { T_STRING, T_INT, T_BOOL, T_DURATION };
+
+/* Where Varnish lets each variable be read and written. A VRT accessor
+   asserts on the objects its subroutine has, so this table is what keeps
+   a tenant from reaching one where it would panic varnishd. It mirrors
+   vcl/compiler/src/vcl_vars.def, which refuses the same at compile time. */
+static const struct {
+	enum vclv_type	type;
+	unsigned	rd;
+	unsigned	wr;
+} vclv_vars[] = {
+	[VCLV_METHOD]		= { T_STRING, 0, MET_CLIENT | MET_BACKEND },
+	[VCLV_XID]		= { T_STRING, MET_CLIENT | MET_BACKEND, 0 },
+	[VCLV_RESTARTS]		= { T_INT, MET_CLIENT, 0 },
+	[VCLV_ESI_LEVEL]	= { T_INT, MET_CLIENT, 0 },
+	[VCLV_CAN_GZIP]		= { T_BOOL, MET_CLIENT, 0 },
+	[VCLV_HASH_ALWAYS_MISS]	= { T_BOOL, MET_CLIENT, MET_CLIENT },
+	[VCLV_HASH_IGNORE_BUSY]	= { T_BOOL, MET_CLIENT, MET_CLIENT },
+	[VCLV_BEREQ_RETRIES]	= { T_INT, MET_BACKEND, 0 },
+	[VCLV_BEREQ_UNCACHEABLE] = { T_BOOL, MET_BACKEND, 0 },
+	[VCLV_BEREQ_IS_BGFETCH]	= { T_BOOL, MET_BACKEND, 0 },
+	[VCLV_BERESP_STATUS]	= { T_INT, MET_BERESP, MET_BERESP },
+	[VCLV_BERESP_REASON]	= { T_STRING, MET_BERESP, MET_BERESP },
+	[VCLV_BERESP_DO_STREAM]	= { T_BOOL, MET_BERESP, MET_BERESP },
+	[VCLV_BERESP_DO_GZIP]	= { T_BOOL, MET_BERESP, MET_BERESP },
+	[VCLV_BERESP_DO_GUNZIP]	= { T_BOOL, MET_BERESP, MET_BERESP },
+	[VCLV_BERESP_AGE]	= { T_DURATION, MET_BERESP, 0 },
+	[VCLV_BERESP_UNCACHEABLE] = { T_BOOL, MET_BERESP, MET_BERESP },
+	[VCLV_OBJ_STATUS]	= { T_INT, VCL_MET_HIT, 0 },
+	[VCLV_OBJ_REASON]	= { T_STRING, VCL_MET_HIT, 0 },
+	[VCLV_OBJ_HITS]		= { T_INT, MET_HIT_DELIVER, 0 },
+	[VCLV_OBJ_TTL]		= { T_DURATION, MET_HIT_DELIVER, 0 },
+	[VCLV_OBJ_GRACE]	= { T_DURATION, MET_HIT_DELIVER, 0 },
+	[VCLV_OBJ_KEEP]		= { T_DURATION, MET_HIT_DELIVER, 0 },
+	[VCLV_OBJ_AGE]		= { T_DURATION, MET_HIT_DELIVER, 0 },
+	[VCLV_OBJ_UNCACHEABLE]	= { T_BOOL, VCL_MET_DELIVER, 0 },
+	[VCLV_RESP_STATUS]	= { T_INT, MET_RESP, MET_RESP },
+	[VCLV_RESP_REASON]	= { T_STRING, MET_RESP, MET_RESP },
+	[VCLV_SERVER_HOSTNAME]	= { T_STRING, MET_CLIENT | MET_BACKEND, 0 },
+	[VCLV_SERVER_IDENTITY]	= { T_STRING, MET_CLIENT | MET_BACKEND, 0 },
+	[VCLV_REQUEST_PROTO]	= { T_STRING, MET_CLIENT | MET_BACKEND, 0 },
+	[VCLV_RESPONSE_PROTO]	= { T_STRING, MET_RESP | MET_BERESP, 0 },
+	[VCLV_OBJ_PROTO]	= { T_STRING, VCL_MET_HIT, 0 },
+};
+
+static int
+vclv_known(int id)
+{
+	return (id > 0 && id < (int)(sizeof vclv_vars / sizeof vclv_vars[0])
+	    && (vclv_vars[id].rd | vclv_vars[id].wr) != 0);
+}
+
+int
+vclv_var_is_string(int id)
+{
+	return (vclv_known(id) && vclv_vars[id].type == T_STRING);
+}
+
+static int
+vclv_backend(VRT_CTX)
+{
+	return ((ctx->method & MET_BACKEND) != 0);
+}
+
+/* VCL_DURATION is seconds as a double; the policy ABI is nanoseconds. */
+static int64_t
+vclv_nanos(VCL_DURATION d)
+{
+	if (d != d)
+		return (0);
+	if (d > 9.2e9)
+		return (INT64_MAX);
+	if (d < -9.2e9)
+		return (INT64_MIN);
+	return ((int64_t)(d * 1e9));
+}
+
+int
+vclv_var_get_int(VRT_CTX, int id, int64_t *out)
+{
+	if (!vclv_known(id) || vclv_vars[id].type == T_STRING
+	    || (vclv_vars[id].rd & ctx->method) == 0)
 		return (-1);
-	CHECK_OBJ_NOTNULL(ctx->http_resp, HTTP_MAGIC);
-	copy = WS_Copy(ctx->http_resp->ws, reason, (int)len + 1);
-	if (copy == NULL)
+	switch (id) {
+	case VCLV_RESTARTS:	*out = VRT_r_req_restarts(ctx); break;
+	case VCLV_ESI_LEVEL:	*out = VRT_r_req_esi_level(ctx); break;
+	case VCLV_CAN_GZIP:	*out = VRT_r_req_can_gzip(ctx); break;
+	case VCLV_HASH_ALWAYS_MISS: *out = VRT_r_req_hash_always_miss(ctx); break;
+	case VCLV_HASH_IGNORE_BUSY: *out = VRT_r_req_hash_ignore_busy(ctx); break;
+	case VCLV_BEREQ_RETRIES: *out = VRT_r_bereq_retries(ctx); break;
+	case VCLV_BEREQ_UNCACHEABLE: *out = VRT_r_bereq_uncacheable(ctx); break;
+	case VCLV_BEREQ_IS_BGFETCH: *out = VRT_r_bereq_is_bgfetch(ctx); break;
+	case VCLV_BERESP_STATUS: *out = VRT_r_beresp_status(ctx); break;
+	case VCLV_BERESP_DO_STREAM: *out = VRT_r_beresp_do_stream(ctx); break;
+	case VCLV_BERESP_DO_GZIP: *out = VRT_r_beresp_do_gzip(ctx); break;
+	case VCLV_BERESP_DO_GUNZIP: *out = VRT_r_beresp_do_gunzip(ctx); break;
+	case VCLV_BERESP_AGE:	*out = vclv_nanos(VRT_r_beresp_age(ctx)); break;
+	case VCLV_BERESP_UNCACHEABLE: *out = VRT_r_beresp_uncacheable(ctx); break;
+	case VCLV_OBJ_STATUS:	*out = VRT_r_obj_status(ctx); break;
+	case VCLV_OBJ_HITS:	*out = VRT_r_obj_hits(ctx); break;
+	case VCLV_OBJ_TTL:	*out = vclv_nanos(VRT_r_obj_ttl(ctx)); break;
+	case VCLV_OBJ_GRACE:	*out = vclv_nanos(VRT_r_obj_grace(ctx)); break;
+	case VCLV_OBJ_KEEP:	*out = vclv_nanos(VRT_r_obj_keep(ctx)); break;
+	case VCLV_OBJ_AGE:	*out = vclv_nanos(VRT_r_obj_age(ctx)); break;
+	case VCLV_OBJ_UNCACHEABLE: *out = VRT_r_obj_uncacheable(ctx); break;
+	case VCLV_RESP_STATUS:	*out = VRT_r_resp_status(ctx); break;
+	default:
 		return (-1);
-	copy[len] = '\0';
-	http_SetH(ctx->http_resp, HTTP_HDR_REASON, copy);
+	}
 	return (0);
 }
 
 int
-vclv_synth_body(VRT_CTX, const char *body, size_t len)
+vclv_var_get_string(VRT_CTX, int id, const char **out)
 {
-	struct vsb *vsb;
+	const char *s;
 
-	if (ctx->method != VCL_MET_SYNTH || len > INT_MAX)
+	if (!vclv_known(id) || vclv_vars[id].type != T_STRING
+	    || (vclv_vars[id].rd & ctx->method) == 0)
 		return (-1);
-	vsb = (struct vsb *)ctx->specific;
-	AN(vsb);
-	VSB_clear(vsb);
-	VSB_bcat(vsb, body, (ssize_t)len);
+	switch (id) {
+	case VCLV_XID:
+		s = vclv_backend(ctx) ? VRT_r_bereq_xid(ctx) : VRT_r_req_xid(ctx);
+		break;
+	case VCLV_BERESP_REASON: s = VRT_r_beresp_reason(ctx); break;
+	case VCLV_OBJ_REASON:	s = VRT_r_obj_reason(ctx); break;
+	case VCLV_RESP_REASON:	s = VRT_r_resp_reason(ctx); break;
+	case VCLV_SERVER_HOSTNAME: s = VRT_r_server_hostname(ctx); break;
+	case VCLV_SERVER_IDENTITY: s = VRT_r_server_identity(ctx); break;
+	case VCLV_REQUEST_PROTO:
+		s = vclv_backend(ctx) ? VRT_r_bereq_proto(ctx) : VRT_r_req_proto(ctx);
+		break;
+	case VCLV_RESPONSE_PROTO:
+		s = vclv_backend(ctx) ? VRT_r_beresp_proto(ctx) : VRT_r_resp_proto(ctx);
+		break;
+	case VCLV_OBJ_PROTO:	s = VRT_r_obj_proto(ctx); break;
+	default:
+		return (-1);
+	}
+	*out = s != NULL ? s : "";
 	return (0);
+}
+
+/* A status Varnish would take: three digits. Varnish itself accepts more
+   (a status past 999 carries a custom reason), but the policy ABI keeps to
+   what reaches the wire. */
+static int
+vclv_status_ok(int64_t v)
+{
+	return (v >= 100 && v <= 999);
+}
+
+int
+vclv_var_set_int(VRT_CTX, int id, int64_t v)
+{
+	if (!vclv_known(id) || vclv_vars[id].type == T_STRING
+	    || (vclv_vars[id].wr & ctx->method) == 0)
+		return (-1);
+	switch (id) {
+	case VCLV_HASH_ALWAYS_MISS: VRT_l_req_hash_always_miss(ctx, v != 0); break;
+	case VCLV_HASH_IGNORE_BUSY: VRT_l_req_hash_ignore_busy(ctx, v != 0); break;
+	case VCLV_BERESP_STATUS:
+		if (!vclv_status_ok(v))
+			return (-1);
+		VRT_l_beresp_status(ctx, v);
+		break;
+	case VCLV_BERESP_DO_STREAM: VRT_l_beresp_do_stream(ctx, v != 0); break;
+	case VCLV_BERESP_DO_GZIP: VRT_l_beresp_do_gzip(ctx, v != 0); break;
+	case VCLV_BERESP_DO_GUNZIP: VRT_l_beresp_do_gunzip(ctx, v != 0); break;
+	case VCLV_BERESP_UNCACHEABLE: VRT_l_beresp_uncacheable(ctx, v != 0); break;
+	case VCLV_RESP_STATUS:
+		if (!vclv_status_ok(v))
+			return (-1);
+		VRT_l_resp_status(ctx, v);
+		break;
+	default:
+		return (-1);
+	}
+	return (0);
+}
+
+int
+vclv_var_set_string(VRT_CTX, int id, const char *v)
+{
+	if (!vclv_known(id) || vclv_vars[id].type != T_STRING
+	    || (vclv_vars[id].wr & ctx->method) == 0)
+		return (-1);
+	switch (id) {
+	case VCLV_METHOD:
+		if (vclv_backend(ctx))
+			VRT_l_bereq_method(ctx, v, vrt_magic_string_end);
+		else
+			VRT_l_req_method(ctx, v, vrt_magic_string_end);
+		break;
+	case VCLV_BERESP_REASON:
+		VRT_l_beresp_reason(ctx, v, vrt_magic_string_end);
+		break;
+	case VCLV_RESP_REASON:
+		VRT_l_resp_reason(ctx, v, vrt_magic_string_end);
+		break;
+	default:
+		return (-1);
+	}
+	return (0);
+}
+
+int
+vclv_hash_data(VRT_CTX, const char *data)
+{
+	if (ctx->method != VCL_MET_HASH || ctx->specific == NULL)
+		return (-1);
+	VRT_hashdata(ctx, data, vrt_magic_string_end);
+	return (0);
+}
+
+int
+vclv_synth_body(VRT_CTX, int replace, const char *body)
+{
+	switch (ctx->method) {
+	case VCL_MET_SYNTH:
+		if (replace)
+			VRT_l_resp_body(ctx, body, vrt_magic_string_end);
+		else
+			VRT_synth_page(ctx, body, vrt_magic_string_end);
+		return (0);
+	case VCL_MET_BACKEND_ERROR:
+		if (replace)
+			VRT_l_beresp_body(ctx, body, vrt_magic_string_end);
+		else
+			VRT_synth_page(ctx, body, vrt_magic_string_end);
+		return (0);
+	default:
+		return (-1);
+	}
 }
 
 void
@@ -386,4 +607,10 @@ vclv_stat_alloc(const char *tenant, const char *name, const char *help,
 	if (word == NULL)
 		VSB_destroy(&vsb);
 	return (word);
+}
+
+void
+vclv_fail(VRT_CTX, const char *msg)
+{
+	VRT_fail(ctx, "%s", msg);
 }

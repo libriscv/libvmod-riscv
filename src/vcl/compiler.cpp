@@ -36,7 +36,7 @@ static constexpr size_t MAX_RENDERED = 1024 * 1024;
 static constexpr size_t MAX_NAME = 4096;
 static constexpr size_t MAX_RESPONSE = MAX_ELF + 16 * MAX_LINE_ENTRIES
 	+ (MAX_INCLUDE_FILES + 1) * (MAX_NAME + MAX_RENDERED) + 64;
-static constexpr uint32_t WIRE_VERSION = 1;
+static constexpr uint32_t WIRE_VERSION = 2;
 
 /* ── Include session ────────────────────────────────────────────────── */
 
@@ -216,7 +216,7 @@ static Compiled decode_response(const std::string& buffer)
 	const uint32_t files = r.count("file list", MAX_INCLUDE_FILES, 4);
 	for (uint32_t i = 0; i < files; i++)
 		r.bytes("file name", MAX_NAME);
-	r.u8("exports");
+	r.u32("exports");
 	const uint32_t warnings = r.count("warnings", MAX_INCLUDE_FILES, 4);
 	for (uint32_t i = 0; i < warnings; i++)
 		result.warnings.push_back(r.bytes("warning", MAX_RENDERED));

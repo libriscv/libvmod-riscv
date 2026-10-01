@@ -53,13 +53,27 @@ static constexpr int64_t TYPED_CACHE_DURATION      = 27;
    only while a compile runs on the calling thread (compiler.cpp). */
 static constexpr int64_t TYPED_INCLUDE_READ        = 28;
 static constexpr int64_t TYPED_CACHE_STATUS        = 31;
+/* Varnish variables by number (vclv_var in vcl_varnish.h). */
+static constexpr int64_t TYPED_VAR_GET_STRING      = 32;
+static constexpr int64_t TYPED_VAR_GET_SCALAR      = 33;
+static constexpr int64_t TYPED_VAR_SET_SCALAR      = 34;
+static constexpr int64_t TYPED_VAR_SET_STRING      = 35;
+static constexpr int64_t TYPED_HASH_DATA           = 36;
+static constexpr int64_t TYPED_SYNTH_BODY          = 37;
 
-/* Outcome codes (return_action, set_outcome_plain). */
+/* Outcome codes (return_action, set_outcome_plain), the compiler's
+   ActionCode. ACTION_NEXT is a hook that ended without a return. */
 static constexpr int64_t ACTION_NEXT    = 0;
 static constexpr int64_t ACTION_PASS    = 1;
 static constexpr int64_t ACTION_DELIVER = 2;
-static constexpr int64_t ACTION_SYNTH   = 3;
+static constexpr int64_t ACTION_SYNTH   = 3;  /* status, reason */
 static constexpr int64_t ACTION_ABANDON = 4;
+static constexpr int64_t ACTION_HASH    = 5;
+static constexpr int64_t ACTION_LOOKUP  = 6;
+static constexpr int64_t ACTION_FETCH   = 7;
+static constexpr int64_t ACTION_MISS    = 8;
+static constexpr int64_t ACTION_ERROR   = 9;  /* status, reason */
+static constexpr int64_t ACTION_FAIL    = 10;
 
 static constexpr uint64_t FAILED = UINT64_MAX;
 /* A regex the host will not run: distinct from "did not match", because

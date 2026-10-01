@@ -249,7 +249,8 @@ impl CompileOptions {
             | vars::Lowering::ResponseHeader
             | vars::Lowering::RequestUrl
             | vars::Lowering::RequestMethod
-            | vars::Lowering::ResponseStatus
+            | vars::Lowering::Body
+            | vars::Lowering::Host(_)
             | vars::Lowering::Now
             | vars::Lowering::ClientIp
             | vars::Lowering::Ttl
@@ -1082,24 +1083,19 @@ sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
                 "backends and directors belong to the Varnish VCL",
             ),
             (
-                "vcl 4.1; sub vcl_hash {}",
-                &ordinary,
-                "the cache key belongs to the Varnish VCL",
-            ),
-            (
                 "vcl 4.1; sub vcl_recv { hash_data(req.url); }",
                 &ordinary,
-                "the cache key belongs to the Varnish VCL",
-            ),
-            (
-                "vcl 4.1; sub vcl_recv { set req.url = \"/other\"; }",
-                &ordinary,
-                "rewriting req.url and Host belongs to the Varnish VCL",
+                "hash_data() is only valid in vcl_hash",
             ),
             (
                 "vcl 4.1; sub vcl_recv { set req.http.Host = \"other\"; }",
                 &ordinary,
-                "rewriting req.url and Host belongs to the Varnish VCL",
+                "req.http.Host picked this tenant",
+            ),
+            (
+                "vcl 4.1; sub vcl_hit { unset req.http.host; }",
+                &ordinary,
+                "req.http.Host picked this tenant",
             ),
             (
                 "vcl 4.1; sub vcl_recv { set req.http.X-Variant = \"a\"; }",
@@ -1107,12 +1103,22 @@ sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
                 "the header is part of the cache key",
             ),
             (
+                "vcl 4.1; sub vcl_recv { set req.url = \"has space\"; }",
+                &ordinary,
+                "cannot be empty or contain spaces",
+            ),
+            (
+                "vcl 4.1; sub vcl_backend_response { set req.url = \"/x\"; }",
+                &ordinary,
+                "the backend side writes its own copy of the request, bereq",
+            ),
+            (
                 "vcl 4.1; sub vcl_recv { return (restart); }",
                 &ordinary,
                 "host-controlled",
             ),
             (
-                "vcl 4.1; sub vcl_recv { return (retry); }",
+                "vcl 4.1; sub vcl_backend_response { return (retry); }",
                 &ordinary,
                 "host-controlled",
             ),
@@ -1127,34 +1133,19 @@ sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
                 "purging belongs to the Varnish VCL",
             ),
             (
-                "vcl 4.1; sub vcl_backend_response { set beresp.do_gzip = true; }",
+                "vcl 4.1; sub vcl_purge {}",
                 &ordinary,
-                "immutable response body",
-            ),
-            (
-                "vcl 4.1; sub vcl_backend_response { set beresp.do_gunzip = true; }",
-                &ordinary,
-                "store a separate representation",
+                "not a hook a tenant policy can define",
             ),
             (
                 "vcl 4.1; sub vcl_backend_response { set beresp.do_esi = true; }",
                 &ordinary,
-                "immutable response body",
-            ),
-            (
-                "vcl 4.1; sub vcl_backend_response { set beresp.do_stream = true; }",
-                &ordinary,
-                "store a separate representation",
+                "an include may name another tenant's site",
             ),
             (
                 "vcl 4.1; sub vcl_recv { synthetic(\"body\"); }",
                 &ordinary,
-                "only valid in vcl_synth",
-            ),
-            (
-                "vcl 4.1; sub vcl_deliver { return (synth(302, \"over there\")); }",
-                &ordinary,
-                "must name a status of 400 or more",
+                "only valid in vcl_synth and vcl_backend_error",
             ),
             (
                 "vcl 4.1; import cookie; sub vcl_recv {}",
@@ -1167,9 +1158,9 @@ sub vcl_recv { set var.blocked = var.blocked + 1; return (hash); }"#;
                 "integer or duration arithmetic",
             ),
             (
-                "vcl 4.1; sub vcl_hit {}",
+                "vcl 4.1; sub vcl_hit { set req.storage = \"s0\"; }",
                 &ordinary,
-                "not a hook a tenant policy can define",
+                "storage selection belongs to the Varnish VCL",
             ),
         ];
 

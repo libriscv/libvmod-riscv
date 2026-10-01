@@ -16,9 +16,9 @@ The host side lives in `src/vcl/`:
 | File | What it does |
 |---|---|
 | `compiler.cpp` | Runs `vclc.elf` in a fresh machine per compile, answers its includes (confined to the policy's directory), and decodes the answer under hard caps. |
-| `vcl_program.cpp` | Loads a compiled policy: compiles its regex literals (`.carapace.regex`), seeds its request globals (`.carapace.globals`) into the master VM, binds its statistics (`.carapace.stats`), maps its hooks to the VMOD callbacks, and stages a folded `vcl_synth`. |
+| `vcl_program.cpp` | Loads a compiled policy: compiles its regex literals (`.carapace.regex`), seeds its request globals (`.carapace.globals`) into the master VM, binds its statistics (`.carapace.stats`), and maps its hooks to the VMOD callbacks. |
 | `vcl_stats.cpp` | Statistics: the tenant counter registry, and the fold of each statistic word into its Varnish counter after every hook. |
-| `vcl_syscalls.cpp` | The policy ABI the generated code calls, at syscalls 540..=560 (`abi.hpp`). |
+| `vcl_syscalls.cpp` | The policy ABI the generated code calls, at syscalls 540..=560 (`abi.hpp`), and the gates on each call. |
 | `vcl_varnish.c` | Everything that touches Varnish's own objects, in C against `cache/cache.h`. |
 
 ## The ABI
@@ -29,13 +29,31 @@ and the native heap helpers (580..). `define_syscalls!` in
 `compiler/src/ir.rs` and `src/vcl/abi.hpp` are the two halves; change both
 together.
 
-Differences from Carapace, all on the host side:
+Differences from Carapace:
 
+- The language is Varnish Enterprise's rather than Carapace's subset. Every
+  Varnish subroutine a tenant can reach is a hook of its own: `on_recv`,
+  `on_hash`, `on_hit`, `on_miss`, `on_pass`, `on_deliver`, `on_synth`,
+  `on_backend_fetch`, `on_backend_response` and `on_backend_error`.
+  `vcl_synth` is no longer folded into the hooks that return `synth(...)`.
+  The variables and return actions follow Varnish's tables
+  (`compiler/src/vcl_vars.def`, `check_return_action` in
+  `compiler/src/typecheck.rs`), less what a tenant is denied. `req.*` is the
+  client side and `bereq.*` the backend side, as in Varnish, where Carapace
+  let the backend phases read the client request.
 - Header edits go straight to Varnish's header maps, instead of being
   recorded and replayed after the phase.
-- Carapace has no `vcl_synth`, so the compiler folds it into the hook that
-  returns `synth(...)`. Its `resp` writes and `synthetic()` are staged and
-  applied when `riscv.run()` is called from `vcl_synth`.
+- Most variables go through one pair of calls, `TYPED_VAR_GET_*` and
+  `TYPED_VAR_SET_*`, by a number: the compiler's `HostVar`, and `vclv_var` in
+  `src/vcl/vcl_varnish.h`. The host gates each number by `ctx->method` with a
+  table that mirrors `vcl_vars.def`. That gate is what stops a hand-written
+  ELF from calling a `VRT_r_obj_*` accessor where it would assert.
+- `return (...)` codes are the compiler's `ActionCode` and the host's
+  `ACTION_*`. The host checks each against Varnish's return table and
+  reports it as `riscv.want_result()`.
+- The client's `Host` is read-only. It picked the tenant, so the host refuses
+  a write to it even from an ELF the compiler did not make. In `vcl_hash` the
+  VMOD feeds the tenant's name into the key before the hook runs.
 - Regular expressions are Varnish's (PCRE). The compiler still validates
   patterns against its own, stricter rules.
 - A plain `static var` is refused, because each request runs in a fresh fork

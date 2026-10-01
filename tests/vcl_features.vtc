@@ -36,34 +36,7 @@ varnish v1 -arg "-p workspace_client=128k" -arg "-p workspace_backend=128k" -vcl
 		riscv.finalize_tenants();
 	}
 
-	sub vcl_recv {
-		if (!riscv.fork(req.http.Host)) {
-			return (synth(500, "no tenant"));
-		}
-		riscv.run();
-		if (riscv.want_result() == "synth") {
-			return (synth(riscv.want_status()));
-		}
-		return (hash);
-	}
-
-	sub vcl_backend_fetch {
-		if (riscv.fork(bereq.http.Host)) {
-			riscv.run();
-		}
-	}
-
-	sub vcl_backend_response {
-		if (riscv.active()) {
-			riscv.run();
-		}
-	}
-
-	sub vcl_deliver {
-		if (riscv.active()) {
-			riscv.run();
-		}
-	}
+	include "${testdir}/vcl_router.vcl";
 } -start
 
 client c1 {

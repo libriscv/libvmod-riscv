@@ -150,9 +150,15 @@ sub vcl_recv {
     return (hash);
 }
 
+sub vcl_hash {
+    hash_data(req.url);
+    return (lookup);
+}
+
 sub vcl_synth {
     set resp.http.Content-Type = "text/plain";
     synthetic("no");
+    return (deliver);
 }
 
 sub vcl_backend_response {
@@ -160,7 +166,9 @@ sub vcl_backend_response {
 }
 ```
 
-The surrounding VCL forks the tenant in each task and calls `riscv.run()` in each subroutine the tenant may define:
+The surrounding VCL forks the tenant in each subroutine and dispatches the return action. `riscv.run()` executes the tenant's hook for the current subroutine. `riscv.want_result()` returns the action string: `"hash"`, `"lookup"`, `"pass"`, `"miss"`, `"fetch"`, `"deliver"`, `"synth"`, `"error"` or `"abandon"`. It returns `""` when the tenant has no hook for the subroutine or the hook did not return an action, in which case the surrounding VCL falls through to Varnish's built-in behavior. `riscv.want_status()` and `riscv.want_reason()` return the arguments of `synth(...)` and `error(...)`. `return (fail)` calls `VRT_fail` on the subroutine.
+
+[`tests/vcl_router.vcl`](tests/vcl_router.vcl) is a complete surrounding VCL covering every subroutine. In short:
 
 ```vcl
 sub vcl_init {
@@ -172,60 +180,107 @@ sub vcl_init {
 
 sub vcl_recv {
     if (!riscv.fork(req.http.Host)) {
-        return (synth(403));
+        return (synth(404));
     }
     riscv.run();
     if (riscv.want_result() == "synth") {
-        return (synth(riscv.want_status()));
-    }
-    if (riscv.want_result() == "pass") {
+        return (synth(riscv.want_status(), riscv.want_reason()));
+    } else if (riscv.want_result() == "pass") {
         return (pass);
+    } else if (riscv.want_result() == "hash") {
+        return (hash);
     }
 }
 
+sub vcl_hash {
+    riscv.run();
+    if (riscv.want_result() == "lookup") {
+        return (lookup);
+    }
+}
+
+# vcl_hit, vcl_miss, vcl_pass and vcl_deliver: the same, for their actions.
+
 sub vcl_synth {
     if (riscv.active()) {
-        riscv.run();     # applies the tenant's vcl_synth
-        return (deliver);
+        riscv.run();
+        if (riscv.want_result() == "deliver") {
+            return (deliver);
+        }
     }
 }
 
 sub vcl_backend_fetch {
-    if (riscv.fork(bereq.http.Host)) {
-        riscv.run();
+    if (!riscv.fork(bereq.http.Host)) {
+        return (error(503));
+    }
+    riscv.run();
+    if (riscv.want_result() == "error") {
+        return (error(riscv.want_status(), riscv.want_reason()));
+    } else if (riscv.want_result() == "abandon") {
+        return (abandon);
     }
 }
 
-sub vcl_backend_response {
-    if (riscv.active()) {
-        riscv.run();
-        if (riscv.want_result() == "abandon") {
-            return (abandon);
-        }
+# vcl_backend_response and vcl_backend_error: the same, for their actions.
+```
+
+Tenant VCL follows Varnish Enterprise VCL, with the same subroutines, variables, return actions and scope rules:
+- Subroutines: `vcl_recv`, `vcl_hash`, `vcl_hit`, `vcl_miss`, `vcl_pass`, `vcl_deliver`, `vcl_synth`, `vcl_backend_fetch`, `vcl_backend_response` and `vcl_backend_error`.
+- Return actions: `hash`, `lookup`, `miss`, `fetch`, `pass`, `deliver`, `abandon`, `synth(status, "reason")`, `error(status, "reason")` and `fail`. Custom-status `synth` works as usual, e.g. `return (synth(750, "/elsewhere"))` handled by a redirect in `vcl_synth`.
+- `hash_data()` in `vcl_hash`. `synthetic()`, `set resp.body` and `set beresp.body` in `vcl_synth` and `vcl_backend_error`.
+- Headers on `req`, `bereq`, `beresp` and `resp`. Writable: `req.url`, `req.method`, `bereq.url`, `bereq.method`, `resp.status`, `resp.reason`, `beresp.status`, `beresp.reason`. `beresp.ttl`, `grace`, `keep`, `uncacheable`, `do_stream`, `do_gzip` and `do_gunzip`. Read-only `obj` fields: `obj.hits`, `obj.ttl`, `obj.status`, etc. `req.xid`, `req.restarts`, `req.esi_level`, `req.can_gzip`, `req.hash_always_miss`, `req.hash_ignore_busy`, `bereq.retries`, `bereq.uncacheable`, the `proto` fields, `server.hostname`, `server.identity`, `client.ip`, `now`. `req.cache_hit` (non-standard) indicates whether `vcl_deliver` is serving a cache hit.
+- Regular expressions, compiled by Varnish's regex engine. ACLs, user subroutines and `include` (confined to the tenant's directory).
+- VMODs: `std`, `str`, `digest`, `headerplus`, `cookieplus`, `urlplus`. Lexical locals (`var` inside a sub).
+- Request globals (`var` at the top level). The client side (`vcl_recv` through `vcl_deliver` and `vcl_synth`) shares one copy. The backend fetch starts from the initializers, not from the client-side values, because it runs in a separate fork. Pass values to the backend on `bereq` headers, as in Varnish.
+- Statistics: `static var NAME: INT stat [counter|gauge|max|min] ["description"];` declares a Varnish counter named `RISCV.<tenant>.<name>`, visible in `varnishstat`. See below.
+
+The following are denied by the compiler and enforced again at runtime by the VMOD:
+- `req.http.Host` is read-only. The surrounding VCL uses it to select the tenant on both client and backend sides; allowing writes would route the request to another tenant. To set the origin Host header, use `bereq.http.Host` in `vcl_backend_fetch`.
+- Cache key isolation: the VMOD prepends the tenant name to every cache key before `vcl_hash` runs, preventing cross-tenant cache reads or poisoning.
+- Restarts, retries, `pipe`, `purge`, `vcl_purge`, `vcl_pipe`, `vcl_init`, `vcl_fini`, bans, backends, directors, storage selection, timeouts and `beresp.do_esi` (whose includes could reference another tenant's origin). These are reserved for the surrounding VCL.
+- Plain `static var` (non-stat), because each request runs in a fresh fork with no state carried between requests.
+- Writes to framing headers (`Content-Length`, `Transfer-Encoding`, etc.).
+- Variables used outside their allowed subroutine scope. `req.*` belongs to the client side and `bereq.*` to the backend side, as in Varnish.
+
+### Statistics
+
+```vcl
+import std;
+
+static var blocked: INT stat "Requests the tenant refused";
+static var inflight: INT stat gauge;
+static var largest_body: INT stat max "Largest Content-Length seen";
+
+sub vcl_recv {
+    set var.inflight += 1;
+    if (req.url ~ "^/admin") {
+        set var.blocked += 1;
+        return (synth(403, "denied"));
     }
 }
 
 sub vcl_deliver {
-    if (riscv.active()) {
-        riscv.run();
-        if (riscv.want_result() == "synth") {
-            return (synth(riscv.want_status()));
-        }
-    }
+    set var.inflight -= 1;
+}
+
+sub vcl_backend_response {
+    set var.largest_body = std.integer(beresp.http.Content-Length, 0);
 }
 ```
 
-`riscv.want_result()` is what the tenant's subroutine returned: `""` (carry on), `"pass"`, `"deliver"`, `"synth"` or `"abandon"`. A `return (pass)` from `vcl_backend_response` has already set `beresp.uncacheable`.
+```sh
+$ varnishstat -1 -f 'RISCV.*'
+RISCV.customer1.com.blocked                     17         0.00 Requests the tenant refused
+RISCV.customer1.com.inflight                     0          .   VCL-declared gauge inflight
+RISCV.customer1.com.largest_body            524288          .   Largest Content-Length seen
+```
 
-What a tenant's VCL can do:
-- `req`, `bereq`, `beresp` and `resp` headers, `bereq.url`, `beresp.ttl`, `grace`, `keep` and `uncacheable`, `client.ip`, `now` and `req.cache_hit`.
-- Regular expressions, which are compiled with Varnish's own engine. ACLs, user subroutines and `include`. Includes are confined to the directory of the tenant's file.
-- `std`, `str`, `digest`, `headerplus`, `cookieplus`, `urlplus`, and lexical locals (`var` inside a sub).
-- Request globals (`var` at the top level). A request's client side (`vcl_recv` through `vcl_deliver`) has one copy. Its backend fetch starts from the initialisers, not from the client's values, because it is a separate fork. Pass values to the fetch on `bereq` headers, as in Varnish.
+Each fork initializes the static variable to its declared value. After each subroutine, the VMOD reads the variable and applies the delta to the tenant's counter. `counter` (the default) and `gauge` add the difference. `max` and `min` retain the highest or lowest value seen. A subroutine observes only its own request's delta, not the running total. `min` has no initializer and reads `INT64_MAX` until a request sets a lower value. A gauge that decrements below zero wraps, because Varnish counters are unsigned.
 
-What it cannot do: `static var` is refused, because every request runs in a fresh fork and nothing persists between requests. `req.url` is read-only in `vcl_recv`. There are no backends, restarts, retries, bans or purges: the surrounding VCL owns those decisions. Header writes to framing headers (`Content-Length`, `Transfer-Encoding`, …) are refused.
+Counters belong to the tenant, not to the program binary. They persist across `riscv.live_update_file()` and VCL reloads, and live until varnishd exits. Redeclaring a name with a different kind is refused. A changed description is logged; the original description is kept.
 
-A policy that does not compile leaves its tenant without a program: `riscv.fork()` returns false, and the rendered diagnostics are in the log as `Error` records. `riscv.live_update_file()` accepts a `.vcl` too, and a broken one leaves the running program in place.
+A `.vcl` file that fails to compile leaves the tenant without a program: `riscv.fork()` returns false and the compiler diagnostics are logged as `Error` records. `riscv.live_update_file()` also accepts `.vcl` files; a failed compile leaves the running program unchanged.
 
 Forks take their dirtied pages from the task workspace, so give tenants some room, e.g. `-p workspace_client=128k`. `vcl/README.md` has the compiler's layout and how to rebuild it.
 

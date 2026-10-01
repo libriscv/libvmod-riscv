@@ -72,4 +72,6 @@ add_vmod_tests(vmod_riscv vmod_riscv
 	tests/vcl_features.vtc
 	tests/vcl_errors.vtc
 	tests/vcl_abi_gates.vtc
+	tests/vcl_stats.vtc
+	tests/vcl_hooks.vtc
 )

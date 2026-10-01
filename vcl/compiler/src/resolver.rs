@@ -436,6 +436,7 @@ fn validate_edges(
             | ast::Statement::If { .. }
             | ast::Statement::Log { .. }
             | ast::Statement::Synthetic { .. }
+            | ast::Statement::HashData { .. }
             | ast::Statement::Return { .. } => return,
         };
         let Some(callee) = names.get(name).copied() else {
@@ -555,7 +556,8 @@ fn statement_terminates(statement: &ast::Statement) -> bool {
         | ast::Statement::Set { .. }
         | ast::Statement::Unset { .. }
         | ast::Statement::Log { .. }
-        | ast::Statement::Synthetic { .. } => false,
+        | ast::Statement::Synthetic { .. }
+        | ast::Statement::HashData { .. } => false,
     }
 }
 
@@ -608,11 +610,15 @@ fn is_reserved(name: &str) -> bool {
         "var"
             | "static"
             | "hash"
+            | "lookup"
             | "fetch"
+            | "miss"
             | "pass"
             | "abandon"
             | "deliver"
             | "synth"
+            | "error"
+            | "fail"
             | "restart"
             | "retry"
             | "pipe"
@@ -622,31 +628,24 @@ fn is_reserved(name: &str) -> bool {
 
 /// `vcl_` names a hook, never a user subroutine — that is Varnish's rule too.
 ///
-/// Anything with the prefix that is not one of the five phases is therefore an
+/// Anything with the prefix that is not one of the phases is therefore an
 /// error here rather than an ordinary sub that turns out to be uncalled, which
 /// is what a mistyped hook name used to be reported as.
 fn is_unsupported_hook(name: &str) -> bool {
     name.starts_with("vcl_")
 }
 
-/// The Varnish hooks Carapace has no phase for. A name in this list is a real
-/// hook the product does not run; anything else with the prefix is a typo.
+/// The Varnish hooks a tenant has no phase for. A name in this list is a
+/// real hook the tenant cannot reach; anything else with the prefix is a typo.
 fn is_varnish_hook(name: &str) -> bool {
     matches!(
         name,
-        "vcl_hash"
-            | "vcl_hit"
-            | "vcl_miss"
-            | "vcl_pass"
-            | "vcl_purge"
-            | "vcl_pipe"
-            | "vcl_backend_error"
-            | "vcl_init"
-            | "vcl_fini"
+        "vcl_purge" | "vcl_pipe" | "vcl_connect" | "vcl_init" | "vcl_fini"
     )
 }
 
-const HOOKS: &str = "vcl_recv, vcl_backend_fetch, vcl_backend_response, vcl_deliver, and vcl_synth";
+const HOOKS: &str = "vcl_recv, vcl_hash, vcl_hit, vcl_miss, vcl_pass, vcl_deliver, vcl_synth, \
+                     vcl_backend_fetch, vcl_backend_response and vcl_backend_error";
 
 fn unsupported_hook(name: &str, span: Span) -> Diagnostic {
     let message = if is_varnish_hook(name) {
@@ -655,11 +654,16 @@ fn unsupported_hook(name: &str, span: Span) -> Diagnostic {
         format!("sub {name} is not a VCL hook, and the 'vcl_' prefix names hooks only")
     };
     Diagnostic::error(span, message).with_help(match name {
-        "vcl_hash" => {
-            "the cache key belongs to the Varnish VCL that forks this tenant".to_string()
+        "vcl_purge" => {
+            "purging belongs to the Varnish VCL that forks this tenant".to_string()
+        }
+        "vcl_pipe" | "vcl_connect" => {
+            "piping and tunnelling are host-controlled".to_string()
         }
         "vcl_init" | "vcl_fini" => {
-            "backends and directors belong to the Varnish VCL that forks this tenant".to_string()
+            "a tenant has no per-VCL state; backends and directors belong to the Varnish \
+             VCL that forks this tenant"
+                .to_string()
         }
         _ => format!("the hooks are {HOOKS}"),
     })
@@ -675,17 +679,7 @@ mod tests {
     /// about why it is uncalled.
     #[test]
     fn every_varnish_hook_without_a_phase_is_refused_by_name() {
-        for hook in [
-            "vcl_hash",
-            "vcl_hit",
-            "vcl_miss",
-            "vcl_pass",
-            "vcl_purge",
-            "vcl_pipe",
-            "vcl_backend_error",
-            "vcl_init",
-            "vcl_fini",
-        ] {
+        for hook in ["vcl_purge", "vcl_pipe", "vcl_connect", "vcl_init", "vcl_fini"] {
             let source = format!("vcl 4.1; sub {hook} {{ }} sub vcl_recv {{ return (hash); }}");
             let error = resolved(&source).unwrap_err().to_string();
             assert!(
@@ -755,7 +749,7 @@ mod tests {
 
     #[test]
     fn owns_duplicate_and_unsupported_hook_diagnostics() {
-        let error = resolved("vcl 4.1; sub vcl_hash {} sub vcl_recv {} sub vcl_recv {}")
+        let error = resolved("vcl 4.1; sub vcl_purge {} sub vcl_recv {} sub vcl_recv {}")
             .unwrap_err()
             .to_string();
         assert!(error.contains("not a hook a tenant policy can define"), "{error}");

@@ -38,7 +38,7 @@ varnish v1 -arg "-p workspace_client=128k" -vcl {
 		}
 		riscv.run();
 		if (riscv.want_result() == "synth") {
-			return (synth(riscv.want_status()));
+			return (synth(riscv.want_status(), riscv.want_reason()));
 		}
 		return (synth(200, "ran"));
 	}
@@ -46,7 +46,9 @@ varnish v1 -arg "-p workspace_client=128k" -vcl {
 	sub vcl_synth {
 		if (riscv.active()) {
 			riscv.run();
-			return (deliver);
+			if (riscv.want_result() == "deliver") {
+				return (deliver);
+			}
 		}
 	}
 }
