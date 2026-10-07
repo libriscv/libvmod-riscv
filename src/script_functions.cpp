@@ -128,6 +128,15 @@ inline uint32_t field_length(const txt& field)
 	return field.e - field.b;
 }
 
+/* An empty slot (never compiled, or deleted) is NULL, and VRE asserts on it */
+inline struct vre* get_regex(machine_t& machine, size_t idx)
+{
+	auto* vre = get_script(machine).regex().get(idx);
+	if (UNLIKELY(vre == nullptr))
+		throw std::out_of_range("No regex at index " + std::to_string(idx));
+	return vre;
+}
+
 /**
  *  These are all system call handlers, which get called by the guest,
  *  and so they have to maintain the integrity of Varnish by checking
@@ -270,7 +279,7 @@ APICALL(remote_strcall)
 
 	// All arguments have to be valid, and we
 	// can't call this from the storage machine
-	if (script.is_storage() || tramp == 0 || data == 0 || len < 0) {
+	if (script.is_storage() || tramp == 0 || data == 0 || len < 0 || len == INT_MAX) {
 		gaddr_t resdata = script.guest_alloc(1);
 		script.machine().memory.write<uint8_t> (resdata, 0);
 		machine.set_result(resdata, 0);
@@ -438,7 +447,8 @@ APICALL(synth)
 		// Synth responses are always using HDR_RESP
 		auto* hp = get_http(ctx, HDR_RESP);
 		const auto [status, type, data] = machine.sysargs<uint16_t, riscv::Buffer, riscv::Buffer> ();
-		if (UNLIKELY(status < 100))
+		/* http_SetStatus() asserts on the last three digits */
+		if (UNLIKELY(status % 1000 < 100))
 			throw std::runtime_error("Invalid synth status code: " + std::to_string(status));
 
 #ifdef VARNISH_PLUS
@@ -638,6 +648,11 @@ APICALL(http_copy_from)
 	auto [hp_from, field_from] = get_field(ctx, (gethdr_e) where, index);
 	auto* hp_dest = get_http(ctx, (gethdr_e) dest);
 
+	/* An unset field, eg. the status of a request */
+	if (field_from.b == nullptr) {
+		machine.set_result(HDR_INVALID);
+		return;
+	}
 	const size_t len = field_length(field_from);
 	/* Avoid overflowing dest */
 	if (UNLIKELY(hp_dest->field_count >= hp_dest->fields_max)) {
@@ -677,7 +692,7 @@ APICALL(http_set_status)
 APICALL(http_unset_re)
 {
 	const auto [where, index] = machine.sysargs<int, int> ();
-	auto* vre = get_script(machine).regex().get(index);
+	auto* vre = get_regex(machine, index);
 
 	auto* ctx = get_ctx(machine);
 	auto* hp = get_http(ctx, (gethdr_e) where);
@@ -708,6 +723,9 @@ APICALL(http_rollback)
 {
 	const auto [where] = machine.sysargs<int> ();
 	auto* ctx = get_ctx(machine);
+	/* Varnish can only roll back req and bereq, and panics otherwise */
+	if (where != HDR_REQ && where != HDR_BEREQ)
+		throw std::runtime_error("Rollback is only possible for req and bereq");
 	auto* hp = get_http(ctx, (gethdr_e) where);
 
 	VRT_Rollback(ctx, hp);
@@ -755,7 +773,7 @@ APICALL(header_field_retrieve_str)
 		const auto& field = hp->field_array[index];
 		const size_t len = field_length(field);
 		riscv::GuestStdString<Script::MARCH> gstr(machine, straddr);
-		gstr.set_string(machine, straddr, field.b, len, false);
+		gstr.set_string(machine, straddr, field.b ? field.b : "", len, false);
 		machine.copy_to_guest(straddr, &gstr, sizeof(gstr));
 		machine.set_result(len);
 		return;
@@ -770,6 +788,9 @@ APICALL(header_field_append)
 	const auto* ctx = get_ctx(machine);
 	auto* hp = get_http(ctx, (gethdr_e) where);
 
+	/* len+1 must not wrap around to a zero-sized allocation */
+	if (UNLIKELY(len == UINT32_MAX))
+		throw std::runtime_error("HTTP header field too long");
 	auto* val = (char*) WS_Alloc(ctx->ws, len+1);
 	if (val == nullptr)
 		throw std::runtime_error("Unable to make room for HTTP header field");
@@ -920,7 +941,7 @@ APICALL(regex_compile)
 APICALL(regex_match)
 {
 	auto [index, buffer] = machine.sysargs<uint32_t, riscv::Buffer> ();
-	auto* vre = get_script(machine).regex().get(index);
+	auto* vre = get_regex(machine, index);
 	/* A match may cost the host up to the match limit in backtracking. */
 	machine.penalize(VCLV_REGEX_MATCH_LIMIT);
 	/* VRE_exec(const vre_t *code, const char *subject, int length,
@@ -969,7 +990,7 @@ APICALL(regex_subst)
 	auto [index, tbuffer, sbuffer, dst, maxlen]
 		= machine.sysargs<uint32_t, riscv::Buffer, riscv::Buffer, gaddr_t, uint32_t> ();
 	auto& script = get_script(machine);
-	auto* re = script.regex().get(index);
+	auto* re = get_regex(machine, index);
 
 	/* Run the regsub using existing 're' */
 	const bool all = (maxlen & 0x80000000);
@@ -992,7 +1013,7 @@ APICALL(regex_subst_hdr)
 {
 	auto [ridx, where, index, subst, all]
 		= machine.sysargs<uint32_t, int, uint32_t, riscv::Buffer, int> ();
-	auto* re = get_script(machine).regex().get(ridx);
+	auto* re = get_regex(machine, ridx);
 	auto* ctx = get_ctx(machine);
 	if (index == HDR_INVALID) {
 		machine.set_result(-1);
