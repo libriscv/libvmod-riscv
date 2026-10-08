@@ -11,11 +11,18 @@ using gaddr_t = Script::gaddr_t;
 
 #define APICALL(func) static void func(riscv::Machine<Script::MARCH>& machine [[maybe_unused]])
 
-inline Script& get_script(machine_t& m) noexcept {
-	return *m.get_userdata<Script> ();
+/* The system call table is per machine type, so a machine without a
+   Script, the VCL compiler's (vcl/compiler.cpp), reaches these handlers
+   too. It is refused rather than trusted not to call them. */
+inline Script& get_script(machine_t& m) {
+	auto* script = m.get_userdata<Script> ();
+	if (UNLIKELY(script == nullptr))
+		throw riscv::MachineException(riscv::ILLEGAL_OPERATION,
+			"System call is only available to tenant programs");
+	return *script;
 }
 
-inline const auto* get_ctx(machine_t& m) noexcept {
+inline const auto* get_ctx(machine_t& m) {
 	return get_script(m).ctx();
 }
 

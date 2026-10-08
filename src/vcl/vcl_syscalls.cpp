@@ -74,7 +74,7 @@ bool valid_value(std::string_view value)
 	return value.find_first_of(std::string_view("\r\n\0", 3)) == std::string_view::npos;
 }
 
-Script& script_of(machine_t& m) { return *m.get_userdata<Script>(); }
+Script& script_of(machine_t& m) { return get_script(m); }
 const vrt_ctx* ctx_of(machine_t& m) { return script_of(m).ctx(); }
 
 /* Copy a guest (pointer, length) string out, or fail on a length past max.

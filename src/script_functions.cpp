@@ -223,18 +223,36 @@ APICALL(remote_call)
 
 	// === Serialized access to storage === //
 	std::scoped_lock lock(instance.storage_mtx);
+	StorageCtx lease(remote, script.ctx());
 	for (int i = 0; i < 4; i++) {
 		// Integer registers
 		stregs.get(10 + i) = myregs.get(11 + i);
 	}
+	/* For the length of the call, the storage VM reads this fork's pages
+	   and writes into its heap. The fork and its pages end with the
+	   request, while the storage VM lives on: whatever happens in the
+	   call, neither the handlers that reach the fork nor the page caches
+	   that may point into its pages may outlive it. */
+	struct Borrow {
+		riscv::Memory<Script::MARCH>& mem;
+		riscv::Memory<Script::MARCH>::page_readf_cb_t readf;
+		riscv::Memory<Script::MARCH>::page_fault_cb_t fault;
+		~Borrow() {
+			mem.set_page_readf_handler(std::move(readf));
+			mem.set_page_fault_handler(std::move(fault));
+			mem.invalidate_reset_cache();
+		}
+	};
+	auto& rmem = remote.machine().memory;
+	Borrow borrow { rmem,
 	// Page-sharing mechanisms
-	remote.machine().memory.set_page_readf_handler(
+	rmem.set_page_readf_handler(
 		[&m = machine.memory] (const auto&, size_t pageno) -> const auto& {
 			// This works because the default return value for
 			// missing pages is a CoW zero-page (in both machines).
 			return m.get_pageno(pageno);
-		});
-	remote.machine().memory.set_page_fault_handler(
+		}),
+	rmem.set_page_fault_handler(
 		[&s = script] (auto& mem, const size_t pageno, bool) -> auto& {
 			const gaddr_t addr = pageno * riscv::Page::size();
 			if (s.within_heap(addr)) {
@@ -250,7 +268,7 @@ APICALL(remote_call)
 			}
 			throw riscv::MachineException(riscv::OUT_OF_MEMORY,
 				"Out of memory", s.max_memory());
-		});
+		}) };
 	// Reset instruction counter for measuring purposes
 	remote.machine().reset_instruction_counter();
 	// Make storage VM function call
@@ -263,7 +281,6 @@ APICALL(remote_call)
 	for (int i = 0; i < 4; i++) {
 		myregs.get(10 + i) = stregs.get(10 + i);
 	}
-	remote.machine().memory.reset_page_readf_handler();
 	// Short-circuit the ret pseudo-instruction:
 	machine.cpu.jump(machine.cpu.reg(riscv::REG_RA) - 4);
 }
@@ -288,6 +305,7 @@ APICALL(remote_strcall)
 
 	// === Serialized access to storage === //
 	std::scoped_lock lock(instance.storage_mtx);
+	StorageCtx lease(remote, script.ctx());
 
 	gaddr_t gaddr = remote.guest_alloc(len+1);
 	if (gaddr == 0) {
@@ -472,25 +490,13 @@ APICALL(synth)
 		const std::string buf = data.to_string();
 		VSB_bcat(vsb, buf.data(), buf.size());
 #else
-		// riscv::Buffer tries to accumulate the data in a way
-		// that preserves continuity even if it crosses many pages.
-		// Sadly, even if just one data range is different, we need
-		// to sequentialize it.
-		if (data.is_sequential()) {
-			// Delete any old heap-allocated data
-			if (vsb->s_flags & VSB_DYNAMIC) {
-				free(vsb->s_buf);
-			}
-			// Make VSB fixed length, which does not call free
-			// XXX: Varnish will literally append a \0 at len.
-			vsb->s_buf = (char *)data.c_str();
-			vsb->s_size = data.size() + 1; /* pretend-zero */
-			vsb->s_len  = data.size();
-			vsb->s_flags = VSB_FIXEDLEN;
-		} else {
+		// The body is always copied out of the guest. Varnish writes a
+		// NUL after it, which would land past the end of a guest page,
+		// or in a page every fork shares with the master (rodata, or
+		// the zero page). We allocate one more byte for that zero.
+		{
 			// By using realloc we do not need to delete old data,
 			// although only if s_flags is *not* VSB_FIXEDLEN.
-			// We allocate one more byte for the VCP-appended zero.
 			char* new_buffer = nullptr;
 			if (vsb->s_flags & VSB_DYNAMIC) {
 				new_buffer = (char *)realloc(vsb->s_buf, data.size()+1);
@@ -914,6 +920,10 @@ APICALL(regex_compile)
 		return;
 	}
 
+	/* A full cache refuses before compiling, or the pattern would leak */
+	if (UNLIKELY(get_script(machine).regex().full()))
+		throw std::out_of_range("Too many cached regex patterns");
+
 	/* Compile new regex pattern */
 #ifdef VARNISH_PLUS
 	const char* error = "";
@@ -989,7 +999,6 @@ APICALL(regex_subst)
 {
 	auto [index, tbuffer, sbuffer, dst, maxlen]
 		= machine.sysargs<uint32_t, riscv::Buffer, riscv::Buffer, gaddr_t, uint32_t> ();
-	auto& script = get_script(machine);
 	auto* re = get_regex(machine, index);
 
 	/* Run the regsub using existing 're' */
@@ -1001,11 +1010,14 @@ APICALL(regex_subst)
 		return;
 	}
 
+	/* Copied out first: writing to a bad destination throws */
+	const std::string text(VSB_data(result), VSB_len(result));
+	VSB_destroy(&result);
+
 	/* This call only supports dest buffer being in the RW area */
 	const size_t len =
-		std::min((size_t) maxlen & 0x7FFFFFFF, size_t(VSB_len(result))+1);
-	machine.copy_to_guest(dst, VSB_data(result), len);
-	VSB_destroy(&result);
+		std::min((size_t) maxlen & 0x7FFFFFFF, text.size()+1);
+	machine.copy_to_guest(dst, text.c_str(), len);
 	/* The last byte is the zero, not reporting that */
 	machine.set_result(len-1);
 }
@@ -1042,7 +1054,9 @@ APICALL(regex_subst_hdr)
 APICALL(regex_delete)
 {
 	auto [index] = machine.sysargs<uint32_t> ();
-	get_script(machine).regex().free((uint32_t) index);
+	auto* re = get_script(machine).regex().free((uint32_t) index);
+	if (re != nullptr)
+		VRE_free(&re);
 }
 
 void sha256(machine_t&);

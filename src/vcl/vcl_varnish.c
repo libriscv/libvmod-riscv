@@ -723,6 +723,14 @@ vclv_regsub(int all, const char *subject, size_t len, const void *re,
 		}
 		if (rc == 0)
 			break;
+		/* PCRE's \K in a look-behind can start a match before the last
+		   one ended, or after its own end. Varnish's own regsub panics
+		   on that; the compiler refuses both, and the host refuses the
+		   match rather than trust it. */
+		if (groups[0] < (int)at || groups[1] < groups[0]) {
+			VSB_destroy(&out);
+			return (-1);
+		}
 		VSB_bcat(out, subject + at, groups[0] - (int)at);
 		vclv_regsub_expand(out, subject, replacement, groups,
 		    VCLV_REGSUB_GROUPS);

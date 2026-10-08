@@ -1,0 +1,52 @@
+varnishtest "An unset header passed to the VMOD is NULL, and must not crash varnishd"
+
+# A STRING argument from an unset header is NULL. HTTP/1.0 lets a client
+# leave out Host, so riscv.fork(req.http.Host) gets one from any client.
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"good.com": { "filename": "${testdir}/vcl/limits.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/live-update") {
+			return (pass);
+		}
+	}
+
+	sub vcl_backend_fetch {
+		if (bereq.url == "/live-update") {
+			set bereq.backend = riscv.live_update(bereq.http.X-Tenant);
+			return (fetch);
+		}
+	}
+
+	include "${testdir}/vcl_router.vcl";
+} -start
+
+client c1 {
+	send "GET / HTTP/1.0\r\n\r\n"
+	rxresp
+	expect resp.status == 404
+	expect resp.reason == "No such tenant"
+} -run
+
+client c2 {
+	txreq -url "/live-update" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+# Still running
+client c3 {
+	txreq -url "/" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 200
+} -run

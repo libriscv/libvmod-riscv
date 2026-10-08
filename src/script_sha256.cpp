@@ -18,7 +18,7 @@ void sha256(machine_t& machine)
 	VSHA256_CTX ctx;
 	VSHA256_Init(&ctx);
 	buffer.foreach(
-		[ctx] (const char* data, size_t len) mutable {
+		[&ctx] (const char* data, size_t len) {
 			VSHA256_Update(&ctx, data, len);
 		});
 	unsigned char result[VSHA256_LEN];

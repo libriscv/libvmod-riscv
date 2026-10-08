@@ -295,7 +295,7 @@ VCL_BACKEND vmod_vm_backend(VRT_CTX, VCL_STRING func, VCL_STRING farg)
 
 	if (func) {
 		rvr->arguments.funcaddr = atoi(func);
-		rvr->arguments.funcarg  = atoi(farg);
+		rvr->arguments.funcarg  = farg ? atoi(farg) : 0;
 		/* TODO: If it's null, should we abandon? */
 		if (rvr->arguments.funcaddr == 0x0) {
 			return (NULL);

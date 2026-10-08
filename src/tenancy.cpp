@@ -149,7 +149,14 @@ void init_tenants_str(VRT_CTX, const char* str)
 extern "C"
 void init_tenants_file(VRT_CTX, const char* filename)
 {
-	const auto json = rvs::file_loader(filename);
+	/* Nothing may throw into C */
+	std::vector<uint8_t> json;
+	try {
+		json = rvs::file_loader(filename);
+	} catch (const std::exception& e) {
+		VRT_fail(ctx, "load_tenants: %s", e.what());
+		return;
+	}
 	rvs::init_tenants(ctx, json, filename);
 }
 

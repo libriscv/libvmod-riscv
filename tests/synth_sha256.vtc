@@ -1,0 +1,101 @@
+varnishtest "RISC-V synth bodies are copied, and SHA-256 hashes its input"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+/* In .rodata: a page every fork shares with the master */
+static const char text[] = "HelloWorld";
+static const char mime[] = "text/plain";
+
+void on_synth()
+{
+	char url[256];
+	get_url(0, url, sizeof(url)-1);
+
+	if (strcmp(url, "/sha256") == 0) {
+		static const char input[] = "abc";
+		unsigned char digest[32];
+		char hex[64];
+		const long len = syscall4(ECALL_SHA256,
+			(long)input, sizeof(input)-1, (long)digest, sizeof(digest));
+		if (len != 32) {
+			synth(500, mime, sizeof(mime)-1, "bad length", 10);
+			return;
+		}
+		for (int i = 0; i < 32; i++) {
+			hex[i*2+0] = "0123456789abcdef"[digest[i] >> 4];
+			hex[i*2+1] = "0123456789abcdef"[digest[i] & 0xF];
+		}
+		synth(200, mime, sizeof(mime)-1, hex, sizeof(hex));
+	} else if (strcmp(url, "/part") == 0) {
+		/* Varnish ends a synth body with a NUL. It must not land in
+		   the guest, here in the middle of the master's string. */
+		synth(200, mime, sizeof(mime)-1, text, 5);
+	} else {
+		synth(200, mime, sizeof(mime)-1, text, sizeof(text)-1);
+	}
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/sha256" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+	txreq -url "/part" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "Hello"
+
+	txreq -url "/full" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 10
+	expect resp.body == "HelloWorld"
+} -run

@@ -125,8 +125,14 @@ extern "C"
 const char* riscv_current_result_string(VRT_CTX, size_t idx)
 {
 	auto* script = rvs::get_machine(ctx);
-	if (script && idx < rvs::Script::RESULTS_MAX)
-		return script->want_workspace_string(idx);
+	if (script && idx < rvs::Script::RESULTS_MAX) {
+		/* The value is a guest address, and nothing may throw into C */
+		try {
+			return script->want_workspace_string(idx);
+		} catch (const std::exception& e) {
+			VRT_fail(ctx, "result_as_string: %s", e.what());
+		}
+	}
 	return nullptr;
 }
 extern "C"

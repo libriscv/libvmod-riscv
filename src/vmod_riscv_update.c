@@ -258,6 +258,10 @@ VCL_BACKEND vmod_live_update(VRT_CTX, VCL_STRING tenant, VCL_BYTES max_size)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
+	if (tenant == NULL) {
+		VRT_fail(ctx, "Could not find tenant: (null)");
+		return NULL;
+	}
 	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant, strlen(tenant));
 	if (rvm == NULL) {
 		VRT_fail(ctx, "Could not find tenant: %s", tenant);
@@ -285,6 +289,10 @@ VCL_BACKEND vmod_live_debug(
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
+	if (tenant == NULL) {
+		VRT_fail(ctx, "Could not find tenant: (null)");
+		return NULL;
+	}
 	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant, strlen(tenant));
 	if (rvm == NULL) {
 		VRT_fail(ctx, "Could not find tenant: %s", tenant);

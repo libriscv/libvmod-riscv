@@ -204,4 +204,19 @@ inline long Script::resume(uint64_t cycles)
 	return -1;
 }
 
+/* The storage VM outlives the task that loaded it, and so the ctx it was
+   made with. A call into it lends it the caller's ctx, so that its system
+   calls and its exception handling (VRT_fail) never see a stale one. */
+struct StorageCtx
+{
+	StorageCtx(Script& storage, const vrt_ctx* ctx)
+		: m_storage(storage), m_old(storage.ctx()) { storage.set_ctx(ctx); }
+	~StorageCtx() { m_storage.set_ctx(m_old); }
+	StorageCtx(const StorageCtx&) = delete;
+	StorageCtx& operator=(const StorageCtx&) = delete;
+private:
+	Script& m_storage;
+	const vrt_ctx* m_old;
+};
+
 } // rvs

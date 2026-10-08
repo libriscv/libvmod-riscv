@@ -29,10 +29,16 @@ struct Cache {
 		}
 		throw std::out_of_range("Too many cached items");
 	}
-	void free(size_t idx)
+	/* Empty a slot. The item is handed back when this cache owns it,
+	   for the caller to destroy: a loaned item belongs to the source. */
+	T* free(size_t idx)
 	{
-		cache.at(idx) = { nullptr, 0 };
+		auto& entry = cache.at(idx);
+		T* owned = entry.non_owned ? nullptr : entry.item;
+		entry = {};
+		return owned;
 	}
+	bool full() const { return size() >= max_size(); }
 	size_t size() const { return m_size; }
 	size_t max_size() const { return m_max_entries; }
 

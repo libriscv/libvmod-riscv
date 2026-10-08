@@ -1,0 +1,44 @@
+varnishtest "riscv.result_as_string() of an address the tenant cannot read fails the request, not varnishd"
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+static void on_recv(int req) {
+	char url[64];
+	get_url(req, url, sizeof(url)-1);
+	/* A "compute" decision: result value 1 is any address the guest
+	   likes, and riscv.result_as_string(1) reads a string there. */
+	long addr = 0x0;
+	if (strcmp(url, "/text") == 0) addr = 0x120000;
+	syscall4(ECALL_BACKEND_DECISION, 0, 0, addr, 0);
+}
+void start(int argc, char** argv) { wait_for_requests(on_recv); }
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{ "x.com": { "filename": "${tmpdir}/${testname}", "group": "test" } }""");
+		riscv.finalize_tenants();
+	}
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) { return (synth(403)); }
+		riscv.vcall(ON_REQUEST);
+		set req.http.X-S = riscv.result_as_string(1);
+		return (synth(200));
+	}
+} -start
+# A failed subroutine closes the connection, so each gets its own.
+client c1 {
+	# Page zero is a protection fault
+	txreq -url "/zero" -hdr "Host: x.com"
+	rxresp
+	expect resp.status == 503
+} -run
+client c3 {
+	txreq -url "/text" -hdr "Host: x.com"
+	rxresp
+	expect resp.status == 200
+} -run

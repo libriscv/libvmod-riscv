@@ -48,14 +48,22 @@ void riscv_backend_call(VRT_CTX, const void* key, struct vmod_riscv_arguments *a
 			script->set_ctx(ctx);
 			/* Call the backend response function */
 			auto& machine = script->machine();
+			/* What vmcall() does, but within the tenant's instruction
+			   limit: vmcall() without one does not count instructions,
+			   and a guest that never returns would keep the thread. */
+			machine.cpu.reset_stack_pointer();
 			/* Cast all arguments to gaddr_t to avoid double-register 64-bit ABI */
-			machine.vmcall(args->funcaddr, (Script::gaddr_t)args->funcarg, (Script::gaddr_t)args->post.address, (Script::gaddr_t)args->post.length);
+			machine.setup_call((Script::gaddr_t)args->funcarg, (Script::gaddr_t)args->post.address, (Script::gaddr_t)args->post.length);
+			machine.simulate_with<true>(script->max_instructions(), 0u, args->funcaddr);
 			/* Restore old ctx for backend_response */
 			script->set_ctx(old_ctx);
 
 			/* Get content-type, data and status */
 			const auto [status, type, data, datalen] =
 				machine.sysargs<int, riscv::Buffer, Script::gaddr_t, Script::gaddr_t> ();
+			/* http_PutResponse() asserts on a status that is not three digits */
+			if (UNLIKELY(status < 100 || status > 999))
+				throw std::runtime_error("Invalid backend response status: " + std::to_string(status));
 			/* Return content-type, status, and iovecs containing data */
 			using vBuffer = riscv::vBuffer;
 			result->type = optional_copy(ctx, type);
@@ -106,6 +114,11 @@ int riscv_backend_streaming_post(struct vmod_riscv_post *post,
 				assert(post->address == 0);
 				post->address = script->allocate_post_data(post->capacity);
 			}
+
+			/* The body must fit what was allocated for it, or it
+			   would be written over whatever the guest has after it. */
+			if (UNLIKELY(data_len < 0 || size_t(data_len) > post->capacity - post->length))
+				throw std::runtime_error("POST body is larger than " + std::to_string(post->capacity) + " bytes");
 
 			/* Copy the data segment into VM at the right offset,
 			   building a sequential, complete buffer. */

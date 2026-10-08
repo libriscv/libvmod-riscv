@@ -71,8 +71,13 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 				const auto resaddr = inst->callback_entries.at(11);
 				if (resaddr != 0x0)
 				{
-				/* Serialize data in the old machine */
+				/* Serialize data in the old machine. Requests holding
+				   either program may be calling into its storage, so
+				   the handover is serialized with them. */
+				std::scoped_lock lock(old->storage_mtx, inst->storage_mtx);
 				auto& old_machine = old->storage;
+				StorageCtx old_lease(old_machine, ctx);
+				StorageCtx new_lease(inst->storage, ctx);
 				old_machine.call(luaddr);
 				/* Get serialized data */
 				auto [data_addr, data_len] =
@@ -174,7 +179,10 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 				const auto resaddr = inst->callback_entries.at(11);
 				if (resaddr != 0x0)
 				{
+				std::scoped_lock lock(old->storage_mtx, inst->storage_mtx);
 				auto& old_machine = old->storage;
+				StorageCtx old_lease(old_machine, ctx);
+				StorageCtx new_lease(inst->storage, ctx);
 				old_machine.call(luaddr);
 				auto [data_addr, data_len] =
 					old_machine.machine().sysargs<Script::gaddr_t, unsigned>();
