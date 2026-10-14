@@ -3,6 +3,8 @@
 #include <libriscv/util/crc32.hpp>
 #include "builder/builder.hpp"
 #include <climits>
+#include <mutex>
+#include <sys/stat.h>
 #include <unistd.h>
 using riscv::crc32;
 typedef void mi_output_fun(const char*, void*);
@@ -40,6 +42,45 @@ std::string apply_dollar_vars(std::string str)
 		}
 	}
 	return str;
+}
+
+FileStamp FileStamp::of(const std::string& path)
+{
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0)
+		return {};
+	return {
+		.dev  = uint64_t(st.st_dev),
+		.ino  = uint64_t(st.st_ino),
+		.size = int64_t(st.st_size),
+		.mtime_ns = int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec,
+	};
+}
+
+bool TenantConfig::same_as(const TenantConfig& other) const
+{
+	const auto& a = this->group;
+	const auto& b = other.group;
+	return name == other.name && filename == other.filename
+		&& a.max_instructions == b.max_instructions
+		&& a.max_memory_mb == b.max_memory_mb
+		&& a.max_heap_mb == b.max_heap_mb
+		&& a.max_backends == b.max_backends
+		&& a.max_regex == b.max_regex
+		&& a.verbose == b.verbose
+		&& *rvs::atomic_load(&a.argv) == *rvs::atomic_load(&b.argv);
+}
+
+std::string SandboxTenant::program_path() const
+{
+	if (config.filename.starts_with("rust:"))
+		return apply_dollar_vars(config.filename.substr(5));
+	return apply_dollar_vars(config.filename);
+}
+
+bool SandboxTenant::reusable_source() const
+{
+	return !config.filename.starts_with("rust:");
 }
 
 SandboxTenant::SandboxTenant(VRT_CTX, const TenantConfig& conf)
@@ -92,7 +133,10 @@ void SandboxTenant::load(VRT_CTX)
 }
 void SandboxTenant::init()
 {
-	Script::init();
+	/* This installs the process-wide system call handlers, which the
+	   requests of an already running VCL use while another one loads. */
+	static std::once_flag once;
+	std::call_once(once, Script::init);
 }
 
 static inline void* get_priv_key(VRT_CTX) {

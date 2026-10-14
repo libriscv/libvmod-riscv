@@ -27,12 +27,13 @@ namespace rvs
 }
 
 extern "C"
-rvs::Script* riscv_fork(VRT_CTX, const char* tenant, size_t tenantlen, int debug)
+rvs::Script* riscv_fork(VRT_CTX, struct vmod_priv* priv,
+	const char* tenant, size_t tenantlen, int debug)
 {
 	using namespace rvs;
 
-	extern SandboxTenant* tenant_find(VRT_CTX, const char* name, size_t namelen);
-	auto* tenptr = tenant_find(ctx, tenant, tenantlen);
+	extern SandboxTenant* tenant_find(struct vmod_priv*, const char* name, size_t namelen);
+	auto* tenptr = tenant_find(priv, tenant, tenantlen);
 	if (UNLIKELY(tenptr == nullptr)) {
 		VSLb(ctx->vsl, SLT_VCL_Error,
 		    "riskv.fork: Could not find tenant '%.*s'",

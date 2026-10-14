@@ -1,3 +1,4 @@
+#pragma once
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,6 +38,18 @@ struct TenantGroup {
 		std::make_shared<std::vector<std::string>>();
 };
 
+/* Identifies the program file a tenant was loaded from, so that a VCL
+   reload can tell whether it has been replaced on disk since. */
+struct FileStamp {
+	uint64_t dev = 0;
+	uint64_t ino = 0;
+	int64_t  size = -1;
+	int64_t  mtime_ns = 0;
+
+	static FileStamp of(const std::string& path);
+	bool operator==(const FileStamp&) const = default;
+};
+
 struct TenantConfig
 {
 	std::string    name;
@@ -52,6 +65,10 @@ struct TenantConfig
 
 	TenantConfig(std::string n, std::string f, TenantGroup g)
 		: name(n), filename(f), group{std::move(g)} {}
+
+	/* Whether two tenants would load the same program the same way.
+	   The argv of a running tenant must be read under its update_mtx. */
+	bool same_as(const TenantConfig& other) const;
 };
 
 } // rvs

@@ -41,6 +41,9 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 		return static_result("Empty file received");
 	}
 	try {
+		/* Two updates racing would hand the state of the program both
+		   replace to only one of them, and lose the other's. */
+		std::scoped_lock update_lock(vrm->update_mtx);
 	#ifdef ENABLE_TIMING
 		TIMING_LOCATION(t0);
 	#endif
@@ -117,6 +120,9 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 				VSLb(ctx->vsl, SLT_Error, "%.*s", len, buffer);
 				return dynamic_result(buffer);
 			}
+			/* A reload with an unchanged configuration keeps this
+			   program rather than loading the file it just wrote. */
+			vrm->file_stamp = FileStamp::of(vrm->program_path());
 		}
 		return static_result("Update successful\n");
 	} catch (const riscv::MachineException& e) {
@@ -141,6 +147,9 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 {
 	using namespace rvs;
 	try {
+		/* Serializes the argv extension below, and the state handover,
+		   with other updates of this tenant. */
+		std::scoped_lock update_lock(vrm->update_mtx);
 		const std::string path = apply_dollar_vars(std::string(filename));
 		if (rvs::vcl::is_vcl_source(path)) {
 			/* A compiled policy has no serialized state to hand over. */

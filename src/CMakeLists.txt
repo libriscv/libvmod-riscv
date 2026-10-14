@@ -60,6 +60,8 @@ add_vmod_tests(vmod_riscv vmod_riscv
 	tests/fork_cow_write.vtc
 	tests/hello_backend_world.vtc
 	tests/hello_synth_world.vtc
+	tests/tenant_reload.vtc
+	tests/tenant_reload_stress.vtc
 	tests/js_synth_basic.vtc
 	tests/js_url_routing.vtc
 	tests/js_recv_headers.vtc

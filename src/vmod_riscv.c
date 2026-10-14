@@ -9,12 +9,12 @@
 #include "vmod_util.h"
 #include "update_result.h" // vcall_info
 
-extern void init_tenants_str(VRT_CTX, const char*);
-extern void init_tenants_file(VRT_CTX, const char*);
-extern void finalize_tenants_impl(VRT_CTX);
-extern void tenant_append_main_argument(VRT_CTX, const char*, const char*);
+extern void init_tenants_str(VRT_CTX, struct vmod_priv*, const char*);
+extern void init_tenants_file(VRT_CTX, struct vmod_priv*, const char*);
+extern void finalize_tenants_impl(VRT_CTX, struct vmod_priv*);
+extern void tenant_append_main_argument(VRT_CTX, struct vmod_priv*, const char*, const char*);
 
-extern void* riscv_fork(VRT_CTX, const char* ten, size_t tenlen, int dbg);
+extern void* riscv_fork(VRT_CTX, struct vmod_priv*, const char* ten, size_t tenlen, int dbg);
 // Functions operating on a machine already forked, which
 // is accessible through a priv_task.
 extern const char* riscv_current_call(VRT_CTX, const char*, const char*);
@@ -55,7 +55,7 @@ static inline vcall_info enum_to_idx(VCL_ENUM e)
 }
 
 /* Load tenant information from a JSON string */
-VCL_VOID vmod_embed_tenants(VRT_CTX, VCL_STRING str)
+VCL_VOID vmod_embed_tenants(VRT_CTX, struct vmod_priv *priv, VCL_STRING str)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
@@ -63,18 +63,18 @@ VCL_VOID vmod_embed_tenants(VRT_CTX, VCL_STRING str)
 		VRT_fail(ctx, "embed_tenants: no JSON given");
 		return;
 	}
-	init_tenants_str(ctx, str);
+	init_tenants_str(ctx, priv, str);
 }
 /* Finalize tenant loading: actually instantiate all VM programs.
    Call after embed_tenants/load_tenants and any add_main_argument calls. */
-VCL_VOID vmod_finalize_tenants(VRT_CTX)
+VCL_VOID vmod_finalize_tenants(VRT_CTX, struct vmod_priv *priv)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
-	finalize_tenants_impl(ctx);
+	finalize_tenants_impl(ctx, priv);
 }
 /* Load tenant information from a JSON file */
-VCL_VOID vmod_load_tenants(VRT_CTX, VCL_STRING filename)
+VCL_VOID vmod_load_tenants(VRT_CTX, struct vmod_priv *priv, VCL_STRING filename)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
@@ -82,10 +82,11 @@ VCL_VOID vmod_load_tenants(VRT_CTX, VCL_STRING filename)
 		VRT_fail(ctx, "load_tenants: no filename given");
 		return;
 	}
-	init_tenants_file(ctx, filename);
+	init_tenants_file(ctx, priv, filename);
 }
 /* Append to a tenants main function arguments. */
-VCL_VOID vmod_add_main_argument(VRT_CTX, VCL_STRING tenant, VCL_STRING arg)
+VCL_VOID vmod_add_main_argument(VRT_CTX, struct vmod_priv *priv,
+    VCL_STRING tenant, VCL_STRING arg)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
@@ -93,12 +94,12 @@ VCL_VOID vmod_add_main_argument(VRT_CTX, VCL_STRING tenant, VCL_STRING arg)
 		VRT_fail(ctx, "add_main_argument: tenant and argument are required");
 		return;
 	}
-	tenant_append_main_argument(ctx, tenant, arg);
+	tenant_append_main_argument(ctx, priv, tenant, arg);
 }
 
 /* Fork into a new VM. The VM is freed when the
    request (priv_task) ends. */
-VCL_BOOL vmod_fork(VRT_CTX, VCL_STRING tenant, VCL_STRING debug)
+VCL_BOOL vmod_fork(VRT_CTX, struct vmod_priv *priv, VCL_STRING tenant, VCL_STRING debug)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
@@ -106,7 +107,7 @@ VCL_BOOL vmod_fork(VRT_CTX, VCL_STRING tenant, VCL_STRING debug)
 	   and names no tenant. */
 	if (tenant == NULL)
 		return (0);
-	return riscv_fork(ctx, tenant, strlen(tenant), debug != NULL) != NULL;
+	return riscv_fork(ctx, priv, tenant, strlen(tenant), debug != NULL) != NULL;
 }
 
 /* Check if there is a VM currently for this request. */

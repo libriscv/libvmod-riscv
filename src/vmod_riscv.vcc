@@ -67,22 +67,35 @@ Example:
 API
 ===
 
-$Function VOID embed_tenants(STRING json)
+$Function VOID embed_tenants(PRIV_VCL, STRING json)
 
 - Load tenants directly from embedded JSON. See below.
+- Tenants belong to the VCL that loads them: only that VCL can fork
+  them, and they go away when it is discarded.
+- Only available in vcl_init, as are add_main_argument(),
+  finalize_tenants() and load_tenants().
 
-$Function VOID add_main_argument(STRING tenant, STRING arg)
+$Function VOID add_main_argument(PRIV_VCL, STRING tenant, STRING arg)
 
 - Appends to a tenants main arguments
 - Supports multi-line strings in VCL
 
-$Function VOID finalize_tenants()
+$Function VOID finalize_tenants(PRIV_VCL)
 
 - Finalize tenant loading by instantiating all VM programs.
 - Must be called after embed_tenants/load_tenants and any
   add_main_argument calls, at the end of vcl_init.
+- A finalized tenant can no longer be reconfigured.
+- On a VCL reload, a tenant whose configuration (filename, limits
+  and arguments) is unchanged, and whose program file has not been
+  replaced since it was loaded, keeps running the program it has,
+  including one installed by a live update, and its storage state.
+  It is then shared with the VCL it came from, so a live update
+  through either VCL updates both.
+  Any other tenant loads its program file again. Tenants built from
+  a Rust project ("rust:") are always rebuilt.
 
-$Function VOID load_tenants(STRING json_filepath)
+$Function VOID load_tenants(PRIV_VCL, STRING json_filepath)
 
 - Load tenants from a JSON file in this format:
 
@@ -104,26 +117,26 @@ $Function VOID load_tenants(STRING json_filepath)
   accessible to Varnish. When a tenant sends a new program
   to Varnish, it will try to write to that location.
 
-$Function BOOL    fork(STRING tenant, STRING debug = 0)
+$Function BOOL    fork(PRIV_VCL, STRING tenant, STRING debug = 0)
 
 - Tenant names are the object names in the JSON configuration file.
 - Quickly create a new tenant machine forked from a previously
   fully prepared machine, using copy-on-write mechanics.
 - Returns true if the fork succeeded.
 
-$Function BACKEND live_update(STRING tenant, BYTES max_size = 2097152)
+$Function BACKEND live_update(PRIV_VCL, STRING tenant, BYTES max_size = 2097152)
 
 - Update this machine using binary data received in the
   current request. If the machine fails to load, the old machine
   will be kept running.
 - Tenant name must be specified to avoid accidents.
 
-$Function BOOL live_update_file(STRING tenant, STRING filename, STRING append_argument = 0)
+$Function BOOL live_update_file(PRIV_VCL, STRING tenant, STRING filename, STRING append_argument = 0)
 
 - Reload a tenant using the given filename, which can be the same filename as before.
 - If append_argument is given, the string is appended to the main() arguments of the program.
 
-$Function BACKEND live_debug(STRING tenant, BYTES max_size = 2097152)
+$Function BACKEND live_debug(PRIV_VCL, STRING tenant, BYTES max_size = 2097152)
 
 - Receive a binary suitable for debugging, then
   open a port for GDB remote debugging.

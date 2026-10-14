@@ -1,0 +1,335 @@
+varnishtest "Requests and live updates while tenant VCLs are reloaded and discarded"
+
+# Program A and B answer with different bodies; ${tmpdir}/prog is the
+# file the tenant is configured with, and starts out as A.
+shell {
+cat >${tmpdir}/a.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+void on_synth()
+{
+	static const char mime[] = "text/plain";
+	static const char text[] = "Program A";
+	synth(200, mime, sizeof(mime)-1, text, sizeof(text)-1);
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+cat >${tmpdir}/b.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+void on_synth()
+{
+	static const char mime[] = "text/plain";
+	static const char text[] = "Program B is a different size";
+	synth(200, mime, sizeof(mime)-1, text, sizeof(text)-1);
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/a.cpp ${testdir} ${tmpdir}/a
+bash ${testdir}/build.sh ${tmpdir}/b.cpp ${testdir} ${tmpdir}/b
+cp ${tmpdir}/a ${tmpdir}/prog
+}
+
+# Live updates and requests while VCLs are loaded, discarded, and either
+# share the tenant of the VCL before them or load it again.
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 3000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c8 {
+	loop 30 {
+		txreq -url "/update" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 200
+		delay 0.03
+	}
+} -start
+client c9 {
+	loop 200 {
+		txreq -url "/" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 200
+		delay 0.005
+	}
+} -start
+
+
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 3000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+}
+varnish v1 -cliok "vcl.discard vcl1"
+
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 4000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+}
+varnish v1 -cliok "vcl.discard vcl2"
+
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 4000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+}
+varnish v1 -cliok "vcl.discard vcl3"
+
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 3000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+}
+varnish v1 -cliok "vcl.discard vcl4"
+
+varnish v1 -vcl+backend {
+vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"limited": {
+				"max_instructions": 3000000
+			},
+			"xpizza.com": {
+				"filename": "${tmpdir}/prog",
+				"group": "limited"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file("xpizza.com", "${tmpdir}/b")) {
+				return (synth(200, "Updated"));
+			}
+			return (synth(500, "Update failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+}
+varnish v1 -cliok "vcl.discard vcl5"
+
+client c8 -wait
+client c9 -wait
