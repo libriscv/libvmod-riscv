@@ -88,7 +88,7 @@ public:
 
 	void init_sha256();
 	void hash_buffer(const char* buffer, int len);
-	bool apply_hash();
+	bool apply_hash(const vrt_ctx*);
 
 	std::string symbol_name(gaddr_t address) const;
 	gaddr_t resolve_address(const char* name) const;

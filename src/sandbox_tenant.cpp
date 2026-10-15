@@ -226,6 +226,13 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug)
 		priv_task->methods = riscv_priv_methods;
 #endif
 	}
+	else if (UNLIKELY(((Script*) priv_task->priv)->vrm() != this)) {
+		VSLb(ctx->vsl, SLT_VCL_Error,
+		    "riscv.fork: '%s' already forked, can't fork '%s'",
+		    ((Script*) priv_task->priv)->name().c_str(),
+		    this->config.name.c_str());
+		return nullptr;
+	}
 	return (Script*) priv_task->priv;
 }
 

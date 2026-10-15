@@ -216,7 +216,7 @@ void Script::machine_setup(machine_t& machine, bool init)
 		[] (riscv::Memory<MARCH>& mem, gaddr_t pageno, const riscv::Page& foreign_page) -> riscv::Page& {
 			riscv::PageAttributes attr = foreign_page.attr;
 			attr.non_owning = true;
-			attr.is_cow = foreign_page.attr.write;
+			attr.is_cow = foreign_page.attr.write || foreign_page.attr.is_cow;
 			attr.write = false;
 			riscv::PageData* data = const_cast<riscv::PageData*>(foreign_page.m_page.get());
 			return mem.allocate_page(pageno, attr, data);
@@ -225,9 +225,10 @@ void Script::machine_setup(machine_t& machine, bool init)
 		auto copy_page = [this] (auto& mem, gaddr_t pageno, riscv::Page& page) -> void {
 			assert(page.attr.is_cow);
 			/* Pages are allocated from workspace */
-			auto* data =
-				(riscv::PageData*) WS_Copy(m_ctx->ws, page.data(), page.size());
+			auto* data = (riscv::PageData*) riscv_ws_alloc_spare(
+				m_ctx->ws, riscv::Page::size(), WS_PAGE_SPARE);
 			if (LIKELY(data != nullptr)) {
+				std::memcpy(data, page.data(), page.size());
 				/* Replace old data with new non-owned data */
 				page.new_data(data, false);
 				page.attr.write = true;
@@ -534,10 +535,10 @@ void Script::hash_buffer(const char* buffer, int len)
 	VSHA256_Update(this->m_sha_ctx, buffer, len);
 	VSLb(ctx()->vsl, SLT_Hash, "%.*s", len, buffer);
 }
-bool Script::apply_hash()
+bool Script::apply_hash(const vrt_ctx* ctx)
 {
-	if (m_sha_ctx && ctx()->req) {
-		riscv_SetHash(ctx()->req, m_sha_ctx);
+	if (m_sha_ctx && ctx->req) {
+		riscv_SetHash(ctx->req, m_sha_ctx);
 		return true;
 	}
 	return false;

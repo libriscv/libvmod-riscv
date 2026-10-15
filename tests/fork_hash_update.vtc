@@ -1,0 +1,101 @@
+varnishtest "RISC-V: one tenant per task, apply_hash in vcl_hash, live update status"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int)
+{
+	static const char key[] = "same-object";
+	syscall3(ECALL_HASH_DATA, (long)key, sizeof(key)-1, 0);
+	decision("lookup", 6, 0);
+}
+
+void start(int, char**) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/a"
+	txresp -body "from a"
+} -start
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"a.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			},
+			"b.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			},
+			"test": {
+				"max_instructions": 1000000
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/live-update") {
+			return (pass);
+		}
+		if (!riscv.fork("a.com")) {
+			return (synth(500));
+		}
+		if (req.url == "/two") {
+			if (riscv.fork("b.com")) {
+				return (synth(200));
+			}
+			return (synth(409));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (hash);
+	}
+
+	sub vcl_hash {
+		if (riscv.apply_hash()) {
+			return (lookup);
+		}
+	}
+
+	sub vcl_backend_fetch {
+		if (bereq.url == "/live-update") {
+			set bereq.backend = riscv.live_update(bereq.http.X-Tenant);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/a"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "from a"
+
+	txreq -url "/b"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "from a"
+
+	txreq -url "/two"
+	rxresp
+	expect resp.status == 409
+
+	txreq -req POST -url "/live-update" -hdr "X-Tenant: b.com" -body "not a program"
+	rxresp
+	expect resp.status == 400
+
+	txreq -req POST -url "/live-update" -hdr "X-Tenant: b.com" -bodyfrom "${tmpdir}/${testname}"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "Update successful\n"
+} -run

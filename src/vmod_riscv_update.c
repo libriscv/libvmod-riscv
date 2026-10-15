@@ -186,7 +186,7 @@ riscvbe_gethdrs(const struct vrt_ctx *other_ctx, const struct director *dir)
 		struct update_result result =
 			riscv_update(&ctx, rvu->machine, &uparams);
 
-		http_PutResponse(bo->beresp, "HTTP/1.1", 200, NULL);
+		http_PutResponse(bo->beresp, "HTTP/1.1", result.status, NULL);
 		http_PrintfHeader(bo->beresp, "Content-Length: %zu", result.len);
 
 		/* store the output in workspace and free result */

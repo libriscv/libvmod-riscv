@@ -1,0 +1,122 @@
+varnishtest "RISC-V: guests see the first header field, and can't unset proto fields"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static long find(const char* name, size_t len) {
+	return syscall3(ECALL_HTTP_FIND, HDR_REQ, (long)name, len);
+}
+static long append(const char* field, size_t len) {
+	return syscall3(ECALL_FIELD_APPEND, HDR_REQ, (long)field, len);
+}
+#define S(x) x, sizeof(x)-1
+
+static void on_recv(int req)
+{
+	char url[128];
+	const long len = get_url(req, url, sizeof(url)-1);
+	url[len < 0 ? 0 : len] = 0;
+
+	if (strcmp(url, "/find") == 0) {
+		const long idx = find(S("X-First"));
+		if (idx >= 0 && idx != 0xFFFFFFFFL) {
+			char buf[64];
+			const long n = header_field(HDR_REQ, idx, buf, sizeof(buf)-1);
+			buf[n < 0 ? 0 : n] = 0;
+			if (strcmp(buf, "X-First: one") == 0)
+				append(S("X-Found: yes"));
+		}
+	} else if (strcmp(url, "/unset") == 0) {
+		const long idx = find(S("X-First"));
+		syscall3(ECALL_FIELD_UNSET, HDR_REQ, idx, 0);
+	} else if (strcmp(url, "/unset-proto") == 0) {
+		syscall3(ECALL_FIELD_UNSET, HDR_REQ, 2, 0);
+	} else if (strcmp(url, "/copy-proto") == 0) {
+		syscall4(ECALL_FIELD_COPY, HDR_REQ, 2, HDR_REQ, 9999);
+	}
+	decision("synth", 5, 299);
+}
+
+void start(int, char**) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			},
+			"test": {
+				"max_instructions": 1000000
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+
+	sub vcl_synth {
+		if (resp.status == 299) {
+			set resp.status = 200;
+			if (req.http.X-Found) {
+				set resp.http.X-Found = req.http.X-Found;
+			}
+			if (req.http.X-First) {
+				set resp.http.X-First = req.http.X-First;
+			}
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/find" -hdr "X-First: one" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Found == "yes"
+	expect resp.http.X-First == "one"
+
+	txreq -url "/unset" -hdr "X-First: one" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-First == <undef>
+} -run
+
+client c2 {
+	txreq -url "/unset-proto" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client c3 {
+	txreq -url "/copy-proto" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client c4 {
+	txreq -url "/find" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Found == <undef>
+} -run

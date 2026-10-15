@@ -161,7 +161,7 @@ int  riscv_current_apply_hash(VRT_CTX)
 {
 	auto* script = rvs::get_machine(ctx);
 	if (script)
-		return script->apply_hash();
+		return script->apply_hash(ctx);
 	return 0;
 }
 extern "C"

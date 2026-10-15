@@ -246,6 +246,13 @@ APICALL(is_storage)
 {
 	machine.set_result(get_script(machine).is_storage());
 }
+struct StorageStack {
+	Script::machine_t& machine;
+	const Script::gaddr_t sp;
+	StorageStack(Script& storage)
+		: machine(storage.machine()), sp(machine.cpu.reg(riscv::REG_SP)) {}
+	~StorageStack() { machine.cpu.reg(riscv::REG_SP) = sp; }
+};
 APICALL(remote_call)
 {
 	auto [func] = machine.sysargs <gaddr_t> ();
@@ -259,6 +266,7 @@ APICALL(remote_call)
 	// === Serialized access to storage === //
 	std::scoped_lock lock(instance.storage_mtx);
 	StorageCtx lease(remote, script.ctx());
+	StorageStack stack(remote);
 	for (int i = 0; i < 4; i++) {
 		// Integer registers
 		stregs.get(10 + i) = myregs.get(11 + i);
@@ -290,7 +298,7 @@ APICALL(remote_call)
 	rmem.set_page_fault_handler(
 		[&s = script] (auto& mem, const size_t pageno, bool) -> auto& {
 			const gaddr_t addr = pageno * riscv::Page::size();
-			if (s.within_heap(addr)) {
+			if (s.within_heap(addr) && !s.within_stack(addr)) {
 				auto& pg = s.machine().memory.create_writable_pageno(pageno);
 				// The page is created on the source Machine, but we need
 				// to invalidate the page on the remote Machine too:
@@ -341,6 +349,7 @@ APICALL(remote_strcall)
 	// === Serialized access to storage === //
 	std::scoped_lock lock(instance.storage_mtx);
 	StorageCtx lease(remote, script.ctx());
+	StorageStack stack(remote);
 
 	gaddr_t gaddr = remote.guest_alloc(len+1);
 	if (gaddr == 0) {
@@ -918,7 +927,7 @@ APICALL(header_field_copy)
 			machine.set_result(field_length(src_field));
 			return;
 		}
-		else /* In VCL you can unset a header field by assigning it
+		else if (index >= HDR_FIRST) /* In VCL you can unset a header field by assigning it
 			to a non-existing other header field. */
 		{
 			http_unsetat(hp, index);

@@ -9,13 +9,13 @@ extern std::vector<uint8_t> file_loader(const std::string& filename);
 extern std::string apply_dollar_vars(std::string str);
 
 constexpr update_result
-static_result(const char* text) {
-	return { text, __builtin_strlen(text), nullptr };
+static_result(const char* text, unsigned status) {
+	return { text, __builtin_strlen(text), nullptr, status };
 }
 static update_result
-dynamic_result(const char* text) {
+dynamic_result(const char* text, unsigned status) {
 	return { strdup(text), __builtin_strlen(text),
-		[] (update_result* res) { free((void*) res->output); } };
+		[] (update_result* res) { free((void*) res->output); }, status };
 }
 
 static bool file_writer(const std::string& filename, const std::vector<uint8_t>& binary)
@@ -38,7 +38,7 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 
 	/* ELF loader will not be run for empty binary */
 	if (UNLIKELY(params->data == nullptr || params->len == 0)) {
-		return static_result("Empty file received");
+		return static_result("Empty file received", 400);
 	}
 	try {
 		/* Two updates racing would hand the state of the program both
@@ -118,26 +118,26 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 				const int len = snprintf(buffer, sizeof(buffer),
 					"Could not write '%s'", vrm->config.filename.c_str());
 				VSLb(ctx->vsl, SLT_Error, "%.*s", len, buffer);
-				return dynamic_result(buffer);
+				return dynamic_result(buffer, 500);
 			}
 			/* A reload with an unchanged configuration keeps this
 			   program rather than loading the file it just wrote. */
 			vrm->file_stamp = FileStamp::of(vrm->program_path());
 		}
-		return static_result("Update successful\n");
+		return static_result("Update successful\n", 200);
 	} catch (const riscv::MachineException& e) {
 		if (e.type() == riscv::OUT_OF_MEMORY) {
 			/* Pass helpful explanation when OOM */
-			return static_result("Program ran out of memory, update not applied");
+			return static_result("Program ran out of memory, update not applied", 400);
 		}
 		/* Pass machine error back to the client */
 		char buffer[2048];
 		snprintf(buffer, sizeof(buffer),
 			"Machine exception: %s (data: 0x%lX)\n", e.what(), e.data());
-		return dynamic_result(buffer);
+		return dynamic_result(buffer, 400);
 	} catch (const std::exception& e) {
 		/* Pass unknown error back to the client */
-		return dynamic_result(e.what());
+		return dynamic_result(e.what(), 400);
 	}
 }
 

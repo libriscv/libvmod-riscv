@@ -59,12 +59,6 @@ int riscv_delete(VRT_CTX)
 }
 
 extern "C"
-int  riscv_apply_hash(rvs::Script* script)
-{
-	return script->apply_hash();
-}
-
-extern "C"
 long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* argument)
 {
 	using namespace rvs;
