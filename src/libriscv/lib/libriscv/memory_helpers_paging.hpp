@@ -168,7 +168,6 @@ riscv::Buffer Memory<W>::membuffer(address_t addr,
 	if (UNLIKELY(datalen > maxlen))
 		protection_fault(addr);
 
-	// An empty buffer may be at any address, even null (an empty slice)
 	if (datalen == 0)
 		return result;
 
