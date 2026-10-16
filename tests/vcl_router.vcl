@@ -34,8 +34,6 @@ sub vcl_hit {
 		return (synth(riscv.want_status(), riscv.want_reason()));
 	} else if (riscv.want_result() == "pass") {
 		return (pass);
-	} else if (riscv.want_result() == "miss") {
-		return (miss);
 	} else if (riscv.want_result() == "deliver") {
 		return (deliver);
 	}
