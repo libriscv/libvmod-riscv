@@ -149,10 +149,56 @@ fn on_deliver(_a: u32, _b: u32) {
 	add_full_resp_header(get_req_header("X-Hello").as_str());
 }
 
+fn token_ok(token: &str) -> bool {
+	!token.is_empty() && token.len() <= 128 && token.bytes().all(|c|
+		c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.')
+}
+
+fn push_uri(out: &mut Vec<u8>, uri: &[u8], token: &str) {
+	out.extend_from_slice(uri);
+	out.push(if uri.contains(&b'?') { b'&' } else { b'?' });
+	out.extend_from_slice(b"token=");
+	out.extend_from_slice(token.as_bytes());
+}
+
+fn find_uri_attribute(line: &[u8]) -> Option<(usize, usize)> {
+	let start = line.windows(5).position(|w| w == b"URI=\"")? + 5;
+	let len = line[start..].iter().position(|&c| c == b'"')?;
+	Some((start, start + len))
+}
+
+fn manifest_tokens<'a>(token: &'a str, body: &'a mut [u8]) -> Option<DeliverResponse<'a>> {
+	if !token_ok(token) {
+		deliver_response(403, "text/plain", b"Invalid token");
+	}
+	let mut out = Vec::with_capacity(body.len() + body.len() / 4);
+	for line in body.split_inclusive(|&c| c == b'\n') {
+		let eol = line.iter().rev().take_while(|&&c| c == b'\n' || c == b'\r').count();
+		let (text, ending) = line.split_at(line.len() - eol);
+		if text.is_empty() {
+		} else if text[0] != b'#' {
+			push_uri(&mut out, text, token);
+		} else if let Some((start, end)) = find_uri_attribute(text) {
+			out.extend_from_slice(&text[..start]);
+			push_uri(&mut out, &text[start..end], token);
+			out.extend_from_slice(&text[end..]);
+		} else {
+			out.extend_from_slice(text);
+		}
+		out.extend_from_slice(ending);
+	}
+	Some(DeliverResponse {
+		status: 200,
+		content_type: "application/vnd.apple.mpegurl",
+		body: out.into(),
+	})
+}
+
 pub fn main() {
 	println!("RISC-V Rust example program started");
 	register_function("verify_signature", verify_signature);
 	register_function("create_token", create_token);
+	deliver_transform!("on_manifest", manifest_tokens);
 	set_on_deliver(on_deliver);
 	wait_for_requests(on_client_request);
 }

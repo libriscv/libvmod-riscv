@@ -1,5 +1,7 @@
 use core::arch::asm;
 use core::str;
+use std::borrow::Cow;
+use std::ffi::{c_char, CStr};
 pub enum SysCalls {
 	Print = 500 + 2,
 	RegisterCallback = 500 + 9,
@@ -20,6 +22,11 @@ pub struct BackendResponse {
 	pub status: u16,
 	pub content_type: &'static str,
 	pub body: Vec<u8>,
+}
+pub struct DeliverResponse<'a> {
+	pub status: u16,
+	pub content_type: &'a str,
+	pub body: Cow<'a, [u8]>,
 }
 
 #[allow(unused)]
@@ -174,6 +181,57 @@ pub fn backend_response(status: u16, content_type: &str, body: &[u8]) -> !
 	unreachable!();
 }
 
+#[allow(unused)]
+pub fn deliver_response(status: u16, content_type: &str, body: &[u8]) -> !
+{
+	unsafe {
+		asm!(".insn i SYSTEM, 0, x0, x0, 0x7ff",
+			in("a0") status as u32,
+			in("a1") content_type.as_ptr(),
+			in("a2") content_type.len(),
+			in("a3") body.as_ptr(),
+			in("a4") body.len(),
+			options(noreturn)
+		);
+	}
+}
+
+#[allow(unused)]
+#[doc(hidden)]
+pub unsafe fn deliver_trampoline(arg: *const c_char, data: *mut u8, len: usize,
+	func: for<'a> fn(&'a str, &'a mut [u8]) -> Option<DeliverResponse<'a>>)
+{
+	let arg = str::from_utf8_unchecked(CStr::from_ptr(arg).to_bytes());
+	let body: &mut [u8] = if len == 0 { &mut [] } else { core::slice::from_raw_parts_mut(data, len) };
+	if let Some(resp) = func(arg, body) {
+		deliver_response(resp.status, resp.content_type, &resp.body);
+	}
+}
+
+#[allow(unused)]
+#[doc(hidden)]
+pub fn register_deliver_transform(name: &str, func: extern "C" fn(*const c_char, *mut u8, usize))
+{
+	unsafe {
+		asm!("ecall",
+			in("a7") 539,
+			in("a0") name.as_ptr(),
+			in("a1") name.len(),
+			in("a2") func as *const ()
+		);
+	}
+}
+
+#[macro_export]
+macro_rules! deliver_transform {
+	($name:expr, $func:path) => {{
+		extern "C" fn deliver_entry(arg: *const std::ffi::c_char, data: *mut u8, len: usize) {
+			unsafe { $crate::varnish::deliver_trampoline(arg, data, len, $func) }
+		}
+		$crate::varnish::register_deliver_transform($name, deliver_entry);
+	}};
+}
+
 fn trampoline(func: fn(u32, u32) -> BackendResponse) {
 	const BEREQ:  u32 = 4; // HDR_BEREQ
 	const BERESP: u32 = 5; // HDR_BERESP
@@ -287,12 +345,20 @@ pub fn set_on_deliver(callback: fn(u32, u32))
 	register_callback(7, callback); // 7 = on_deliver
 }
 
-fn fast_exit() -> !
-{
-	unsafe {
-		asm!(".insn i SYSTEM, 0, x0, x0, 0x7ff");
-	}
-	unreachable!();
+core::arch::global_asm!(
+	".pushsection .text.varnish_fast_exit, \"ax\", @progbits",
+	".cfi_startproc",
+	".cfi_undefined ra",
+	"nop",
+	".global varnish_fast_exit",
+	"varnish_fast_exit:",
+	".insn i SYSTEM, 0, x0, x0, 0x7ff",
+	"j varnish_fast_exit",
+	".cfi_endproc",
+	".popsection",
+);
+extern "C" {
+	fn varnish_fast_exit() -> !;
 }
 
 #[allow(unused)]
@@ -302,7 +368,7 @@ pub fn wait_for_requests(callback: fn(u32, u32))
 		asm!("ecall",
 			in("a7") SysCalls::SetDecision as i32,
 			in("a0") callback as *const (),
-			in("a1") fast_exit as *const ()
+			in("a1") varnish_fast_exit as *const ()
 		);
 	}
 }

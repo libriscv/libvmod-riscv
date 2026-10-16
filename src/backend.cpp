@@ -179,7 +179,8 @@ int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
 		script->set_ctx(old_ctx);
 
 		/* A function that returns instead of responding has no answer */
-		if (machine.cpu.pc() == machine.memory.exit_address())
+		const auto exit_pc = machine.memory.exit_address();
+		if (machine.cpu.pc() == exit_pc || machine.cpu.pc() == exit_pc + 4)
 			throw std::runtime_error("function '" + std::string(func) + "' returned without a response");
 
 		const auto [status, type, data, datalen] =

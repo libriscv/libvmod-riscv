@@ -1,0 +1,192 @@
+varnishtest "RISC-V deliver_transform with a Rust guest"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+feature cmd "command -v cargo && command -v riscv64-linux-gnu-gcc-14"
+feature cmd "rustup target list --installed 2>/dev/null | grep -q riscv64gc-unknown-linux-gnu"
+
+shell {
+mkdir -p ${tmpdir}/rust/src ${tmpdir}/rust/.cargo
+cp ${testdir}/../program/rust/.cargo/config ${tmpdir}/rust/.cargo/config.toml
+cat >${tmpdir}/rust/Cargo.toml <<-EOF
+[package]
+name = "deliver"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 2
+EOF
+cat >${tmpdir}/rust/src/main.rs <<-EOF
+#[path = "${testdir}/../program/rust/src/sysalloc.rs"]
+mod sysalloc;
+#[path = "${testdir}/../program/rust/src/varnish.rs"]
+mod varnish;
+use std::borrow::Cow;
+use varnish::*;
+
+fn on_body<'a>(arg: &'a str, body: &'a mut [u8]) -> Option<DeliverResponse<'a>> {
+	match arg {
+		"none" => return None,
+		"deny" => deliver_response(403, "text/plain", b"Denied by Rust"),
+		"panic" => panic!("on_body"),
+		"badstatus" => return Some(DeliverResponse {
+			status: 42,
+			content_type: "text/plain",
+			body: Cow::Borrowed(b"bad"),
+		}),
+		_ => {}
+	}
+	if let Some(name) = arg.strip_prefix("hello:") {
+		return Some(DeliverResponse {
+			status: 201,
+			content_type: "text/html",
+			body: format!("<p>Hello {}, {} bytes</p>", name, body.len()).into_bytes().into(),
+		});
+	}
+	body.make_ascii_uppercase();
+	Some(DeliverResponse {
+		status: 200,
+		content_type: "text/x-upper",
+		body: Cow::Borrowed(body),
+	})
+}
+
+fn on_lower<'a>(_arg: &'a str, body: &'a mut [u8]) -> Option<DeliverResponse<'a>> {
+	body.make_ascii_lowercase();
+	Some(DeliverResponse {
+		status: 200,
+		content_type: "text/x-lower",
+		body: Cow::Borrowed(body),
+	})
+}
+
+fn on_recv(_a: u32, _b: u32) {}
+
+pub fn main() {
+	deliver_transform!("on_body", on_body);
+	deliver_transform!("on_lower", on_lower);
+	wait_for_requests(on_recv);
+}
+EOF
+cd ${tmpdir}/rust && cargo build --release --offline --quiet
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/upper"
+	txresp -hdr {ETag: "abc"} -hdr "Content-Type: text/plain" -body "hello World"
+
+	rxreq
+	expect req.url == "/big"
+	txresp -bodylen 300000
+
+	rxreq
+	expect req.url == "/empty"
+	txresp -body ""
+} -start
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/rust/target/riscv64gc-unknown-linux-gnu/release/deliver",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		return (hash);
+	}
+
+	sub vcl_deliver {
+		if (req.http.X-Raw) {
+			return (deliver);
+		}
+		if (!riscv.deliver_transform(req.http.X-Func, req.http.X-Mode)) {
+			return (synth(503));
+		}
+	}
+} -start
+
+logexpect l1 -v v1 -g raw {
+	expect * * Error "function 'on_body' returned without a response"
+	expect * * Error "Invalid deliver response status: 42"
+	expect * * Error "function 'on_missing' not found"
+} -start
+
+client c1 {
+	txreq -url "/upper" -hdr "X-Func: on_body"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "HELLO WORLD"
+	expect resp.http.Content-Type == "text/x-upper"
+	expect resp.http.Content-Length == 11
+	expect resp.http.ETag == <undef>
+
+	txreq -url "/upper" -hdr "X-Func: on_lower"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "hello world"
+	expect resp.http.Content-Type == "text/x-lower"
+
+	txreq -url "/upper" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body == "hello World"
+	expect resp.http.ETag == {"abc"}
+
+	txreq -url "/upper" -hdr "X-Func: on_body" -hdr "X-Mode: hello:alice"
+	rxresp
+	expect resp.status == 201
+	expect resp.http.Content-Type == "text/html"
+	expect resp.body == "<p>Hello alice, 11 bytes</p>"
+
+	txreq -url "/upper" -hdr "X-Func: on_body" -hdr "X-Mode: deny"
+	rxresp
+	expect resp.status == 403
+	expect resp.body == "Denied by Rust"
+
+	txreq -url "/upper" -hdr "X-Func: on_body" -hdr "X-Mode: none"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Func: on_body" -hdr "X-Mode: badstatus"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Func: on_body" -hdr "X-Mode: panic"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Func: on_missing"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/big" -hdr "X-Func: on_body"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 300000
+
+	txreq -url "/empty" -hdr "X-Func: on_body"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 0
+	expect resp.http.Content-Type == "text/x-upper"
+
+	txreq -url "/empty" -hdr "X-Func: on_body" -hdr "X-Mode: hello:bob"
+	rxresp
+	expect resp.status == 201
+	expect resp.body == "<p>Hello bob, 0 bytes</p>"
+} -run
+
+logexpect l1 -wait
+
+varnish v1 -expect client_req == 12
+varnish v1 -expect sess_conn == 1
