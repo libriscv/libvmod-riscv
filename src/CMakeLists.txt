@@ -8,6 +8,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	script.cpp
 	script_debug.cpp
 	script_functions.cpp
+	script_base64.cpp
 	script_sha256.cpp
 	tenancy.cpp
 	varnish_cpp_interface.cpp

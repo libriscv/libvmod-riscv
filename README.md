@@ -101,6 +101,16 @@ pub fn main() {
 }
 ```
 
+## JWT example programs
+
+HS256 JSON Web Tokens are verified and issued by [jwt.cpp](/program/cpp/jwt.cpp) and [rust-jwt](/program/rust-jwt/src/main.rs), using the native base64 (`api::base64_encode/decode`, `varnish::base64_encode/decode`) and SHA-256 system calls. Both register functions that VCL calls:
+```vcl
+set req.http.X-JWT-Sub = riscv.call("jwt_verify", req.http.Authorization);
+if (req.http.X-JWT-Sub == "") {
+	return (synth(401));
+}
+```
+
 ## JavaScript example program
 
 Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required — the JavaScript source is passed as a string directly in your VCL via `add_main_argument`.

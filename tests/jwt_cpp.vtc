@@ -1,0 +1,128 @@
+varnishtest "RISC-V JWT example in C++, verified and signed from VCL"
+
+feature cmd "ls /usr/bin/riscv64-linux-gnu-g++* >/dev/null 2>&1"
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"jwt": {
+				"filename": "${testdir}/../program/cpp/jwt.cpp",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		unset req.http.X-JWT-Sub;
+		if (!riscv.fork("jwt")) {
+			return (synth(500));
+		}
+		if (req.url == "/token") {
+			set req.http.X-Token = riscv.call("jwt_sign", req.http.X-Subject);
+			set req.http.X-JWT-Sub = riscv.call("jwt_verify", "Bearer " + req.http.X-Token);
+			return (synth(200));
+		}
+		set req.http.X-JWT-Sub = riscv.call("jwt_verify", req.http.Authorization);
+		if (req.http.X-JWT-Sub == "") {
+			return (synth(401));
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.X-Token = req.http.X-Token;
+		set resp.http.X-JWT-Sub = req.http.X-JWT-Sub;
+	}
+} -start
+
+client c1 {
+	txreq -url "/token" -hdr "X-Subject: alice"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Token ~ "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$"
+	expect resp.http.X-JWT-Sub == "alice"
+
+	txreq -url "/token"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Token == ""
+	expect resp.http.X-JWT-Sub == ""
+
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9.lK7jHvhP9YNG-fJPW7J5BegMlwdu_uJHe24YHa4wOsE"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-JWT-Sub == "bob"
+
+	txreq -hdr "Authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9.lK7jHvhP9YNG-fJPW7J5BegMlwdu_uJHe24YHa4wOsE"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-JWT-Sub == "bob"
+
+	txreq -hdr "X-JWT-Sub: admin"
+	rxresp
+	expect resp.status == 401
+
+	# Expired
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJleHAiOjEwMDAwMDAwMDB9.ycfvOZnFm4LC23qoduOtRsGFipnRNLN9X26IYkLVlis"
+	rxresp
+	expect resp.status == 401
+
+	# Not yet valid
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJuYmYiOjQxMDI0NDQ4MDAsImV4cCI6NDEwMjQ0NDkwMH0.Qp4SDM9MaKdMMTO2f90kpTbNlQHCi4BfVGyrFn8qzCM"
+	rxresp
+	expect resp.status == 401
+
+	# Signed with another key
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9.ZoAiUcyeg8y4b-yp_q3R5UDhnir3_IXGPSspj6hRMI8"
+	rxresp
+	expect resp.status == 401
+
+	# alg: none
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9."
+	rxresp
+	expect resp.status == 401
+
+	# alg: HS512, signed with the right key
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9.5uKI6o6Ufe8HX0MAnMuzXxOz0OkRmW6JbzaBZafqG3U"
+	rxresp
+	expect resp.status == 401
+
+	# Padded signature
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IiLCJleHAiOjQxMDI0NDQ4MDB9.lK7jHvhP9YNG-fJPW7J5BegMlwdu_uJHe24YHa4wOsE="
+	rxresp
+	expect resp.status == 401
+
+	# Tampered payload
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJldmUiLCJleHAiOjQxMDI0NDQ4MDB9.lK7jHvhP9YNG-fJPW7J5BegMlwdu_uJHe24YHa4wOsE"
+	rxresp
+	expect resp.status == 401
+
+	# No exp
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJib2IifQ.ocLAGg8kOiHygnYzU3GKQCn1nwYQzkC9skCwfAjEktk"
+	rxresp
+	expect resp.status == 401
+
+	# Control character in sub
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhXHUwMDAxYiIsImV4cCI6NDEwMjQ0NDgwMH0.bUGnkFRfIsGbC8t3nTGEkQJEhXHAuiG8R7eg4kK4Bew"
+	rxresp
+	expect resp.status == 401
+
+	# No sub
+	txreq -hdr "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDB9.7M-xvUjA3LmdIdOXBf62t_qj7re3FRYGgjnei7HrphA"
+	rxresp
+	expect resp.status == 401
+
+	txreq -hdr "Authorization: Bearer not.a.token"
+	rxresp
+	expect resp.status == 401
+
+	txreq -hdr "Authorization: Bearer a.b.c.d"
+	rxresp
+	expect resp.status == 401
+} -run

@@ -1,0 +1,153 @@
+varnishtest "RISC-V native base64: RFC 4648 vectors, URL alphabet, padding and strict decoding"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+static long b64(long flags, const char* src, long srclen, char* dst, long dstlen)
+{
+	register long a0 asm("a0") = flags;
+	register long a1 asm("a1") = (long) src;
+	register long a2 asm("a2") = srclen;
+	register long a3 asm("a3") = (long) dst;
+	register long a4 asm("a4") = dstlen;
+	register long syscall_id asm("a7") = ECALL_BASE64;
+	asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(syscall_id) : "memory");
+	return a0;
+}
+
+static long slen(const char* s)
+{
+	long n = 0;
+	while (s[n]) n++;
+	return n;
+}
+
+enum { D = BASE64_FLAG_DECODE, U = BASE64_FLAG_URL, N = BASE64_FLAG_NOPAD };
+struct Case { long flags; const char* in; const char* out; };
+static const Case cases[] = {
+	{0, "", ""},
+	{0, "f", "Zg=="},
+	{0, "fo", "Zm8="},
+	{0, "foo", "Zm9v"},
+	{0, "foob", "Zm9vYg=="},
+	{0, "fooba", "Zm9vYmE="},
+	{0, "foobar", "Zm9vYmFy"},
+	{N, "f", "Zg"},
+	{N, "fo", "Zm8"},
+	{N, "foo", "Zm9v"},
+	{0, "\xfb\xff\xbf", "+/+/"},
+	{U, "\xfb\xff\xbf", "-_-_"},
+	{U|N, "\xfb\xff", "-_8"},
+	{D, "", ""},
+	{D, "Zg==", "f"},
+	{D, "Zm8=", "fo"},
+	{D, "Zm9vYmFy", "foobar"},
+	{D, "Zg", "f"},
+	{D, "Zm8", "fo"},
+	{D, "+/+/", "\xfb\xff\xbf"},
+	{D|U, "-_-_", "\xfb\xff\xbf"},
+	{D|U|N, "-_8", "\xfb\xff"},
+	{D, "-_-_", 0},
+	{D|U, "+/+/", 0},
+	{D|N, "Zg==", 0},
+	{D, "Z", 0},
+	{D, "Zg=", 0},
+	{D, "Zg===", 0},
+	{D, "Z===", 0},
+	{D, "====", 0},
+	{D, "Zm=v", 0},
+	{D, " Zm9v", 0},
+	{D, "Zm9v\nYmFy", 0},
+	{D, "Zm9v\x80", 0},
+	{0x8, "foo", 0},
+};
+
+static const char mime[] = "text/plain";
+
+static void fail(const char* why)
+{
+	synth(500, mime, sizeof(mime)-1, why, slen(why));
+}
+
+void on_synth()
+{
+	char buf[64];
+	for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		const Case& c = cases[i];
+		for (unsigned j = 0; j < sizeof(buf); j++) buf[j] = '#';
+		const long len = b64(c.flags, c.in, slen(c.in), buf, sizeof(buf));
+		if (c.out == 0) {
+			if (len != -1) fail("accepted invalid input");
+			continue;
+		}
+		if (len != slen(c.out)) fail("wrong length");
+		for (long j = 0; j < len; j++)
+			if (buf[j] != c.out[j]) fail("wrong output");
+		if (buf[len] != '#') fail("wrote past the output");
+	}
+
+	for (unsigned j = 0; j < sizeof(buf); j++) buf[j] = '#';
+	if (b64(0, "foo", 3, buf, 4) != 4) fail("exact encode");
+	if (b64(0, "foo", 3, buf + 8, 3) != -1 || buf[8] != '#') fail("short encode");
+	if (b64(N, "f", 1, buf + 16, 2) != 2 || buf[18] != '#') fail("exact nopad encode");
+	if (b64(D, "Zg", 2, buf + 24, 1) != 1 || buf[24] != 'f' || buf[25] != '#') fail("exact decode");
+	if (b64(D, "Zm9v", 4, buf + 32, 2) != -1 || buf[32] != '#') fail("short decode");
+	if (b64(D, "Zg==", 4, buf + 40, 0) != -1 || buf[40] != '#') fail("empty decode");
+
+	char out[16];
+	const long len = b64(U|N, "\xfb\xff", 2, out, sizeof(out));
+	synth(200, mime, sizeof(mime)-1, out, len);
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "-_8"
+} -run

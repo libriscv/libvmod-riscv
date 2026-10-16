@@ -178,6 +178,44 @@ inline void hash_data(const HeaderField& hf)
 	hash_data(data);
 }
 
+inline std::string base64_encode(std::string_view data, unsigned flags)
+{
+	std::string out((data.size() + 2) / 3 * 4, '\0');
+	asm ("" ::: "memory");
+	const long len = syscall(ECALL_BASE64, flags & ~BASE64_FLAG_DECODE,
+		(long) data.data(), data.size(), (long) out.data(), out.size());
+	asm ("" ::: "memory");
+	out.resize(len < 0 ? 0 : len);
+	return out;
+}
+inline std::optional<std::string> base64_decode(std::string_view text, unsigned flags)
+{
+	std::string out(text.size() / 4 * 3 + 2, '\0');
+	asm ("" ::: "memory");
+	const long len = syscall(ECALL_BASE64, flags | BASE64_FLAG_DECODE,
+		(long) text.data(), text.size(), (long) out.data(), out.size());
+	asm ("" ::: "memory");
+	if (len < 0)
+		return std::nullopt;
+	out.resize(len);
+	return out;
+}
+
+inline void register_function(std::string_view name, function_t func)
+{
+	asm ("" ::: "memory");
+	syscall(ECALL_REGISTER_FUNC, (long) name.data(), name.size(), (long) func);
+}
+
+inline std::array<uint8_t, 32> sha256(std::string_view data)
+{
+	std::array<uint8_t, 32> digest;
+	asm ("" ::: "memory");
+	syscall(ECALL_SHA256, (long) data.data(), data.size(), (long) digest.data(), digest.size());
+	asm ("" ::: "memory");
+	return digest;
+}
+
 inline HeaderField::HeaderField(gethdr_e wh, size_t idx)
 	: where(wh), index(idx)
 {

@@ -4,7 +4,9 @@
 **/
 #pragma once
 #include <engine.hpp>
+#include <array>
 #include <memory>
+#include <optional>
 #include "api_structs.h"
 #define PPT() template <typename... Args>
 
@@ -28,6 +30,13 @@ void hash_data(const HeaderField&);
 
 /* Caching */
 void make_uncacheable_for(float secs);
+
+/* Base64 (RFC 4648), flags: BASE64_FLAG_URL, BASE64_FLAG_NOPAD */
+std::string base64_encode(std::string_view data, unsigned flags = 0);
+std::optional<std::string> base64_decode(std::string_view text, unsigned flags = 0);
+
+/* SHA-256 */
+std::array<uint8_t, 32> sha256(std::string_view data);
 
 /* Regular expressions */
 struct Regex {
@@ -144,6 +153,10 @@ enum Callback {
 };
 void set_on_deliver(void (*func)(Request, Response));
 void set_on_deliver(void (*func)(Request, Response, const char*));
+
+/* Make a function callable from VCL with riscv.call(name, arg) */
+using function_t = const char* (*)(const char* arg, size_t len);
+void register_function(std::string_view name, function_t func);
 
 /*  */
 inline bool is_storage() {

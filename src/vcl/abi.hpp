@@ -7,10 +7,10 @@
  * Carapace's scripting ABI.
  *
  * Numbers are Carapace's 490..=510 shifted by 50, so the whole block sits
- * between the VMOD's own API (500..=539, machine/syscalls.h) and the native
- * heap and memory helpers (580.., NATIVE_SYSCALLS_BASE). The compiler's
- * `define_syscalls!` table (vcl/compiler/src/ir.rs) is the other half of
- * this file; a number changed here has to change there.
+ * between the VMOD's own API (500..=539, machine/syscalls.h; its base64 is
+ * 570) and the native heap and memory helpers (580.., NATIVE_SYSCALLS_BASE).
+ * The compiler's `define_syscalls!` table (vcl/compiler/src/ir.rs) is the
+ * other half of this file; a number changed here has to change there.
  *
  * Arguments are in a0..a6 and the result in a0. Strings are (pointer,
  * length) pairs, never NUL-terminated. -1 is a refusal: the generated code

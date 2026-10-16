@@ -383,20 +383,59 @@ macro_rules! print {
 }
 
 #[allow(unused)]
-pub fn decode_base64(input: &[u8]) -> Vec<u8> {
-	let mut len: i32;
+pub const BASE64_URL: u32 = 0x2;
+#[allow(unused)]
+pub const BASE64_NOPAD: u32 = 0x4;
+const BASE64_DECODE: u32 = 0x1;
+
+fn base64_call(flags: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
+	let len: isize;
 	unsafe {
-		// The decoded bytes is always smaller than the input
-		let mut buf: Vec<u8> = Vec::with_capacity(input.len()+1);
 		asm!("ecall",
-			in("a7") 538, // BASE64_DECODE
-			in("a0") input.as_ptr(),
-			in("a1") input.len(),
-			in("a2") buf.as_mut_ptr(),
-			in("a3") buf.capacity(),
-			lateout("a0") len
+			in("a7") 570, // BASE64
+			inlateout("a0") flags as usize => len,
+			in("a1") input.as_ptr(),
+			in("a2") input.len(),
+			in("a3") out.as_mut_ptr(),
+			in("a4") out.capacity()
 		);
-		buf.set_len(len as usize);
-		buf
+		if len < 0 || len as usize > out.capacity() {
+			return false;
+		}
+		out.set_len(len as usize);
 	}
+	true
+}
+
+#[allow(unused)]
+pub fn base64_encode(input: &[u8], flags: u32) -> String {
+	let mut out = Vec::with_capacity((input.len() + 2) / 3 * 4);
+	base64_call(flags & !BASE64_DECODE, input, &mut out);
+	unsafe { String::from_utf8_unchecked(out) }
+}
+
+#[allow(unused)]
+pub fn base64_decode(input: &[u8], flags: u32) -> Option<Vec<u8>> {
+	let mut out = Vec::with_capacity(input.len() / 4 * 3 + 2);
+	base64_call(flags | BASE64_DECODE, input, &mut out).then_some(out)
+}
+
+#[allow(unused)]
+pub fn decode_base64(input: &[u8]) -> Vec<u8> {
+	base64_decode(input, 0).unwrap_or_default()
+}
+
+#[allow(unused)]
+pub fn sha256(input: &[u8]) -> [u8; 32] {
+	let mut digest = [0u8; 32];
+	unsafe {
+		asm!("ecall",
+			in("a7") 536, // SHA256
+			inlateout("a0") input.as_ptr() => _,
+			in("a1") input.len(),
+			in("a2") digest.as_mut_ptr(),
+			in("a3") digest.len()
+		);
+	}
+	digest
 }

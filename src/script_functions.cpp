@@ -1142,6 +1142,7 @@ APICALL(regex_delete)
 }
 
 void sha256(machine_t&);
+void base64(machine_t&);
 
 APICALL(base64_decode)
 {
@@ -1239,6 +1240,7 @@ void Script::setup_syscall_interface()
 	for (size_t i = 0; i < handlers.size(); i++) {
 		machine_t::install_syscall_handler(SYSCALL_BASE + i, handlers[i]);
 	}
+	machine_t::install_syscall_handler(ECALL_BASE64, base64);
 
 	// A custom intruction used to handle indexed dynamic calls.
 	using namespace riscv;
