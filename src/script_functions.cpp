@@ -10,6 +10,10 @@
 #include "vcl/vcl_varnish.h"
 extern "C" {
 # include "varnish_interface.h"
+# include "update_result.h"
+#ifndef VARNISH_PLUS
+# include <vrt_obj.h>
+#endif
 enum {
 #define SLTH(tag, ind, req, resp, sdesc, ldesc)	ind,
 #include "tbl/vsl_tags_http.h"
@@ -57,22 +61,22 @@ get_http(VRT_CTX, int where)
 {
 	struct http* hp = nullptr;
 	switch (where) {
-	case HDR_REQ:
+	case GUEST_HDR_REQ:
 		hp = ctx->http_req;
 		break;
-	case HDR_REQ_TOP:
+	case GUEST_HDR_REQ_TOP:
 		hp = ctx->http_req_top;
 		break;
-	case HDR_BEREQ:
+	case GUEST_HDR_BEREQ:
 		hp = ctx->http_bereq;
 		break;
-	case HDR_BERESP:
+	case GUEST_HDR_BERESP:
 		hp = ctx->http_beresp;
 		break;
-	case HDR_RESP:
+	case GUEST_HDR_RESP:
 		hp = ctx->http_resp;
 		break;
-	case HDR_OBJ:
+	case GUEST_HDR_OBJ:
 		throw std::runtime_error("Object headers (HDR_OBJ) are not supported");
 	}
 	if (UNLIKELY(hp == nullptr))
@@ -82,7 +86,7 @@ get_http(VRT_CTX, int where)
 inline std::tuple<http*, txt&>
 get_field(VRT_CTX, int where, uint32_t index)
 {
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	if (is_valid_index(hp, index))
 	{
@@ -512,7 +516,7 @@ APICALL(synth)
 		ctx->method == VCL_MET_BACKEND_ERROR)
 	{
 		// Synth responses are always using HDR_RESP
-		auto* hp = get_http(ctx, HDR_RESP);
+		auto* hp = get_http(ctx, GUEST_HDR_RESP);
 		const auto [status, type, data] = machine.sysargs<uint16_t, riscv::Buffer, riscv::Buffer> ();
 		/* http_SetStatus() asserts on the last three digits */
 		if (UNLIKELY(status % 1000 < 100))
@@ -533,15 +537,27 @@ APICALL(synth)
 		else
 			http_PrintfHeader(hp, "Content-Type: %.*s", (int)type.size(), type.to_string().c_str());
 
+#ifndef VARNISH_PLUS
+#if __has_include("cache/cache_int.h")
+		auto* body = (char *)WS_Alloc(ctx->ws, data.size() + 1);
+		if (UNLIKELY(body == nullptr))
+			throw std::runtime_error("Out of workspace for synth content");
+		data.copy_to(body, data.size());
+		VCL_BLOB blob = VRT_blob(ctx, "riscv.synth", body, data.size(), 0);
+#else
+		const std::string buf = data.to_string();
+		VCL_BLOB blob = VRT_blob(ctx, "riscv.synth", buf.data(), buf.size(), 0);
+#endif
+		if (UNLIKELY(blob == nullptr))
+			throw std::runtime_error("Out of workspace for synth content");
+		if (ctx->method == VCL_MET_SYNTH)
+			VRT_l_resp_body(ctx, LBODY_SET_BLOB, nullptr, blob);
+		else
+			VRT_l_beresp_body(ctx, LBODY_SET_BLOB, nullptr, blob);
+#else
 		auto* vsb = (struct vsb *)ctx->specific;
 		assert(vsb != nullptr);
 
-#ifndef VARNISH_PLUS
-		// There is no VSB_new in open-source Varnish
-		VSB_clear(vsb);
-		const std::string buf = data.to_string();
-		VSB_bcat(vsb, buf.data(), buf.size());
-#else
 		// The body is always copied out of the guest. Varnish writes a
 		// NUL after it, which would land past the end of a guest page,
 		// or in a page every fork shares with the master (rodata, or
@@ -619,7 +635,7 @@ APICALL(foreach_header_field)
 	auto [where, func, data] = machine.sysargs<int, gaddr_t, gaddr_t> ();
 
 	const auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	auto& script = get_script(machine);
 
@@ -635,7 +651,7 @@ APICALL(foreach_header_field)
 		if (len == 0)
 			continue;
 
-		const guest_header_field gf {(gethdr_e) where, idx, false, true};
+		const guest_header_field gf {where, idx, false, true};
 		machine.copy_to_guest(iterator, &gf, sizeof(gf));
 		iterator += sizeof(gf);
 		acount ++; /* Actual */
@@ -669,7 +685,7 @@ APICALL(http_find_name)
 {
 	const auto [where, fieldname] = machine.sysargs<int, riscv::Buffer> ();
 	auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	if (fieldname.is_sequential())
 	{
@@ -703,8 +719,8 @@ APICALL(http_copy_from)
 		return;
 	}
 
-	auto [hp_from, field_from] = get_field(ctx, (gethdr_e) where, index);
-	auto* hp_dest = get_http(ctx, (gethdr_e) dest);
+	auto [hp_from, field_from] = get_field(ctx, where, index);
+	auto* hp_dest = get_http(ctx, dest);
 
 	/* An unset field, eg. the status of a request */
 	if (field_from.b == nullptr) {
@@ -753,7 +769,7 @@ APICALL(http_unset_re)
 	auto* vre = get_regex(machine, index);
 
 	auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	/* Unset header fields from the top down */
 	size_t mcount = 0;
@@ -782,11 +798,16 @@ APICALL(http_rollback)
 	const auto [where] = machine.sysargs<int> ();
 	auto* ctx = get_ctx(machine);
 	/* Varnish can only roll back req and bereq, and panics otherwise */
-	if (where != HDR_REQ && where != HDR_BEREQ)
+	if (where != GUEST_HDR_REQ && where != GUEST_HDR_BEREQ)
 		throw std::runtime_error("Rollback is only possible for req and bereq");
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
+#if __has_include("cache/cache_int.h")
+	(void)hp;
+	VRT_Rollback(ctx);
+#else
 	VRT_Rollback(ctx, hp);
+#endif
 }
 
 APICALL(header_field_get)
@@ -799,7 +820,7 @@ APICALL(header_field_retrieve)
 	const auto [where, index, buffer, buflen]
 		= machine.sysargs<int, uint32_t, gaddr_t, uint32_t> ();
 
-	const auto* hp = get_http(get_ctx(machine), (gethdr_e) where);
+	const auto* hp = get_http(get_ctx(machine), where);
 
 	if (is_valid_index(hp, index))
 	{
@@ -824,7 +845,7 @@ APICALL(header_field_retrieve_str)
 	const auto [where, index, straddr]
 		= machine.sysargs<int, uint32_t, gaddr_t> ();
 
-	const auto* hp = get_http(get_ctx(machine), (gethdr_e) where);
+	const auto* hp = get_http(get_ctx(machine), where);
 
 	if (is_valid_index(hp, index))
 	{
@@ -844,7 +865,7 @@ APICALL(header_field_append)
 {
 	auto [where, field, len] = machine.sysargs<int, gaddr_t, uint32_t> ();
 	const auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	/* len+1 must not wrap around to a zero-sized allocation */
 	if (UNLIKELY(len == UINT32_MAX))
@@ -877,7 +898,7 @@ APICALL(header_field_set)
 		= machine.sysargs<int, unsigned, riscv::Buffer> ();
 
 	const auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	if (is_valid_index(hp, index))
 	{
@@ -910,8 +931,8 @@ APICALL(header_field_copy)
 		= machine.sysargs<int, unsigned, int, unsigned> ();
 
 	const auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
-	auto* src_hp = get_http(ctx, (gethdr_e) src_where);
+	auto* hp = get_http(ctx, where);
+	auto* src_hp = get_http(ctx, src_where);
 
 	if (is_valid_index(hp, index))
 	{
@@ -948,7 +969,7 @@ APICALL(header_field_unset)
 	auto [where, index] = machine.sysargs<int, unsigned> ();
 
 	const auto* ctx = get_ctx(machine);
-	auto* hp = get_http(ctx, (gethdr_e) where);
+	auto* hp = get_http(ctx, where);
 
 	/* You are not allowed to unset proto fields */
 	if (is_valid_index(hp, index) && index >= HDR_FIRST)
@@ -1087,7 +1108,7 @@ APICALL(regex_subst_hdr)
 		machine.set_result(-1);
 		return;
 	}
-	auto [hp, field] = get_field(ctx, (gethdr_e) where, index);
+	auto [hp, field] = get_field(ctx, where, index);
 
 	/* Run the regsub using existing 're' */
 	auto* sub = charged_regsub(machine, all, std::string(field.b, field.e - field.b), re,

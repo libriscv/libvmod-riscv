@@ -86,6 +86,12 @@ header_spec(char *spec, const char *name, size_t nlen)
 	return (0);
 }
 
+#if !defined(VARNISH_PLUS) && VRT_MAJOR_VERSION >= 22U
+#  define VCLV_HDR(spec)	((hdr_t)(const void *)(spec))
+#else
+#  define VCLV_HDR(spec)	(spec)
+#endif
+
 int
 vclv_get(const struct http *hp, const char *name, size_t nlen,
     const char **value, size_t *vlen)
@@ -96,7 +102,7 @@ vclv_get(const struct http *hp, const char *name, size_t nlen,
 	CHECK_OBJ_NOTNULL(hp, HTTP_MAGIC);
 	if (header_spec(spec, name, nlen) < 0)
 		return (-1);
-	if (!http_GetHdr(hp, spec, &v))
+	if (!http_GetHdr(hp, VCLV_HDR(spec), &v))
 		return (-1);
 	*value = v;
 	*vlen = strlen(v);
@@ -142,7 +148,7 @@ vclv_unset(struct http *hp, const char *name, size_t nlen)
 	CHECK_OBJ_NOTNULL(hp, HTTP_MAGIC);
 	if (header_spec(spec, name, nlen) < 0)
 		return;
-	http_Unset(hp, spec);
+	http_Unset(hp, VCLV_HDR(spec));
 }
 
 int
@@ -478,6 +484,11 @@ vclv_var_set_string(VRT_CTX, int id, const char *v)
 	if (!vclv_known(id) || vclv_vars[id].type != T_STRING
 	    || (vclv_vars[id].wr & ctx->method) == 0)
 		return (-1);
+#ifndef VARNISH_PLUS
+	v = WS_Copy(ctx->ws, v, -1);
+	if (v == NULL)
+		return (-1);
+#endif
 	switch (id) {
 	case VCLV_METHOD:
 		if (vclv_backend(ctx))
@@ -513,6 +524,11 @@ vclv_hash_data(VRT_CTX, const char *data)
 int
 vclv_synth_body(VRT_CTX, int replace, const char *body)
 {
+#if __has_include("cache/cache_int.h")
+	body = WS_Copy(ctx->ws, body, -1);
+	if (body == NULL)
+		return (-1);
+#endif
 	switch (ctx->method) {
 #ifdef VARNISH_PLUS
 	case VCL_MET_SYNTH:
@@ -766,7 +782,7 @@ vclv_json_escape(struct vsb *vsb, const char *s)
 }
 
 #ifndef VARNISH_PLUS
-/* Varnish Cache only has the va_list form of VRT_VSC_Alloc(). */
+/* Varnish Cache before VRT 22 only has the va_list form of VRT_VSC_Alloc(). */
 static void *
 vclv_vsc_alloc(const char *category, size_t size, const unsigned char *jp,
     size_t sz_jp, const char *fmt, ...)
@@ -775,7 +791,11 @@ vclv_vsc_alloc(const char *category, size_t size, const unsigned char *jp,
 	void *p;
 
 	va_start(ap, fmt);
+#if VRT_MAJOR_VERSION >= 22U
+	p = VRT_VSC_Allocv(NULL, NULL, category, size, jp, sz_jp, fmt, ap);
+#else
 	p = VRT_VSC_Alloc(NULL, NULL, category, size, jp, sz_jp, fmt, ap);
+#endif
 	va_end(ap);
 	return (p);
 }

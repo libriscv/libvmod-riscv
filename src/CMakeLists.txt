@@ -54,30 +54,5 @@ endif()
 
 # Compute tests
 enable_testing()
-add_vmod_tests(vmod_riscv vmod_riscv
-	tests/empty.vtc
-	tests/faulty_loop.vtc
-	tests/fork_cow_write.vtc
-	tests/hello_backend_world.vtc
-	tests/hello_synth_world.vtc
-	tests/tenant_reload.vtc
-	tests/tenant_reload_stress.vtc
-	tests/js_synth_basic.vtc
-	tests/js_url_routing.vtc
-	tests/js_recv_headers.vtc
-	tests/js_varnish_decision.vtc
-	tests/js_deliver_headers.vtc
-	tests/js_method_routing.vtc
-	tests/js_recv_get_header.vtc
-	tests/js_varnish_helpers.vtc
-	tests/js_header_case_insensitive.vtc
-	tests/js_header_edge_cases.vtc
-	tests/js_resp_setstatus.vtc
-	tests/js_live_update_file.vtc
-	tests/vcl_basic.vtc
-	tests/vcl_features.vtc
-	tests/vcl_errors.vtc
-	tests/vcl_abi_gates.vtc
-	tests/vcl_stats.vtc
-	tests/vcl_hooks.vtc
-)
+file(GLOB VMOD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.vtc)
+add_vmod_tests(vmod_riscv vmod_riscv ${VMOD_TESTS})

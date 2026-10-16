@@ -3,7 +3,13 @@
 
 #include "vtree.h"
 
+#if __has_include("cache/cache_varnishd.h")
 #include "cache/cache_varnishd.h"
+#elif __has_include("cache/cache_vinyld.h")
+#include "cache/cache_vinyld.h"
+#else
+#include "cache/cache_int.h"
+#endif
 #include "cache/cache_director.h"
 #include "cache/cache_filter.h"
 

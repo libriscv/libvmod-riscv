@@ -8,7 +8,7 @@ static void on_recv(int req) {
 	/* A "compute" decision: result value 1 is any address the guest
 	   likes, and riscv.result_as_string(1) reads a string there. */
 	long addr = 0x0;
-	if (strcmp(url, "/text") == 0) addr = 0x120000;
+	if (strcmp(url, "/text") == 0) addr = (long)"text";
 	syscall4(ECALL_BACKEND_DECISION, 0, 0, addr, 0);
 }
 void start(int argc, char** argv) { wait_for_requests(on_recv); }

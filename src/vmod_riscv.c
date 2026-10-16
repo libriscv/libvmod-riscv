@@ -36,21 +36,21 @@ static inline vcall_info enum_to_idx(VCL_ENUM e)
 #ifndef VENUM
 #  define VENUM(x) vmod_enum_##x
 #endif
-	if (e == VENUM(ON_REQUEST)) return (vcall_info){1, HDR_REQ, HDR_INVALID};
+	if (e == VENUM(ON_REQUEST)) return (vcall_info){1, GUEST_HDR_REQ, HDR_INVALID};
 	if (e == VENUM(ON_HASH))    return (vcall_info){2, HDR_INVALID, HDR_INVALID};
-	if (e == VENUM(ON_SYNTH))   return (vcall_info){3, HDR_REQ, HDR_RESP};
-	if (e == VENUM(ON_BACKEND_FETCH)) return (vcall_info){4, HDR_BEREQ, HDR_BERESP};
-	if (e == VENUM(ON_BACKEND_RESPONSE)) return (vcall_info){5, HDR_BEREQ, HDR_BERESP};
-	if (e == VENUM(ON_BACKEND_ERROR)) return (vcall_info){6, HDR_BEREQ, HDR_BERESP};
-	if (e == VENUM(ON_DELIVER)) return (vcall_info){7, HDR_REQ, HDR_RESP};
+	if (e == VENUM(ON_SYNTH))   return (vcall_info){3, GUEST_HDR_REQ, GUEST_HDR_RESP};
+	if (e == VENUM(ON_BACKEND_FETCH)) return (vcall_info){4, GUEST_HDR_BEREQ, GUEST_HDR_BERESP};
+	if (e == VENUM(ON_BACKEND_RESPONSE)) return (vcall_info){5, GUEST_HDR_BEREQ, GUEST_HDR_BERESP};
+	if (e == VENUM(ON_BACKEND_ERROR)) return (vcall_info){6, GUEST_HDR_BEREQ, GUEST_HDR_BERESP};
+	if (e == VENUM(ON_DELIVER)) return (vcall_info){7, GUEST_HDR_REQ, GUEST_HDR_RESP};
 	/* The object's headers are not a struct http, so there is no index
 	   API for them: the guest gets no second HTTP in vcl_hit. */
-	if (e == VENUM(ON_HIT))    return (vcall_info){8, HDR_REQ, HDR_INVALID};
-	if (e == VENUM(ON_MISS))   return (vcall_info){9, HDR_REQ, HDR_BEREQ};
+	if (e == VENUM(ON_HIT))    return (vcall_info){8, GUEST_HDR_REQ, HDR_INVALID};
+	if (e == VENUM(ON_MISS))   return (vcall_info){9, GUEST_HDR_REQ, GUEST_HDR_BEREQ};
 
 	if (e == VENUM(ON_LIVE_UPDATE)) return (vcall_info){10, HDR_INVALID, HDR_INVALID};
 	if (e == VENUM(ON_RESUME_UPDATE)) return (vcall_info){11, HDR_INVALID, HDR_INVALID};
-	if (e == VENUM(ON_PASS))   return (vcall_info){12, HDR_REQ, HDR_INVALID};
+	if (e == VENUM(ON_PASS))   return (vcall_info){12, GUEST_HDR_REQ, HDR_INVALID};
 	return (vcall_info){-1, HDR_INVALID, HDR_INVALID};
 }
 

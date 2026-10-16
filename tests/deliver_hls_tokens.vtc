@@ -1,5 +1,7 @@
 varnishtest "RISC-V deliver_transform: per-client HLS manifests from one cached copy"
 
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+
 shell {
 cat >${tmpdir}/${testname}.cpp <<-EOF
 #include "riscv_api.hpp"

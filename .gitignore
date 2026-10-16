@@ -57,3 +57,4 @@ Makefile.in
 
 # make dist output
 /libvmod-riscv-*.tar.gz
+.build-vcache-*/

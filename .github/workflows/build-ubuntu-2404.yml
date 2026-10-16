@@ -19,11 +19,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Varnish Cache 7.6
+      - name: Install Varnish Cache 9.1
         run: |
-          sudo apt-get update
-          sudo apt-get install -y apt-transport-https
-          curl -s https://packagecloud.io/install/repositories/varnishcache/varnish76/script.deb.sh | sudo bash
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/694566269779DFAC975ED9BDD0525EAE838B3344 \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/varnish.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/varnish.gpg] https://packages.varnish-software.com/varnish/ubuntu noble main" \
+            | sudo tee /etc/apt/sources.list.d/varnish.list
           sudo apt-get update
           sudo apt-get install -y varnish varnish-dev
 

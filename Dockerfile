@@ -3,8 +3,13 @@ FROM ubuntu:24.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      apt-transport-https curl ca-certificates gnupg && \
-    curl -s https://packagecloud.io/install/repositories/varnishcache/varnish76/script.deb.sh | bash && \
+      curl ca-certificates gnupg && \
+    install -d -m 0755 /etc/apt/keyrings && \
+    curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/694566269779DFAC975ED9BDD0525EAE838B3344 \
+      | gpg --dearmor -o /etc/apt/keyrings/varnish.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/varnish.gpg] https://packages.varnish-software.com/varnish/ubuntu noble main" \
+      > /etc/apt/sources.list.d/varnish.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       varnish varnish-dev \
       g++-14-riscv64-linux-gnu \
@@ -46,8 +51,13 @@ FROM ubuntu:24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      apt-transport-https curl ca-certificates gnupg && \
-    curl -s https://packagecloud.io/install/repositories/varnishcache/varnish76/script.deb.sh | bash && \
+      curl ca-certificates gnupg && \
+    install -d -m 0755 /etc/apt/keyrings && \
+    curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/694566269779DFAC975ED9BDD0525EAE838B3344 \
+      | gpg --dearmor -o /etc/apt/keyrings/varnish.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/varnish.gpg] https://packages.varnish-software.com/varnish/ubuntu noble main" \
+      > /etc/apt/sources.list.d/varnish.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       varnish libssl3 libjemalloc2 && \
     rm -rf /var/lib/apt/lists/*

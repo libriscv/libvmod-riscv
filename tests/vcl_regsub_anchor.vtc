@@ -1,0 +1,33 @@
+varnishtest "VCL tenant: a ^ in regsuball matches only at the start of the subject"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"good.com": { "filename": "${testdir}/vcl/limits.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_synth {
+		if (resp.reason == "/semantics") {
+			set resp.http.N-1 = regsuball("aaa", "^a", "b");
+		}
+	}
+
+	include "${testdir}/vcl_router.vcl";
+} -start
+
+client c1 {
+	txreq -url "/semantics" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.T-1 == resp.http.N-1
+	expect resp.http.T-1 == "baa"
+} -run

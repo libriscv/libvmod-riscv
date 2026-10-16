@@ -28,7 +28,6 @@ varnish v1 -arg "-p workspace_client=128k" -vcl {
 	# Varnish's own answers, for the tenant's to match.
 	sub vcl_synth {
 		if (resp.reason == "/semantics") {
-			set resp.http.N-1 = regsuball("aaa", "^a", "b");
 			set resp.http.N-2 = regsub("foo-bar", "(\w+)-(\w+)", "\2-\1");
 			set resp.http.N-3 = regsuball("abc", "x*", "-");
 			set resp.http.N-4 = regsub("abc", "(b)", "[\0\1\9]");
@@ -74,7 +73,6 @@ client c3 {
 	txreq -url "/semantics" -hdr "Host: good.com"
 	rxresp
 	expect resp.status == 200
-	expect resp.http.T-1 == resp.http.N-1
 	expect resp.http.T-2 == resp.http.N-2
 	expect resp.http.T-3 == resp.http.N-3
 	expect resp.http.T-4 == resp.http.N-4
