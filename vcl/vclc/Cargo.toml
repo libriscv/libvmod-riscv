@@ -6,7 +6,7 @@ description = "The VCL compiler, built as a libvmod-riscv guest"
 publish = false
 
 # Its own workspace root, like ../compiler and ../runtime/guest. It builds
-# for riscv64gc-unknown-linux-gnu with link flags that only make sense for a
+# for riscv64gc-unknown-linux-musl with link flags that only make sense for a
 # libriscv guest.
 [workspace]
 members = []
@@ -27,4 +27,4 @@ lto = "fat"
 codegen-units = 1
 # The host resolves `vclc_compile` and `fast_exit` by name in `.symtab`, so
 # symbols stay. Debug info is megabytes nothing reads.
-strip = "debuginfo"
+strip = "none"

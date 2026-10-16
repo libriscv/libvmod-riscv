@@ -22,16 +22,18 @@ CHECKOUT_TARGET := $(CURDIR)/target
 
 STAGE ?= /tmp/libvmod-riscv-vclc-blob
 
+export ZIG ?= zig
+SYSROOT := $(shell rustc --print sysroot)
+OBJCOPY := $(SYSROOT)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy
+RUST_SRC_REMAP := $(SYSROOT)/lib/rustlib/src/rust=/rustc/$(shell rustc -vV | sed -n 's/^commit-hash: //p')
+
 GUEST_RUSTFLAGS := -C target-feature=+crt-static
+GUEST_RUSTFLAGS += -C linker=$(STAGE)/vclc/zig-cc
+GUEST_RUSTFLAGS += -C link-self-contained=no
 GUEST_RUSTFLAGS += -C link-arg=-Wl,--no-gc-sections
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--undefined=fast_exit
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=memcpy
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=memset
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=memmove
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=memcmp
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=__memcmpeq
-GUEST_RUSTFLAGS += -C link-arg=-Wl,--wrap=bcmp
+GUEST_RUSTFLAGS += -C link-arg=-Wl,-u,fast_exit
 GUEST_RUSTFLAGS += --remap-path-prefix=$(STAGE)=/vcl
+GUEST_RUSTFLAGS += --remap-path-prefix=$(RUST_SRC_REMAP)
 
 blob:
 	rm -rf $(STAGE)
@@ -41,5 +43,5 @@ blob:
 	cd $(STAGE)/vclc && \
 	  RUSTFLAGS='$(GUEST_RUSTFLAGS)' CARGO_TARGET_DIR='$(CHECKOUT_TARGET)' \
 	  cargo build --release
-	cp $(CHECKOUT_TARGET)/riscv64gc-unknown-linux-gnu/release/vclc ../vclc.elf
+	$(OBJCOPY) --strip-debug --discard-locals $(CHECKOUT_TARGET)/riscv64gc-unknown-linux-musl/release/vclc ../vclc.elf
 	rm -rf $(STAGE)

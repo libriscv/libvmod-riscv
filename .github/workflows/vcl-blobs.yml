@@ -1,0 +1,58 @@
+name: VCL compiler blobs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vcl/**'
+      - '.github/workflows/vcl-blobs.yml'
+  pull_request:
+    paths:
+      - 'vcl/**'
+      - '.github/workflows/vcl-blobs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  blobs:
+    name: Rebuild runtime.elf and vclc.elf from source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install Rust toolchains
+        run: |
+          (cd vcl/runtime/guest && rustup toolchain install)
+          (cd vcl/vclc && rustup toolchain install)
+
+      - name: Build runtime.elf
+        run: make -C vcl/runtime/guest blob
+
+      - name: Build vclc.elf
+        run: make -C vcl/vclc blob
+
+      - name: Compare with the committed blobs
+        run: |
+          sha256sum vcl/runtime/runtime.elf vcl/vclc.elf
+          if ! git diff --quiet -- vcl/runtime/runtime.elf vcl/vclc.elf; then
+            echo "::error::The committed blobs do not match a build from source. Rebuild them (see vcl/README.md) and commit the result."
+            git diff --stat -- vcl/runtime/runtime.elf vcl/vclc.elf
+            exit 1
+          fi
+
+      - name: Upload blobs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcl-blobs
+          path: |
+            vcl/runtime/runtime.elf
+            vcl/vclc.elf

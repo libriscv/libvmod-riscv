@@ -6,3 +6,5 @@ program/riscv64-linux-musl/
 build/
 .build/
 .build-vcache-*/
+src/vcc_if.c
+src/vcc_if.h

@@ -1,0 +1,52 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: libvmod-riscv:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start demo
+        run: |
+          docker network create demo
+          docker run -d --name backend --network demo nginx:alpine
+          docker run -d --name varnish --network demo -p 8000:8000 libvmod-riscv:ci
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null -H 'Host: qjs.com' http://localhost:8000/test && break
+            sleep 1
+          done
+          curl -sf -o /dev/null -w '%{http_code}\n' -H 'Host: qjs.com' http://localhost:8000/test
+          curl -sf -D - -o /dev/null -H 'Host: qjs.com' http://localhost:8000/ \
+            | grep -i '^X-Handled-By: RISC-V JS'
+
+      - name: Varnish logs
+        if: failure()
+        run: docker logs varnish

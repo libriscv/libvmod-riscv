@@ -3,4 +3,5 @@
 [toolchain]
 channel = "1.91.0"
 profile = "minimal"
-targets = ["riscv64gc-unknown-linux-gnu"]
+components = ["llvm-tools"]
+targets = ["riscv64gc-unknown-linux-musl"]

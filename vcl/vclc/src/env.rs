@@ -82,16 +82,16 @@ unsafe impl GlobalAlloc for ArenaAllocator {
 #[global_allocator]
 static ALLOCATOR: ArenaAllocator = ArenaAllocator;
 
-// The link step passes `--wrap=memcpy` and friends, so every reference in
-// the program — Rust's and static glibc's — reaches these, and the host does
-// the copy natively instead of emulating a byte loop. The bodies are inline
+// These replace musl's weak definitions at link time, so every reference in
+// the program — Rust's and musl's — reaches them, and the host does the copy
+// natively instead of emulating a byte loop. The bodies are inline
 // assembly because a hand-written loop would be recognised by LLVM as a
 // memcpy and turned back into a call to this very function.
 
 /// # Safety
 /// Same contract as C `memcpy`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap_memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
         asm!("ecall", in("a7") MEMORY_SYSCALLS_BASE,
             in("a0") dest, in("a1") src, in("a2") n, lateout("a0") _);
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn __wrap_memcpy(dest: *mut u8, src: *const u8, n: usize) 
 /// # Safety
 /// Same contract as C `memset`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap_memset(dest: *mut u8, value: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, n: usize) -> *mut u8 {
     unsafe {
         asm!("ecall", in("a7") MEMORY_SYSCALLS_BASE + 1,
             in("a0") dest, in("a1") value, in("a2") n, lateout("a0") _);
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn __wrap_memset(dest: *mut u8, value: i32, n: usize) -> *
 /// # Safety
 /// Same contract as C `memmove`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap_memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
         asm!("ecall", in("a7") MEMORY_SYSCALLS_BASE + 2,
             in("a0") dest, in("a1") src, in("a2") n, lateout("a0") _);
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn __wrap_memmove(dest: *mut u8, src: *const u8, n: usize)
 /// # Safety
 /// Same contract as C `memcmp`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap_memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
     let result: i32;
     unsafe {
         asm!("ecall", in("a7") MEMORY_SYSCALLS_BASE + 3,
@@ -140,22 +140,22 @@ pub unsafe extern "C" fn __wrap_memcmp(s1: *const u8, s2: *const u8, n: usize) -
 /// # Safety
 /// Same contract as `__memcmpeq`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap___memcmpeq(s1: *const u8, s2: *const u8, n: usize) -> i32 {
-    unsafe { __wrap_memcmp(s1, s2, n) }
+pub unsafe extern "C" fn __memcmpeq(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe { memcmp(s1, s2, n) }
 }
 
 /// # Safety
 /// Same contract as C `bcmp`.
 #[no_mangle]
-pub unsafe extern "C" fn __wrap_bcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
-    unsafe { __wrap_memcmp(s1, s2, n) }
+pub unsafe extern "C" fn bcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe { memcmp(s1, s2, n) }
 }
 
 /// Where `main` ends up, and where the host's vmcall returns to.
 ///
 /// Stopping here rather than returning from `main` leaves the runtime
 /// initialised: returning would run std's shutdown. The host resolves the
-/// symbol by name, which is why `-Wl,--undefined=fast_exit` keeps it.
+/// symbol by name, which is why `-Wl,-u,fast_exit` keeps it.
 #[no_mangle]
 pub extern "C" fn fast_exit(_code: i32) -> ! {
     loop {
