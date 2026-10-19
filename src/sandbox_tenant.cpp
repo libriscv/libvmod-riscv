@@ -123,7 +123,7 @@ void SandboxTenant::load(VRT_CTX)
 		this->program =
 			std::make_shared<MachineInstance> (std::move(elf), ctx, this);
 	} catch (const std::exception& e) {
-		VSL(SLT_Error, 0,
+		VSL(SLT_Error, RISCV_NO_VXID,
 			"Exception when loading machine '%s': %s",
 			config.name.c_str(), e.what());
 		printf("Machine '%s' failed: %s\n",

@@ -151,7 +151,7 @@ std::shared_ptr<MachineInstance> load(const std::string& path,
 {
 	auto compiled = compile(path);
 	for (auto& warning : compiled.warnings) {
-		VSL(SLT_VCL_Log, 0, "[%s] VCL warning: %s",
+		VSL(SLT_VCL_Log, RISCV_NO_VXID, "[%s] VCL warning: %s",
 			tenant->config.name.c_str(), warning.c_str());
 		printf("[%s] VCL warning: %s\n", tenant->config.name.c_str(), warning.c_str());
 	}

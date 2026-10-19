@@ -237,7 +237,7 @@ static void init_tenants(VRT_CTX, struct vmod_priv* priv,
 			/* Validate the group name */
 			auto grit = groups.find(grname);
 			if (grit == groups.end()) {
-				VSL(SLT_Error, 0,
+				VSL(SLT_Error, RISCV_NO_VXID,
 					"Group '%s' missing for tenant: %s",
 					grname.c_str(), it.key().c_str());
 				VRT_fail(ctx, "Group '%s' missing for tenant: %s",
@@ -254,7 +254,7 @@ static void init_tenants(VRT_CTX, struct vmod_priv* priv,
 			});
 		}
 	} catch (const std::exception& e) {
-		VSL(SLT_Error, 0,
+		VSL(SLT_Error, RISCV_NO_VXID,
 			"Exception '%s' when loading tenants from: %s",
 			e.what(), source);
 		/* TODO: VRT_fail here? */
@@ -320,7 +320,7 @@ void finalize_tenants_impl(VRT_CTX, struct vmod_priv* priv)
 			   loads is loaded again on the next reload. */
 			const auto stamp = FileStamp::of(tenant->program_path());
 			if (auto shared = find_reusable(*tenant, stamp)) {
-				VSL(SLT_Debug, 0, "Tenant '%s' is unchanged, keeping its program",
+				VSL(SLT_Debug, RISCV_NO_VXID, "Tenant '%s' is unchanged, keeping its program",
 					tenant->config.name.c_str());
 				tenant = std::move(shared);
 				continue;
@@ -344,7 +344,7 @@ void tenant_append_main_argument(VRT_CTX, struct vmod_priv* priv,
 	auto* reg = rvs::registry(priv);
 	auto* t = rvs::find_tenant(reg, tenant);
 	if (t == nullptr) {
-		VSL(SLT_Error, 0,
+		VSL(SLT_Error, RISCV_NO_VXID,
 			"Attempted to add main argument to non-existent tenant '%s'",
 			tenant);
 		return;

@@ -14,11 +14,6 @@ extern "C" {
 #ifndef VARNISH_PLUS
 # include <vrt_obj.h>
 #endif
-enum {
-#define SLTH(tag, ind, req, resp, sdesc, ldesc)	ind,
-#include "tbl/vsl_tags_http.h"
-};
-void VSLbt(struct vsl_log *vsl, enum VSL_tag_e tag, txt t);
 }
 
 namespace rvs {
@@ -44,8 +39,8 @@ struct guest_header_field {
 
 inline void foreach(http* hp, const std::function<void(http*, txt&, size_t)>& cb)
 {
-	for (size_t i = 0; i < hp->field_count; i++) {
-		cb(hp, hp->field_array[i], i);
+	for (size_t i = 0; i < hp->nhd; i++) {
+		cb(hp, hp->hd[i], i);
 	}
 }
 
@@ -53,7 +48,7 @@ inline bool is_invalid(unsigned idx) {
 	return idx == HDR_INVALID;
 }
 inline bool is_valid_index(const http* hp, unsigned idx) {
-	return idx < hp->field_count;
+	return idx < hp->nhd;
 }
 
 inline http*
@@ -90,20 +85,20 @@ get_field(VRT_CTX, int where, uint32_t index)
 
 	if (is_valid_index(hp, index))
 	{
-		return {hp, hp->field_array[index]};
+		return {hp, hp->hd[index]};
 	}
 	throw std::out_of_range("Header field index not in bounds");
 }
 static unsigned
 http_findhdr(const struct http *hp, unsigned l, const char *hdr)
 {
-	for (unsigned u = HDR_FIRST; u < hp->field_count; u++)
+	for (unsigned u = HDR_FIRST; u < hp->nhd; u++)
 	{
-		if (hp->field_array[u].e < hp->field_array[u].b + l + 1)
+		if (hp->hd[u].e < hp->hd[u].b + l + 1)
 			continue;
-		if (hp->field_array[u].b[l] != ':')
+		if (hp->hd[u].b[l] != ':')
 			continue;
-		if (strncasecmp(hdr, hp->field_array[u].b, l))
+		if (strncasecmp(hdr, hp->hd[u].b, l))
 			continue;
 		return u;
 	}
@@ -115,18 +110,18 @@ http_unsetat(struct http *hp, unsigned idx)
 	unsigned count;
 
 	assert(idx >= HDR_FIRST); /* Avoid proto fields */
-	assert(idx < hp->field_count); /* Out of bounds */
+	assert(idx < hp->nhd); /* Out of bounds */
 
 	if (hp->vsl != NULL) {
 		const int i = (HTTP_HDR_UNSET - HTTP_HDR_METHOD) + hp->logtag;
-		VSLbt(hp->vsl, (enum VSL_tag_e)i, hp->field_array[idx]);
+		VSLbt(hp->vsl, (enum VSL_tag_e)i, hp->hd[idx]);
 	}
 
 	/* Inefficient, but preserves order (assuming sorted?) */
-	count = hp->field_count - idx - 1;
-	memmove(&hp->field_array[idx], &hp->field_array[idx + 1], count * sizeof *hp->field_array);
-	memmove(&hp->field_flags[idx], &hp->field_flags[idx + 1], count * sizeof *hp->field_flags);
-	hp->field_count--;
+	count = hp->nhd - idx - 1;
+	memmove(&hp->hd[idx], &hp->hd[idx + 1], count * sizeof *hp->hd);
+	memmove(&hp->hdf[idx], &hp->hdf[idx + 1], count * sizeof *hp->hdf);
+	hp->nhd--;
 }
 
 inline uint32_t field_length(const txt& field)
@@ -671,13 +666,13 @@ APICALL(foreach_header_field)
 
 	auto& script = get_script(machine);
 
-	const gaddr_t first = script.guest_alloc(hp->field_count * sizeof(guest_header_field));
+	const gaddr_t first = script.guest_alloc(hp->nhd * sizeof(guest_header_field));
 	gaddr_t iterator = first;
 	int acount = 0;
 
 	/* Iterate each header field */
-	for (unsigned idx = HDR_FIRST; idx < hp->field_count; idx++) {
-		const auto& field = hp->field_array[idx];
+	for (unsigned idx = HDR_FIRST; idx < hp->nhd; idx++) {
+		const auto& field = hp->hd[idx];
 		const uint32_t len = field_length(field);
 		/* Ignore empty fields (?) */
 		if (len == 0)
@@ -761,14 +756,14 @@ APICALL(http_copy_from)
 	}
 	const size_t len = field_length(field_from);
 	/* Avoid overflowing dest */
-	if (UNLIKELY(hp_dest->field_count >= hp_dest->fields_max)) {
+	if (UNLIKELY(hp_dest->nhd >= hp_dest->shd)) {
 		VSLb(hp_dest->vsl, SLT_LostHeader,
 			"%.*s", (int) len, field_from.b);
 		machine.set_result(HDR_INVALID);
 		return;
 	}
 
-	const int idx_dest = hp_dest->field_count++;
+	const int idx_dest = hp_dest->nhd++;
 	http_SetH(hp_dest, idx_dest, field_from.b);
 	machine.set_result(idx_dest);
 }
@@ -785,7 +780,7 @@ APICALL(http_set_status)
 		return;
 	}
 	/* Do the workspace allocation before making changes */
-	const char* string = WS_Printf(ctx->ws, "%u", status);
+	const char* string = (const char*)WS_Printf(ctx->ws, "%u", status);
 	if (UNLIKELY(!string))
 		throw std::runtime_error("Out of workspace");
 	hp->status = status;
@@ -805,9 +800,9 @@ APICALL(http_unset_re)
 
 	/* Unset header fields from the top down */
 	size_t mcount = 0;
-	for (int i = hp->field_count-1; i >= HDR_FIRST; i--)
+	for (int i = hp->nhd-1; i >= HDR_FIRST; i--)
 	{
-		auto& field = hp->field_array[i];
+		auto& field = hp->hd[i];
 		machine.penalize(VCLV_REGEX_MATCH_LIMIT);
 #ifdef VARNISH_PLUS
 		if ( VRE_exec(vre, field.b, field.e - field.b,
@@ -856,7 +851,7 @@ APICALL(header_field_retrieve)
 
 	if (is_valid_index(hp, index))
 	{
-		const auto& field = hp->field_array[index];
+		const auto& field = hp->hd[index];
 		const size_t len = field_length(field);
 		if (buffer == 0 && buflen == 0) {
 			machine.set_result(len);
@@ -881,7 +876,7 @@ APICALL(header_field_retrieve_str)
 
 	if (is_valid_index(hp, index))
 	{
-		const auto& field = hp->field_array[index];
+		const auto& field = hp->hd[index];
 		const size_t len = field_length(field);
 		riscv::GuestStdString<Script::MARCH> gstr(machine, straddr);
 		gstr.set_string(machine, straddr, field.b ? field.b : "", len, false);
@@ -910,17 +905,17 @@ APICALL(header_field_append)
 	if (UNLIKELY(!valid_field(HDR_FIRST, std::string_view(val, len))))
 		throw std::runtime_error("Invalid HTTP header field");
 
-	if (UNLIKELY(hp->field_count >= hp->fields_max)) {
+	if (UNLIKELY(hp->nhd >= hp->shd)) {
 		VSLb(hp->vsl, SLT_LostHeader, "%.*s", (int) len, val);
 		machine.set_result(HDR_INVALID);
 		return;
 	}
 
-	const int idx = hp->field_count++;
+	const int idx = hp->nhd++;
 	//http_SetH(hp, idx, val);
-	hp->field_array[idx].b = val;
-	hp->field_array[idx].e = val + len;
-	hp->field_flags[idx] = 0;
+	hp->hd[idx].b = val;
+	hp->hd[idx].e = val + len;
+	hp->hdf[idx] = 0;
 	machine.set_result(idx);
 }
 
@@ -970,12 +965,12 @@ APICALL(header_field_copy)
 	{
 		if (is_valid_index(src_hp, src_index))
 		{
-			const auto& src_field = src_hp->field_array[src_index];
+			const auto& src_field = src_hp->hd[src_index];
 
 			/* Apply it at the given index */
-			hp->field_array[index].b = src_field.b;
-			hp->field_array[index].e   = src_field.e;
-			hp->field_flags[index] = 0;
+			hp->hd[index].b = src_field.b;
+			hp->hd[index].e   = src_field.e;
+			hp->hdf[index] = 0;
 
 			machine.set_result(field_length(src_field));
 			return;

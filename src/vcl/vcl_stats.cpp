@@ -110,7 +110,7 @@ static void bind_counters(const std::string& tenant, std::vector<Stat>& stats,
 			auto& counter = it->second;
 			if (counter.help != helps[i]) {
 				/* The description is fixed when Varnish publishes the counter. */
-				VSL(SLT_VCL_Log, 0, "[%s] VCL warning: statistic %s keeps its first description '%s'",
+				VSL(SLT_VCL_Log, RISCV_NO_VXID, "[%s] VCL warning: statistic %s keeps its first description '%s'",
 					tenant.c_str(), names[i].c_str(), counter.help.c_str());
 			}
 			stat.counter = counter.word;
