@@ -1,0 +1,74 @@
+varnishtest "RISC-V deliver_transform does not map storage that a busy fetch trims"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+
+setenv MALLOC_CONF junk:true
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static const char mime[] = "text/plain";
+
+extern "C" __attribute__((used))
+void on_body(const char* arg, char* data, size_t len)
+{
+	sys_response(200, mime, sizeof(mime)-1, data, len);
+}
+
+static void on_recv(int) {}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+server s1 {
+	rxreq
+	txresp -nolen -hdr "Transfer-Encoding: chunked"
+	chunkedlen 10000
+	delay 1
+	chunkedlen 0
+} -start
+
+varnish v1 -arg "-p debug=+delay_deliver" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		return (hash);
+	}
+
+	sub vcl_deliver {
+		if (!req.http.X-Raw && !riscv.deliver_transform("on_body", "")) {
+			return (synth(503));
+		}
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 10000
+	expect resp.body ~ "^(?:01234567)++$"
+
+	txreq -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body ~ "^(?:01234567)++$"
+} -run

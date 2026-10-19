@@ -83,6 +83,9 @@ varnish v1 -vcl {
 	sub vcl_synth {
 		if (riscv.active()) {
 			riscv.vcall(ON_SYNTH);
+			if (req.http.X-Append) {
+				synthetic("+appended");
+			}
 			if (req.http.X-Restart && req.restarts == 0) {
 				return (restart);
 			}
@@ -113,6 +116,16 @@ client c1 {
 	rxresp
 	expect resp.status == 200
 	expect resp.body == "0123456789"
+
+	txreq -url "/small" -hdr "Host: xpizza.com" -hdr "X-Append: 1"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "small heap body+appended"
+
+	txreq -url "/check" -hdr "Host: xpizza.com" -hdr "X-Append: 1"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "0123456789ABCDE+appended"
 
 	txreq -url "/guard" -hdr "Host: xpizza.com" -hdr "X-Restart: 1"
 	rxresp

@@ -54,10 +54,6 @@ server s1 {
 	chunkedlen 0
 
 	rxreq
-	expect req.url == "/gzip"
-	txresp -gzipbody "gzip body"
-
-	rxreq
 	expect req.url == "/gunzip"
 	txresp -gzipbody "gzip body"
 
@@ -72,6 +68,12 @@ server s1 {
 	rxreq
 	expect req.url == "/empty"
 	txresp -body ""
+} -start
+
+server s2 {
+	rxreq
+	expect req.url == "/gzip"
+	txresp -gzipbody "gzip body"
 } -start
 
 varnish v1 -vcl+backend {
@@ -96,6 +98,12 @@ varnish v1 -vcl+backend {
 			return (pass);
 		}
 		return (hash);
+	}
+
+	sub vcl_backend_fetch {
+		if (bereq.url == "/gzip") {
+			set bereq.backend = s2;
+		}
 	}
 
 	sub vcl_backend_response {

@@ -188,6 +188,16 @@ int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
 		/* http_PutResponse() asserts on a status that is not three digits */
 		if (UNLIKELY(status < 100 || status > 999))
 			throw std::runtime_error("Invalid deliver response status: " + std::to_string(status));
+		if (UNLIKELY(datalen > post->capacity))
+			throw std::runtime_error("Response of " + std::to_string(datalen)
+				+ " bytes is over the " + std::to_string(post->capacity) + " byte limit");
+		if (datalen > 0) {
+			if (UNLIKELY(data + datalen < data))
+				throw std::runtime_error("Invalid deliver response buffer");
+			const auto last = (data + datalen - 1) / riscv::Page::size();
+			for (auto pageno = data / riscv::Page::size(); pageno <= last; pageno++)
+				machine.memory.get_readable_pageno(pageno);
+		}
 		result->type = content_type_copy(ctx, type);
 		result->tsize = type.size();
 		result->status = status;

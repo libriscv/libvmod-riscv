@@ -594,19 +594,19 @@ APICALL(synth)
 		// in a page this fork owns. Otherwise it would land past the end
 		// of a guest page, or in a page every fork shares with the master
 		// (rodata, or the zero page). The copy has room for that zero.
-		const int dynstruct = vsb->s_flags & VSB_DYNSTRUCT;
+		const int keep = vsb->s_flags & (VSB_DYNSTRUCT | VSB_AUTOEXTEND);
 		if (char* body = synth_zero_copy(machine, data_addr, data_len)) {
 			if (vsb->s_flags & VSB_DYNAMIC)
 				free(vsb->s_buf);
 			vsb->s_buf = body;
-			vsb->s_flags = dynstruct;
+			vsb->s_flags = keep;
 		} else {
 			char* new_buffer = (char *)((vsb->s_flags & VSB_DYNAMIC)
 				? realloc(vsb->s_buf, data_len+1) : malloc(data_len+1));
 			if (UNLIKELY(new_buffer == nullptr))
 				throw std::runtime_error("Unable to allocate room for synth content buffer");
 			vsb->s_buf = new_buffer;
-			vsb->s_flags = dynstruct | VSB_DYNAMIC;
+			vsb->s_flags = keep | VSB_DYNAMIC;
 			vsb->s_size = data_len+1;
 			vsb->s_len  = 0;
 			machine.memory.memcpy_out(new_buffer, data_addr, data_len);

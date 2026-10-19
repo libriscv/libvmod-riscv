@@ -1,0 +1,356 @@
+varnishtest "RISC-V deliver_transform across request and object states"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+
+setenv MALLOC_CONF junk:true
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static const char mime[] = "text/plain";
+
+extern "C" __attribute__((used))
+void on_body(const char* arg, char* data, size_t len)
+{
+	if (strcmp(arg, "same") == 0)
+		sys_response(200, mime, sizeof(mime)-1, data, len);
+	if (strcmp(arg, "fail") == 0)
+		return;
+	if (strcmp(arg, "null") == 0)
+		sys_response(200, mime, sizeof(mime)-1, (const char*)0, 100);
+	if (strcmp(arg, "wrap") == 0)
+		sys_response(200, mime, sizeof(mime)-1, (const char*)~0xFFFUL, 0x2000);
+	if (strcmp(arg, "text") == 0) {
+		const char* text = (const char*)0x120000;
+		sys_response(200, mime, sizeof(mime)-1, text, 64);
+	}
+	if (strcmp(arg, "stack") == 0) {
+		char buf[64];
+		for (int i = 0; i < 10; i++)
+			buf[i] = 's';
+		sys_response(200, mime, sizeof(mime)-1, buf, 10);
+	}
+	for (size_t i = 0; i < len; i++)
+		if (data[i] >= 'a' && data[i] <= 'z')
+			data[i] -= 32;
+	sys_response(200, mime, sizeof(mime)-1, data, len);
+}
+
+static void on_recv(int) {}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+for i in $(seq 3000); do printf abcdefghij; done > ${tmpdir}/body
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/cond"
+	txresp -hdr {ETag: "e1"} -hdr "Last-Modified: Thu, 01 Jan 2015 00:00:00 GMT" -body "cond body"
+
+	rxreq
+	expect req.url == "/vary"
+	expect req.http.X-Lang == "en"
+	txresp -hdr "Vary: X-Lang" -body "lang en"
+
+	rxreq
+	expect req.url == "/vary"
+	expect req.http.X-Lang == "no"
+	txresp -hdr "Vary: X-Lang" -body "lang no"
+
+	rxreq
+	expect req.url == "/grace"
+	txresp -hdr "Cache-Control: max-age=1, stale-while-revalidate=60" -body "old body"
+
+	rxreq
+	expect req.url == "/grace"
+	delay 1
+	txresp -body "new body"
+} -start
+
+server s2 {
+	rxreq
+	expect req.url == "/broken"
+	txresp -nolen -hdr "Transfer-Encoding: chunked"
+	chunked "some data"
+	delay 0.2
+} -start
+
+server s3 {
+	rxreq
+	expect req.url == "/big"
+	txresp -bodyfrom ${tmpdir}/body
+
+	rxreq
+	expect req.url == "/esi"
+	txresp -body {<a><esi:include src="/inc"/></a>}
+
+	rxreq
+	expect req.url == "/inc"
+	txresp -body "include"
+
+	rxreq
+	expect req.url == "/head"
+	expect req.method == "HEAD"
+	txresp -hdr "Content-Length: 1234" -nolen
+} -start
+
+varnish v1 -arg "-p feature=+http2" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.method == "PURGE") {
+			return (purge);
+		}
+		if (!req.http.X-NoFork && !riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		if (req.url == "/head") {
+			return (pass);
+		}
+		return (hash);
+	}
+
+	sub vcl_backend_fetch {
+		if (bereq.url == "/broken") {
+			set bereq.backend = s2;
+		} else if (bereq.url == "/big" || bereq.url == "/esi" ||
+		    bereq.url == "/inc" || bereq.url == "/head") {
+			set bereq.backend = s3;
+		}
+	}
+
+	sub vcl_backend_response {
+		if (bereq.url == "/esi") {
+			set beresp.do_esi = true;
+		}
+	}
+
+	sub vcl_deliver {
+		set resp.http.X-Restarts = req.restarts;
+		if (req.http.X-Raw || (req.http.X-Raw-After && req.restarts > 0)) {
+			return (deliver);
+		}
+		if (req.esi_level > 0 || req.url == "/esi") {
+			if (riscv.deliver_transform("on_body")) {
+				set resp.http.X-Transformed = "yes";
+			}
+			return (deliver);
+		}
+		if (req.http.X-Max) {
+			if (req.http.X-Max == "1000") {
+				set req.http.X-Ok = riscv.deliver_transform("on_body", req.http.X-Mode, 1000B);
+			} else if (req.http.X-Max == "29999") {
+				set req.http.X-Ok = riscv.deliver_transform("on_body", req.http.X-Mode, 29999B);
+			} else if (req.http.X-Max == "30000") {
+				set req.http.X-Ok = riscv.deliver_transform("on_body", req.http.X-Mode, 30000B);
+			} else if (req.http.X-Max == "0") {
+				set req.http.X-Ok = riscv.deliver_transform("on_body", req.http.X-Mode, 0B);
+			} else {
+				set req.http.X-Ok = riscv.deliver_transform("on_body", req.http.X-Mode, 1TB);
+			}
+			if (req.http.X-Ok != "true") {
+				return (synth(503));
+			}
+		} else if (!riscv.deliver_transform("on_body", req.http.X-Mode)) {
+			return (synth(503));
+		}
+		if (req.http.X-Then) {
+			if (!riscv.deliver_transform("on_body", req.http.X-Then)) {
+				set resp.http.X-Then = "failed";
+			}
+		}
+		if (req.http.X-Restart && req.restarts < 2) {
+			return (restart);
+		}
+		if (req.http.X-Fail) {
+			return (fail);
+		}
+	}
+} -start
+
+client c1 {
+	# Conditional requests get the full transformed body
+	txreq -url "/cond"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "COND BODY"
+
+	txreq -url "/cond" -hdr {If-None-Match: "e1"}
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "COND BODY"
+	expect resp.http.ETag == <undef>
+
+	txreq -url "/cond" -hdr "If-Modified-Since: Thu, 01 Jan 2015 00:00:00 GMT"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "COND BODY"
+
+	txreq -url "/cond" -hdr {If-None-Match: "e1"} -hdr "X-Raw: 1"
+	rxresp
+	expect resp.status == 304
+
+	# Restarts drop the transformed object
+	txreq -url "/cond" -hdr "X-Restart: 1"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Restarts == 2
+	expect resp.body == "COND BODY"
+
+	txreq -url "/cond" -hdr "X-Restart: 1" -hdr "X-Raw-After: 1"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Restarts == 1
+	expect resp.body == "cond body"
+
+	txreq -url "/cond" -hdr "X-Then: fail"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Then == "failed"
+	expect resp.body == "COND BODY"
+
+	txreq -url "/cond" -hdr "X-Mode: same" -hdr "X-Then: stack"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "ssssssssss"
+
+	# Vary variants
+	txreq -url "/vary" -hdr "X-Lang: en"
+	rxresp
+	expect resp.body == "LANG EN"
+	txreq -url "/vary" -hdr "X-Lang: no"
+	rxresp
+	expect resp.body == "LANG NO"
+	txreq -url "/vary" -hdr "X-Lang: en" -hdr "X-Mode: same"
+	rxresp
+	expect resp.body == "lang en"
+
+	# A stale object while a background fetch runs
+	txreq -url "/grace"
+	rxresp
+	expect resp.body == "OLD BODY"
+	delay 1.5
+	txreq -url "/grace"
+	rxresp
+	expect resp.body == "OLD BODY"
+	delay 2
+	txreq -url "/grace"
+	rxresp
+	expect resp.body == "NEW BODY"
+
+	# Over the size limit
+	txreq -url "/big" -hdr "X-Max: 1000"
+	rxresp
+	expect resp.status == 503
+	txreq -url "/big" -hdr "X-Max: 29999"
+	rxresp
+	expect resp.status == 503
+	txreq -url "/big" -hdr "X-Max: 30000"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 30000
+	txreq -url "/big" -hdr "X-Max: 0"
+	rxresp
+	expect resp.status == 503
+	txreq -url "/big" -hdr "X-Max: 1T" -hdr "X-Mode: same"
+	rxresp
+	expect resp.status == 200
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	# No tenant
+	txreq -url "/big" -hdr "X-NoFork: 1"
+	rxresp
+	expect resp.status == 503
+
+	# ESI parents and includes are left alone
+	txreq -url "/esi"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "<a>include</a>"
+	expect resp.http.X-Transformed == <undef>
+
+	# A pass HEAD has no body
+	txreq -req HEAD -url "/head"
+	rxresp -no_obj
+	expect resp.status == 200
+	expect resp.http.Content-Length == 0
+
+	txreq -url "/big" -hdr "X-Fail: 1"
+	rxresp
+	expect resp.status == 503
+} -run
+
+# A streaming fetch that fails
+client c2 {
+	txreq -url "/broken"
+	rxresp
+	expect resp.status == 503
+} -run
+
+# Guest responses that cannot be read
+client c3 {
+	txreq -url "/big" -hdr "X-Mode: null"
+	rxresp
+	expect resp.status == 503
+} -run
+client c4 {
+	txreq -url "/big" -hdr "X-Mode: wrap"
+	rxresp
+	expect resp.status == 503
+} -run
+client c5 {
+	txreq -url "/big" -hdr "X-Mode: text"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 64
+} -run
+
+# The original object is purged while the transformed one is delivered
+client c6 {
+	txreq -url "/big" -hdr "X-Mode: same"
+	rxresphdrs
+	expect resp.status == 200
+	delay 1
+	rxrespbody
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:abcdefghij)++$"
+} -start
+delay 0.3
+client c7 {
+	txreq -req PURGE -url "/big"
+	rxresp
+	expect resp.status == 200
+} -run
+client c6 -wait
+
+client c8 {
+	stream 1 {
+		txreq -url "/cond" -hdr "x-mode" "same"
+		rxresp
+		expect resp.status == 200
+		expect resp.body == "cond body"
+	} -run
+	stream 3 {
+		txreq -url "/cond" -hdr "range" "bytes=1-3"
+		rxresp
+		expect resp.status == 206
+		expect resp.body == "OND"
+	} -run
+} -run
+

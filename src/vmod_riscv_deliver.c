@@ -34,6 +34,7 @@ extern void riscv_deliver_unmap(void *script, uint64_t addr, size_t len);
 /* Not in the installed headers (cache_objhead.h, storage.h) */
 struct objcore *HSH_Private(const struct worker *wrk);
 void HSH_Abandon(struct objcore *oc);
+struct boc *HSH_RefBoc(const struct objcore *);
 void HSH_DerefBoc(struct worker *wrk, struct objcore *);
 int HSH_DerefObjCore(struct worker *, struct objcore **);
 extern struct stevedore *stv_transient;
@@ -105,6 +106,9 @@ struct deliver_view {
 	size_t				mapped_len;
 };
 
+extern const struct deliver_obj_methods SML_methods __attribute__((weak));
+extern const struct deliver_obj_methods MSE4_methods_memory __attribute__((weak));
+
 static const struct deliver_obj_methods *deliver_real_methods;
 static struct deliver_obj_methods deliver_methods;
 static pthread_once_t deliver_once = PTHREAD_ONCE_INIT;
@@ -161,6 +165,8 @@ deliver_release(struct worker *wrk, struct deliver_view *dv)
 	if (dv->orig != NULL) {
 		if (dv->orig_oaref)
 			ObjDerefAttr(dv->orig, &dv->orig_oaref);
+		if (dv->orig->flags & OC_F_TRANSIENT)
+			ObjSlim(wrk, dv->orig);
 		(void)HSH_DerefObjCore(wrk, &dv->orig);
 	}
 	dv->magic = 0;
@@ -215,10 +221,42 @@ deliver_copy_to_vm(void *priv, int flush, int last, const void *ptr, ssize_t len
 	return (0);
 }
 
+struct deliver_copy {
+	struct worker		*wrk;
+	struct objcore		*oc;
+	struct stv_stat		*stvstat;
+};
+
+static int
+deliver_copy_out(void *priv, int flush, int last, const void *ptr, ssize_t len)
+{
+	struct deliver_copy *dc = priv;
+	const uint8_t *src = ptr;
+	uint8_t *dest;
+	ssize_t l2;
+
+	(void)flush;
+	(void)last;
+	while (len > 0) {
+		l2 = len;
+		if (!ObjGetSpace(dc->wrk, dc->oc, &l2, &dest, dc->stvstat))
+			return (-1);
+		AN(dest);
+		if (l2 > len)
+			l2 = len;
+		memcpy(dest, src, l2);
+		ObjExtend(dc->wrk, dc->oc, l2, dc->stvstat);
+		src += l2;
+		len -= l2;
+	}
+	return (0);
+}
+
 /* Build a private transient object for the guest's response body.
    Returns NULL with nothing left behind on failure. */
 static struct objcore *
-deliver_new_object(VRT_CTX, oaref_t *oaref)
+deliver_new_object(VRT_CTX, void *script, const struct deliver_result *result,
+    oaref_t *oaref, int *view)
 {
 	struct req *req = ctx->req;
 	struct worker *wrk = req->wrk;
@@ -229,20 +267,34 @@ deliver_new_object(VRT_CTX, oaref_t *oaref)
 	struct objcore *oc = HSH_Private(wrk);
 	CHECK_OBJ_NOTNULL(oc, OBJCORE_MAGIC);
 	memset(hints, 0, sizeof *hints);
+	hints->size_body = result->length;
 	hints->vrt_privs = req->privs;
 	hints->vrt_privs_id = (uintptr_t)req;
 	hints->vcl = req->vcl;
 	hints->is_synth_client = 1;
 
 	*oaref = 0;
+	*view = 0;
 	if (STV_NewObject(wrk, oc, stv_transient, hints, stvstat) == STV_AR_OK) {
 		*oaref = ObjRefAttr(wrk, oc);
 		AN(*oaref);
 	} else
 		ok = 0;
-	if (ok && ((const struct deliver_stevedore *)
-	    (const void *)oc->stobj->stevedore)->methods != deliver_real_methods)
-		ok = 0;
+	if (ok && deliver_real_methods != NULL && ((const struct deliver_stevedore *)
+	    (const void *)oc->stobj->stevedore)->methods == deliver_real_methods)
+		*view = 1;
+	else if (ok) {
+		struct deliver_copy dc = {
+			.wrk = wrk,
+			.oc = oc,
+			.stvstat = stvstat,
+		};
+		if (result->length > 0 && riscv_deliver_iterate(script,
+		    result->data, result->length, &dc, deliver_copy_out) != 0)
+			ok = 0;
+		else
+			ObjSetLen(wrk, oc, *oaref, result->length);
+	}
 
 	HSH_DerefBoc(wrk, oc);
 	if (stvstat != NULL)
@@ -258,6 +310,17 @@ deliver_new_object(VRT_CTX, oaref_t *oaref)
 		return (NULL);
 	}
 	return (oc);
+}
+
+static void
+deliver_drop_orig(struct worker *wrk, struct req *req, int slim)
+{
+	ObjDerefAttr(req->objcore, &req->oc_oaref);
+	if (slim && (req->objcore->flags & OC_F_TRANSIENT)) {
+		HSH_Abandon(req->objcore);
+		ObjSlim(wrk, req->objcore);
+	}
+	(void)HSH_DerefObjCore(wrk, &req->objcore);
 }
 
 VCL_BOOL
@@ -279,16 +342,15 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 	AN(req->oc_oaref);
 	struct worker *wrk = req->wrk;
 
+	if (req->objcore->flags & OC_F_SLICED) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: sliced objects are not supported");
+		return (0);
+	}
 	if (req->esi_level > 0) {
 		VSLb(ctx->vsl, SLT_Error, "deliver_transform: not supported in ESI includes");
 		return (0);
 	}
 	AZ(pthread_once(&deliver_once, deliver_init));
-	if (deliver_real_methods == NULL) {
-		VSLb(ctx->vsl, SLT_Error,
-			"deliver_transform: unsupported Transient storage");
-		return (0);
-	}
 	/* The guest gets the stored bytes, so they must be the body itself */
 	if (http_GetHdr(req->resp, H_Content_Encoding, NULL) ||
 	    ObjCheckFlag(wrk, req->objcore, req->oc_oaref, OF_GZIPED) ||
@@ -321,27 +383,39 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 	struct objcore *oc = NULL;
 	struct deliver_view *dv = NULL;
 
-	if (ObjIterate(wrk, req->objcore, &post,
-	    prev ? deliver_copy_to_vm : deliver_map_to_vm, 0, 0, -1) < 0) {
+	const struct deliver_obj_methods *methods =
+	    ((const struct deliver_stevedore *)(const void *)
+	    req->objcore->stobj->stevedore)->methods;
+	struct boc *boc = HSH_RefBoc(req->objcore);
+	const int copied = prev != NULL || boc != NULL ||
+	    (methods != &SML_methods && methods != &MSE4_methods_memory);
+	const int iterated = ObjIterate(wrk, req->objcore, &post,
+	    copied ? deliver_copy_to_vm : deliver_map_to_vm, 0, 0, -1);
+	if (boc != NULL)
+		HSH_DerefBoc(wrk, req->objcore);
+	if (iterated < 0) {
 		VSLb(ctx->vsl, SLT_Error, "deliver_transform: could not read the body");
 		goto fail;
 	}
 	if (riscv_deliver_call(ctx, func, arg ? arg : "", &post, &result) < 0)
 		goto fail;
-	if (result.length > (size_t)max_size) {
-		VSLb(ctx->vsl, SLT_Error,
-			"deliver_transform: response of %zu bytes is over the %jd byte limit",
-			result.length, (intmax_t)max_size);
-		goto fail;
-	}
 	dv = calloc(1, sizeof *dv);
 	if (dv == NULL) {
 		VSLb(ctx->vsl, SLT_Error, "deliver_transform: out of memory");
 		goto fail;
 	}
-	oc = deliver_new_object(ctx, &oaref);
+	int view;
+	oc = deliver_new_object(ctx, script, &result, &oaref, &view);
 	if (oc == NULL)
 		goto fail;
+
+	if (!view) {
+		free(dv);
+		if (prev == NULL && post.length > 0)
+			riscv_deliver_unmap(script, post.address, post.length);
+		deliver_drop_orig(wrk, req, prev == NULL);
+		goto swap;
+	}
 
 	dv->magic = DELIVER_VIEW_MAGIC;
 	dv->real = (const void *)oc->stobj->stevedore;
@@ -358,8 +432,11 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 		prev->orig = NULL;
 		prev->orig_oaref = 0;
 		prev->mapped_len = 0;
-		ObjDerefAttr(req->objcore, &req->oc_oaref);
-		(void)HSH_DerefObjCore(wrk, &req->objcore);
+		deliver_drop_orig(wrk, req, 0);
+	} else if (copied) {
+		dv->mapped = post.address;
+		dv->mapped_len = post.length;
+		deliver_drop_orig(wrk, req, 1);
 	} else {
 		dv->orig = req->objcore;
 		dv->orig_oaref = req->oc_oaref;
@@ -371,6 +448,7 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 		req->oc_oaref = 0;
 	}
 	oc->stobj->stevedore = (const void *)&dv->stv;
+swap:
 	AZ(req->oc_oaref);
 	AZ(req->objcore);
 	req->objcore = oc;
