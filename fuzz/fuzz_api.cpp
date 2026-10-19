@@ -24,10 +24,6 @@
 #include "varnish.hpp"
 extern "C" {
 #include "varnish_interface.h"
-enum {
-#define SLTH(tag, ind, req, resp, sdesc, ldesc)	ind,
-#include "tbl/vsl_tags_http.h"
-};
 }
 #include "machine/syscalls.h"
 
@@ -104,13 +100,13 @@ static void setup_http(Task& task, Http& h, FuzzedDataProvider& fdp,
 	const uint16_t max = fdp.ConsumeIntegralInRange<uint16_t>(HDR_FIRST + 1, 64);
 	h.fields.reset(new txt[max]{});
 	h.flags.reset(new unsigned char[max]{});
-	h.hp.magic = 0x6428b5c9;
-	h.hp.fields_max = max;
-	h.hp.field_array = h.fields.get();
-	h.hp.field_flags = h.flags.get();
+	h.hp.magic = HTTP_MAGIC;
+	h.hp.shd = max;
+	h.hp.hd = h.fields.get();
+	h.hp.hdf = h.flags.get();
 	h.hp.ws = task.ws;
 	h.hp.status = 200;
-	h.hp.field_count = HDR_FIRST;
+	h.hp.nhd = HDR_FIRST;
 	for (int i = 0; i < 3; i++) {
 		if (first_line[i] == nullptr)
 			continue;
@@ -120,20 +116,20 @@ static void setup_http(Task& task, Http& h, FuzzedDataProvider& fdp,
 	static const char* defaults[] = {
 		"Host: fuzz.tenant", "Accept: */*", "Cookie: a=1; b=2", "X-Forwarded-For: 127.0.0.1"};
 	for (const char* d : defaults) {
-		if (h.hp.field_count >= max)
+		if (h.hp.nhd >= max)
 			break;
 		const char* s = ws_string(task.ws, d);
-		h.fields[h.hp.field_count++] = {s, s + strlen(s)};
+		h.fields[h.hp.nhd++] = {s, s + strlen(s)};
 	}
 	/* Fuzzed header fields; Varnish never has a NUL inside one */
 	const unsigned extra = fdp.ConsumeIntegralInRange<unsigned>(0, 4);
-	for (unsigned i = 0; i < extra && h.hp.field_count < max; i++) {
+	for (unsigned i = 0; i < extra && h.hp.nhd < max; i++) {
 		std::string str = fdp.ConsumeRandomLengthString(96);
 		str.erase(std::remove(str.begin(), str.end(), '\0'), str.end());
 		const char* s = ws_string(task.ws, str);
 		if (s == nullptr)
 			break;
-		h.fields[h.hp.field_count++] = {s, s + str.size()};
+		h.fields[h.hp.nhd++] = {s, s + str.size()};
 	}
 }
 

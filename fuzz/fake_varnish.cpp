@@ -20,25 +20,34 @@ extern "C" {
 	fprintf(stderr, " (%s:%d)\n", __FILE__, __LINE__); \
 	abort(); } } while (0)
 
-struct ws {
+struct fake_ws {
+	struct ws ws {};
 	size_t size;
 	size_t used = 0;
 	bool   overflowed = false;
 	std::vector<void*> blocks;
 };
+static fake_ws* state(struct ws* ws)
+{
+	FAKE_ASSERT(ws != nullptr && ws->magic == WS_MAGIC, "bad workspace");
+	return (fake_ws *)ws;
+}
 
 namespace fake {
 unsigned vrt_failures = 0;
 
 struct ws* ws_new(size_t size)
 {
-	return new struct ws{size};
+	auto* fws = new fake_ws{.size = size};
+	fws->ws.magic = WS_MAGIC;
+	return &fws->ws;
 }
 void ws_delete(struct ws* ws)
 {
-	for (void* p : ws->blocks)
+	auto* fws = state(ws);
+	for (void* p : fws->blocks)
 		free(p);
-	delete ws;
+	delete fws;
 }
 
 /* Varnish rolls req and bereq back to http0, the headers as received. */
@@ -54,8 +63,8 @@ static void snapshot_one(const struct http* hp)
 	if (hp == nullptr)
 		return;
 	snapshots[hp] = {
-		{hp->field_array, hp->field_array + hp->field_count},
-		{hp->field_flags, hp->field_flags + hp->field_count},
+		{hp->hd, hp->hd + hp->nhd},
+		{hp->hdf, hp->hdf + hp->nhd},
 		hp->status};
 }
 void snapshot_http(const struct vrt_ctx* ctx)
@@ -70,11 +79,11 @@ void forget_snapshots()
 
 uint32_t touch_http(const struct http* hp)
 {
-	FAKE_ASSERT(hp->field_count <= hp->fields_max,
-		"http has %u fields, room for %u", hp->field_count, hp->fields_max);
+	FAKE_ASSERT(hp->nhd <= hp->shd,
+		"http has %u fields, room for %u", hp->nhd, hp->shd);
 	uint32_t sum = 0;
-	for (unsigned i = 0; i < hp->field_count; i++) {
-		const txt& t = hp->field_array[i];
+	for (unsigned i = 0; i < hp->nhd; i++) {
+		const txt& t = hp->hd[i];
 		if (t.b == nullptr)
 			continue;
 		FAKE_ASSERT(t.e >= t.b, "header field %u ends before it begins", i);
@@ -87,8 +96,9 @@ uint32_t touch_http(const struct http* hp)
 
 /* ---------- Workspace ---------- */
 
-static void* ws_take(struct ws* ws, size_t bytes)
+static void* ws_take(struct ws* real_ws, size_t bytes)
 {
+	auto* ws = state(real_ws);
 	const size_t rounded = (bytes + 7) & ~size_t(7);
 	if (ws->overflowed || rounded > ws->size - ws->used) {
 		ws->overflowed = true;
@@ -108,7 +118,8 @@ extern "C" void* WS_Alloc(struct ws* ws, unsigned bytes)
 }
 extern "C" void* riscv_ws_alloc_spare(struct ws* ws, unsigned bytes, unsigned keep)
 {
-	if (ws->overflowed || size_t(bytes) + keep > ws->size - ws->used)
+	const auto* fws = state(ws);
+	if (fws->overflowed || size_t(bytes) + keep > fws->size - fws->used)
 		return nullptr;
 	return ws_take(ws, bytes);
 }
@@ -122,7 +133,7 @@ extern "C" void* WS_Copy(struct ws* ws, const void* str, int len)
 		memcpy(p, str, len);
 	return p;
 }
-extern "C" char* WS_Printf(struct ws* ws, const char* fmt, ...)
+extern "C" void* WS_Printf(struct ws* ws, const char* fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -144,7 +155,7 @@ static void vsl_format(const char* fmt, va_list ap)
 	char buffer[2048];
 	vsnprintf(buffer, sizeof(buffer), fmt, ap);
 }
-extern "C" void VSLb(struct vsl_log*, int, const char* fmt, ...)
+extern "C" void VSLb(struct vsl_log*, enum VSL_tag_e, const char* fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -169,11 +180,11 @@ extern "C" void VSLbt(struct vsl_log*, enum VSL_tag_e, txt t)
 
 extern "C" void http_SetH(struct http* to, unsigned n, const char* fm)
 {
-	FAKE_ASSERT(n < to->field_count, "http_SetH index %u of %u", n, to->field_count);
+	FAKE_ASSERT(n < to->nhd, "http_SetH index %u of %u", n, to->nhd);
 	FAKE_ASSERT(fm != nullptr, "http_SetH NULL value");
-	to->field_array[n].b = fm;
-	to->field_array[n].e = strchr(fm, '\0');
-	to->field_flags[n] = 0;
+	to->hd[n].b = fm;
+	to->hd[n].e = strchr(fm, '\0');
+	to->hdf[n] = 0;
 }
 
 extern "C" void http_PrintfHeader(struct http* to, const char* fmt, ...)
@@ -183,15 +194,15 @@ extern "C" void http_PrintfHeader(struct http* to, const char* fmt, ...)
 	const int len = vsnprintf(nullptr, 0, fmt, ap);
 	va_end(ap);
 	char* p = (char *)ws_take(to->ws, len + 1);
-	if (p == nullptr || to->field_count >= to->fields_max)
+	if (p == nullptr || to->nhd >= to->shd)
 		return; /* SLT_LostHeader */
 	va_start(ap, fmt);
 	vsnprintf(p, len + 1, fmt, ap);
 	va_end(ap);
-	const unsigned n = to->field_count++;
-	to->field_array[n].b = p;
-	to->field_array[n].e = p + len;
-	to->field_flags[n] = 0;
+	const unsigned n = to->nhd++;
+	to->hd[n].b = p;
+	to->hd[n].e = p + len;
+	to->hdf[n] = 0;
 }
 
 extern "C" void http_SetStatus(struct http* to, uint16_t status)
@@ -201,7 +212,7 @@ extern "C" void http_SetStatus(struct http* to, uint16_t status)
 	to->status = status;
 	status %= 1000;
 	FAKE_ASSERT(status >= 100, "http_SetStatus(%u)", to->status);
-	char* s = WS_Printf(to->ws, "%03u", status);
+	char* s = (char *)WS_Printf(to->ws, "%03u", status);
 	if (s != nullptr)
 		http_SetH(to, 3, s);
 	http_SetH(to, 4, "Reason");
@@ -235,9 +246,9 @@ extern "C" void VRT_Rollback(const struct vrt_ctx* ctx, VCL_HTTP hp)
 	FAKE_ASSERT(it != fake::snapshots.end(), "rollback without http0");
 	auto* to = const_cast<struct http*>(hp);
 	const auto& from = it->second;
-	memcpy(to->field_array, from.fields.data(), from.fields.size() * sizeof(txt));
-	memcpy(to->field_flags, from.flags.data(), from.flags.size());
-	to->field_count = from.fields.size();
+	memcpy(to->hd, from.fields.data(), from.fields.size() * sizeof(txt));
+	memcpy(to->hdf, from.flags.data(), from.flags.size());
+	to->nhd = from.fields.size();
 	to->status = from.status;
 }
 
