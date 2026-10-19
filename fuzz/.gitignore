@@ -1,0 +1,9 @@
+build/
+artifacts/
+crashes/
+findings*/
+leak-*
+crash-*
+timeout-*
+oom-*
+slow-unit-*

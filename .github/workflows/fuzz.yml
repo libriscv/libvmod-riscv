@@ -1,0 +1,80 @@
+name: Fuzzing (Ubuntu Linux 24.04)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-fuzz
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz scripting API (2 minutes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Varnish Enterprise (Varnish Plus)
+        run: |
+          # The harness builds against the varnish-plus headers (VARNISH_PLUS=1)
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https
+          curl -s https://packagecloud.io/install/repositories/varnishplus/60-enterprise/script.deb.sh | sudo bash
+          sudo apt-get update
+          sudo apt-get install -y varnish-plus-dev
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get install -y \
+            clang-18 \
+            lld-18 \
+            llvm-18 \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libpcre3-dev \
+            pkg-config \
+            ccache
+
+      - name: '🚧 CCache setup'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: fuzz-ubuntu-linux-24.04
+          max-size: 200M
+
+      - name: Configure
+        run: >
+          cmake -S fuzz -B fuzz/build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build fuzz/build -j4
+
+      - name: Fuzz
+        env:
+          ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer-18
+        run: |
+          mkdir -p fuzz/corpus fuzz/crashes
+          fuzz/build/fuzz_api \
+            -fork=$(nproc) \
+            -max_total_time=120 \
+            -timeout=20 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix=fuzz/crashes/ \
+            fuzz/corpus
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/crashes/
+          if-no-files-found: ignore

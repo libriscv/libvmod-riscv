@@ -1,0 +1,8 @@
+ERROR: AddressSanitizer: heap-buffer-overflow | riscv::Memory<8>::memcpy_out const /home/gonzo/github/libvmod-riscv/src/libriscv/lib/./libriscv/memory_helpers_paging.hpp:66:3 | artifacts/crash-a5a153fe7cc2a0de049b67043516032dc40704f0
+ERROR: AddressSanitizer: heap-buffer-overflow | rvs::Script::print /home/gonzo/github/libvmod-riscv/src/script.cpp:434:31 | artifacts/crash-000ab054e9460b88fa121506017ba446052332cb
+/home/gonzo/github/libvmod-riscv/src/libriscv/lib/./libriscv/guest/guest_cpp_string.hpp:72:28: runtime error: null pointer passed as argument 2, which is declared to never be null |  | artifacts/crash-0b683359b6b15738268e8873aba476825b4033dd
+/home/gonzo/github/libvmod-riscv/src/script_functions.cpp:283:40: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int' |  | artifacts/crash-0aebffdbee6977df856d1009f269ec196a35d7fc
+no-crash |  | artifacts/crash-0062c521f18f36e78fb4224e6cb30eb6668421c9
+varnishd would panic: http_SetH NULL value (/home/gonzo/github/libvmod-riscv/fuzz/fake_varnish.cpp:167) | http_SetH /home/gonzo/github/libvmod-riscv/fuzz/fake_varnish.cpp | artifacts/crash-1992b135ab80d012afa3be215bc67c46de905362
+varnishd would panic: VRE_exec(NULL) (/home/gonzo/github/libvmod-riscv/fuzz/fake_varnish.cpp:318) | VRE_exec /home/gonzo/github/libvmod-riscv/fuzz/fake_varnish.cpp:318:2 | artifacts/crash-0013fe1e158cd47812bded696ee1662c5ce10191
+varnishd would panic: VRT_Rollback 'hp' invalid (/home/gonzo/github/libvmod-riscv/fuzz/fake_varnish.cpp:225) | riscv::Machine<8>::system_call /home/gonzo/github/libvmod-riscv/src/libriscv/lib/./libriscv/machine_inline.hpp:92:3 | artifacts/crash-15c118421cf28287713cb11ff4977f6dee9beb73
