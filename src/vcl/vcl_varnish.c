@@ -18,13 +18,17 @@
    they get here, so anything longer than the prefix can say is refused. */
 #define VCLV_MAX_SPEC_NAME 254
 
-/* Varnish Enterprise still takes STRING_LIST arguments, while Varnish
-   Cache 7.x takes STRANDS (with an optional prefix for the setters). */
-#ifdef VARNISH_PLUS
+/* Varnish Enterprise before VRT 6013 takes STRING_LIST arguments, while
+   Varnish Cache 7.x takes STRANDS (with an optional prefix for the setters). */
+#if defined(VARNISH_PLUS) && VRT_MAJOR_VERSION < 6013U
+#define VCLV_STRING_LIST
 #define VCLV_L_STRING(fn, ctx, v)	fn(ctx, v, vrt_magic_string_end)
-#define VCLV_NO_VXID			0
 #else
 #define VCLV_L_STRING(fn, ctx, v)	fn(ctx, NULL, TOSTRAND(v))
+#endif
+#ifdef VARNISH_PLUS
+#define VCLV_NO_VXID			0
+#else
 #define VCLV_NO_VXID			NO_VXID
 /* VRE_capture() passes its options straight to pcre2_match(), and vre.h
    has no name for this one. */
@@ -513,7 +517,7 @@ vclv_hash_data(VRT_CTX, const char *data)
 {
 	if (ctx->method != VCL_MET_HASH || ctx->specific == NULL)
 		return (-1);
-	#ifdef VARNISH_PLUS
+#ifdef VCLV_STRING_LIST
 	VRT_hashdata(ctx, data, vrt_magic_string_end);
 #else
 	VRT_hashdata(ctx, TOSTRAND(data));
@@ -530,7 +534,7 @@ vclv_synth_body(VRT_CTX, int replace, const char *body)
 		return (-1);
 #endif
 	switch (ctx->method) {
-#ifdef VARNISH_PLUS
+#ifdef VCLV_STRING_LIST
 	case VCL_MET_SYNTH:
 		if (replace)
 			VRT_l_resp_body(ctx, body, vrt_magic_string_end);

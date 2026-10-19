@@ -157,7 +157,7 @@ riscvbe_gethdrs(const struct vrt_ctx *other_ctx, const struct director *dir)
 	const struct vrt_ctx ctx = {
 		.magic = VRT_CTX_MAGIC,
 		.vcl = bo->vcl,
-#ifndef VARNISH_PLUS
+#if !defined(VARNISH_PLUS) || VRT_MAJOR_VERSION >= 6013U
 		.vpi = bo->wrk->vpi,
 #endif
 		.ws  = bo->ws,
