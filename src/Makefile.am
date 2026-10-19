@@ -20,8 +20,8 @@ AM_CPPFLAGS = \
 	-DRISCV_PROGRAM_PATH=\"$(abs_top_srcdir)\" \
 	$(CRYPTO_CFLAGS)
 
-## -Wa,-I lets vcl/vclc_blob.c .incbin the sandboxed VCL compiler.
-AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall -Wa,-I$(top_srcdir)/vcl
+## vcl/vclc_blob.c .incbins the sandboxed VCL compiler from this path.
+AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall -DVCLC_ELF_PATH=\"$(abs_top_srcdir)/vcl/vclc.elf\"
 AM_CXXFLAGS = $(VARNISHAPI_CFLAGS) -Wall
 AM_LDFLAGS  = $(VARNISHAPI_LIBS) $(VMOD_LDFLAGS)
 

@@ -95,10 +95,14 @@ static auto& tenant_index()
 static void prune_index()
 {
 	std::scoped_lock lock(index_mtx());
-	std::erase_if(tenant_index(), [] (auto& entry) {
-		std::erase_if(entry.second, [] (const auto& weak) { return weak.expired(); });
-		return entry.second.empty();
-	});
+	auto& index = tenant_index();
+	for (auto it = index.begin(); it != index.end(); ) {
+		std::erase_if(it->second, [] (const auto& weak) { return weak.expired(); });
+		if (it->second.empty())
+			it = index.erase(it);
+		else
+			++it;
+	}
 }
 
 static std::shared_ptr<SandboxTenant>

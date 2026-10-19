@@ -1,8 +1,8 @@
 /*
  * The sandboxed VCL compiler (vcl/vclc.elf), embedded in the VMOD so that
- * building or running it needs no Rust or RISC-V toolchain. The assembler
- * finds the blob through -Wa,-I<top_srcdir>/vcl; both build systems add
- * that flag and a dependency on the blob for this file.
+ * building or running it needs no Rust or RISC-V toolchain. Both build
+ * systems define VCLC_ELF_PATH as the blob's absolute path, which LTO needs
+ * since it assembles this at link time, and add a dependency on the blob.
  */
 __asm__(
 	"	.section .rodata\n"
@@ -10,7 +10,7 @@ __asm__(
 	"	.hidden vclc_elf\n"
 	"	.balign 16\n"
 	"vclc_elf:\n"
-	"	.incbin \"vclc.elf\"\n"
+	"	.incbin \"" VCLC_ELF_PATH "\"\n"
 	"	.global vclc_elf_end\n"
 	"	.hidden vclc_elf_end\n"
 	"vclc_elf_end:\n"

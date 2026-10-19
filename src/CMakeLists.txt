@@ -29,7 +29,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 # vcl/vclc_blob.c embeds the sandboxed VCL compiler with .incbin
 set(VCLC_ELF "${CMAKE_CURRENT_SOURCE_DIR}/../vcl/vclc.elf")
 set_source_files_properties(vcl/vclc_blob.c PROPERTIES
-	COMPILE_OPTIONS "-Wa,-I${CMAKE_CURRENT_SOURCE_DIR}/../vcl"
+	COMPILE_DEFINITIONS "VCLC_ELF_PATH=\"${VCLC_ELF}\""
 	OBJECT_DEPENDS "${VCLC_ELF}")
 #add_vmod_vsc(vmod_riscv VSC_vmod_kvm.vsc)
 

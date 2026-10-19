@@ -74,7 +74,7 @@ target_compile_definitions(fuzz_api PRIVATE
 	FUZZ_GUEST_ELF="${GUEST_ELF}"
 )
 set_source_files_properties(${SRC}/vcl/vclc_blob.c PROPERTIES
-	COMPILE_OPTIONS "-Wa,-I${SRC}/../vcl")
+	COMPILE_DEFINITIONS "VCLC_ELF_PATH=\"${SRC}/../vcl/vclc.elf\"")
 ## Only the VCL glue the scripting API reaches is linked in: the rest of
 ## vcl_varnish.c needs varnishd, and --gc-sections drops it.
 separate_arguments(SANITIZER_LIST UNIX_COMMAND "${SANITIZERS}")
