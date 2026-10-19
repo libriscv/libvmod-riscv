@@ -29,11 +29,17 @@ else()
 	set(VINCLUDE   "/usr/include/varnish")
 endif()
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBVARNISH REQUIRED IMPORTED_TARGET varnishapi)
+pkg_get_variable(LIBVARNISH_PKGDATADIR varnishapi pkgdatadir)
+if (LIBVARNISH_PKGDATADIR AND EXISTS "${LIBVARNISH_PKGDATADIR}/vmodtool.py")
+	set(VTOOLDIR   "${LIBVARNISH_PKGDATADIR}")
+	set(VSCTOOLDIR "${LIBVARNISH_PKGDATADIR}")
+endif()
+
 set(VMODTOOL "${VTOOLDIR}/vmodtool.py")
 set(VSCTOOL  "${VSCTOOLDIR}/vsctool.py")
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBVARNISH REQUIRED IMPORTED_TARGET varnishapi)
 find_program(VARNISHD    "varnishd")
 find_program(VARNISHTEST "varnishtest")
 

@@ -834,7 +834,7 @@ APICALL(http_rollback)
 		throw std::runtime_error("Rollback is only possible for req and bereq");
 	auto* hp = get_http(ctx, where);
 
-#if __has_include("cache/cache_int.h")
+#if __has_include("cache/cache_int.h") || (defined(VARNISH_PLUS) && VRT_MAJOR_VERSION >= 6013U)
 	(void)hp;
 	VRT_Rollback(ctx);
 #else
