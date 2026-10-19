@@ -696,9 +696,9 @@ APICALL(foreach_header_field)
 			(addr + offsetof(guest_header_field, deleted));
 		/* Deleted entries moves everything back */
 		if (deleted) {
-			const int idx = machine.memory.read<uint32_t>
+			const unsigned idx = machine.memory.read<uint32_t>
 				(addr + offsetof(guest_header_field, index));
-			if (is_valid_index(hp, idx)) {
+			if (idx >= HDR_FIRST + dcount && is_valid_index(hp, idx - dcount)) {
 				http_unsetat(hp, idx - dcount++);
 			}
 		}
